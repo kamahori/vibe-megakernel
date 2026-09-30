@@ -1,34 +1,39 @@
-# MegaBench: benchmark for megakernel-writing agents
+# MegaBench: whole-model megakernel challenges
 
-MegaBench evaluates an **agent's submitted implementation**, not any kernel
-already in this repository. Each challenge supplies an input generator, an
-independent PyTorch oracle, multiple hidden-at-submission-time correctness
-trials, a launch budget, and a timed eager baseline. An agent can use Triton,
-CUDA C++, TIRx, another DSL, or a Python loader for an extension as long as it
-implements the submission protocol below. The suite imports no local TIRx
-implementation, checkpoint, or reproduction checkout.
+MegaBench evaluates submitted implementations of a **complete model inference
+step**. A decode task begins with a token and prior model state, runs every
+decoder layer, and returns logits, the greedy next token, and new state. The
+[task catalog](MODEL_STEP_TASKS.md) describes each architecture and timed
+boundary; [`cases.py`](cases.py) is the active machine-readable catalog.
 
-Use the [standard agent task brief](AGENT_TASK.md) when comparing agents.
+## Active catalog
 
-## First challenge set
+| Priority | Model architecture and step | State |
+| --- | --- | --- |
+| P0 | Qwen3-0.6B dense GQA, full 28-layer decode | Ready with seeded synthetic BF16 weights |
+| P0 | Qwen3-30B-A3B MoE, full decode | Planned |
+| P0 | Gemma 3 4B local/global attention, W8A16 and W4A16 full decode | Planned |
+| P0 | Llama 3.1 8B target with EAGLE3 proposal verification | Planned |
+| P1 | GPT-OSS-20B native MXFP4 MoE decode | Planned |
+| P1 | Qwen3.5-0.8B DeltaNet/attention hybrid decode | Planned |
+| P1 | Gemma 3 4B image-conditioned text decode | Planned |
+| P2 | Llama 3.1 8B plus EAGLE3 full speculative iteration | Planned |
+| P2 | Gemma 3 27B TP decode; Qwen3-30B-A3B TP/EP decode | Planned |
+| P3 | DeepSeek-V3.2, GLM-5.2-FP8, and Kimi-K3 full decode | Planned |
 
-| Family | Cross-stage work | Swept dimensions |
-|---|---|---|
-| Dense decoder | RMSNorm, Q/K/V, KV append, attention, output projection, SwiGLU MLP, residual | B1/4, context 32/128 |
-| Routed MoE | Router top-2, expert gather, up/activation/down, weighted combine | B4/16, experts 4/8 |
-| Quantized MLP | RMSNorm, int8 or packed signed-int4 dequantization, SwiGLU, residual | W8A16/W4A16, B1/8 |
-| Speculative verification | Draft argmax, target verification, accepted-prefix scan, fallback/bonus token commit | K2/4/8, B1/8 |
-| Iterative stencil | Several dependent periodic diffusion steps | 4/8 steps, width 128/512 |
+`--suite core` selects ready cases only. `--suite p0` through `p3`, `planned`,
+and `all` expose the rest of the catalog; an unimplemented case returns
+`not_implemented` and cannot contribute to a score. The first ready case uses
+the real Qwen3-0.6B geometry, including all 28 layers and the LM head, but
+uses randomized weights and an initialized prior KV cache. It is a
+**shape/semantics tier**, not checkpoint accuracy. Checkpoint validation and
+the other architecture oracles are future promotion gates described in the
+[catalog](MODEL_STEP_TASKS.md).
 
-The speculative challenge is a **draft/verify/commit component**, not an
-end-to-end speculative LLM: draft and target logits are inputs. It reports
-proposed, accepted, and committed token counts, and never credits rejected
-draft tokens as throughput. W4 uses two signed 4-bit weights per byte with a
-per-output-row FP32 scale; W8 uses signed int8 with the same scale convention.
-The model-like cases use synthetic weights, allowing agents to specialize
-shape and data type but not answers. Two TP/EP cases are cataloged as
-`planned`; they are not included in the runnable score until a multi-process
-input/output and communication audit is implemented.
+The former small fusion suite is retired. Its suite definition and results are
+preserved locally in `megabench/archive/legacy-small-suite-2026-09-30/`,
+which is ignored by Git. The old VibeSys smoke task and submitted kernels are
+historical and do not implement the active cases.
 
 ## Submission contract
 
@@ -36,79 +41,78 @@ Provide a Python file exporting:
 
 ```python
 def build(case: dict):
-    # Compile or allocate reusable state here. `case` gives only public metadata.
+    # Compile or allocate reusable state here. Case metadata is public.
     def run(inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        # Return exactly the keys, shapes, and dtypes specified by the oracle.
+        # Compute the complete inference step from the current inputs.
         ...
     return run
 ```
 
-`run` may allocate output tensors but must not mutate inputs. It must compute
-from **current** input values; the evaluator changes values across trials.
-The callable is expected to perform all dependent stages within the case's
-one-GPU-kernel launch budget. A launch may contain many CTAs and any valid
-in-kernel synchronization scheme. Compilation/initialization is excluded from
-steady-state timing and reported separately. See
-[`workloads.py`](workloads.py) for tensor names, layouts, and precise math;
-[`cases.py`](cases.py) fixes shapes, tolerances, and launch budgets.
+`run` may allocate outputs but must not mutate inputs. It must compute from
+the current token, weights, and prior state; correctness trials change their
+values. The current ready case has a one-GPU-kernel launch budget. See
+[`workloads.py`](workloads.py) for tensor names, layouts, and exact reference
+math; [`cases.py`](cases.py) specifies shapes and tolerances. The included
+[`reference_submission.py`](examples/reference_submission.py) demonstrates
+the API and CPU correctness path. Its many PyTorch GPU launches fail the
+megakernel launch gate.
 
-The included [`reference_submission.py`](examples/reference_submission.py)
-shows the API but is intentionally **not** a megakernel. Its PyTorch oracle
-calls should pass correctness and fail the CUDA launch gate. The
-[`triton_stencil.py`](examples/triton_stencil.py) example implements only the
-stencil family with one Triton launch.
+Use the [agent task brief](AGENT_TASK.md) when comparing implementations.
 
-## Run on this server
+## Run
 
 ```bash
 .venv/bin/python -m unittest megabench.test_suite
 .venv/bin/python -m megabench list --suite all
-CUDA_VISIBLE_DEVICES=6 .venv/bin/python -m megabench evaluate \
-  --submission megabench/examples/triton_stencil.py \
-  --case stencil-b4-n128-t4 --reps 20
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m megabench evaluate \
+  --submission /absolute/path/to/solution.py \
+  --case dense-step-qwen3-06b-b1-s128 --reps 20
 ```
 
-Use `--suite smoke` (five families), `--suite core` (all 13 runnable cells),
-or repeat `--case ID` for a subset. `--device cpu` runs a correctness-only
-protocol check; CUDA timing and launch audit require a visible GPU. Each cell
-runs in a **fresh subprocess** with a timeout. Results are exclusive-create
-JSONL under `megabench/runs/` by default, or at `--output`; existing files
-are never overwritten. The old TIRx-specific JSONL traces remain locally in
-`megabench/results/` but are ignored by Git and are **not agent scores**.
+Choose a visible GPU you are authorized to use. `--device cpu` performs a
+correctness-only check; it does not create a GPU score. Each case runs in a
+fresh subprocess with a timeout. Results are exclusive-create JSONL under
+`megabench/runs/` by default, or at `--output`; existing files are never
+overwritten. Both `runs/` and the legacy archive are ignored by Git.
 
-## Evaluation and score
+To isolate each case in a fresh Docker container, supply an existing local
+image with Python, PyTorch, and the submission compiler/runtime:
 
-For each case, the harness uses fresh randomized inputs and checks every
-output key, shape, dtype, device, and value against the PyTorch oracle;
-integer routing/token outputs must match exactly, floating outputs use the
-case's explicit tolerance. It rejects input mutation. A first call (including
-JIT) is timed separately. The warm path then records both synchronized host
-wall time and CUDA-event latency for the candidate and the same-input eager
-reference. Where capture succeeds, it also times a CUDA Graph replay of that
-reference on the same static input; `--no-graph-baseline` disables this
-diagnostic. The provisional speedup uses the **faster available** baseline
-(eager or graph), divided by candidate median CUDA-event time. Per-case
-p50/p95 and all raw samples are saved. Spec cases also save draft acceptance
-and committed-token counts.
+```bash
+.venv/bin/python -m megabench evaluate \
+  --submission /absolute/path/to/solution.py \
+  --case dense-step-qwen3-06b-b1-s128 --device cuda:0 \
+  --docker-image IMAGE_WITH_PYTORCH_AND_YOUR_KERNEL_DSL \
+  --docker-gpus device=0 --reps 20
+```
 
-The [PyTorch profiler](https://docs.pytorch.org/docs/stable/profiler) counts
-observed GPU kernel executions in one steady-state `run`. More than the case's
-one-launch budget—or zero kernels—sets `non_megakernel`, regardless of speed.
-CUDA Graph replay of many kernels therefore should not pass simply because
-the host called `replay()` once. This failure mode is documented in the
-[KernelBench-Mega devlog](https://github.com/Infatoshi/kernelbench.com/blob/master/benchmarks/mega/DEVLOG.md).
-The source file hash and advisory graph/compile/oracle hints are recorded;
-string hints are **not** a secure authenticity test. Even a one-launch trace
-is marked `ok_provisional`: source/trace review is still required to verify
-the work is genuinely fused and not answer-cached or delegated. If profiling
-is unavailable, authenticity is `unverified`, not assumed to pass.
+The selected host GPU appears as `cuda:0` inside the container. The image
+must already be present (`--pull never`). The harness neither builds nor
+removes images. The repository and submission directory are mounted read-only;
+only a temporary result directory and `/tmp` are writable. The container has
+no network, runs as the invoking UID/GID, and is removed after the run. On
+timeout, cleanup checks the container's unique label before stopping it.
+Docker isolation reduces accidental host changes; untrusted submissions
+should run on a dedicated worker host.
 
-A provisional geometric-mean speedup is emitted **only if every selected
-cell** passes correctness and the launch gate. CPU runs, partially solved
-suites, planned cases, and unverified authenticity have no aggregate score.
-The eager/graph references are reproducible starting baselines, not claims
-against best-in-class libraries. For public rankings, add a same-hardware
-state-of-the-art implementation, repeated isolated regrades, and independent
-source/trace review. This local process boundary limits crash propagation but
-does **not** sandbox untrusted Python; run third-party agent submissions in a
-container or another security boundary.
+## Evaluation
+
+For each ready case, the harness generates fresh randomized inputs and checks
+every output key, shape, dtype, device, and value against its PyTorch oracle.
+Integer tokens must match exactly; floating outputs use the case tolerance.
+Input mutation is rejected. Cold first-call time is reported separately.
+Warm timing records synchronized host and CUDA-event latency for the candidate
+and eager reference. Where capture succeeds, it also times a CUDA Graph
+reference on the same static input. The provisional speedup divides the
+faster available baseline by candidate median CUDA-event time.
+
+The PyTorch profiler counts observed GPU kernel executions in one steady-state
+`run`. A count outside the case launch budget yields `non_megakernel` even if
+the host called one CUDA Graph replay. A passing trace is `ok_provisional`
+until source and trace review verifies complete fused work and current-input
+dependence. If profiling is unavailable, authenticity is unverified. A
+geometric-mean speedup is emitted only if **every selected case** passes
+correctness and the launch gate. Planned cases, CPU checks, and partially
+solved suites have no aggregate score. Eager and graph references are local
+baselines; a public ranking would additionally need optimized serving
+baselines, repeated isolated regrades, and checkpoint-tier checks.

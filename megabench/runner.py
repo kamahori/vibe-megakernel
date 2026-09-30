@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import traceback
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -230,15 +231,6 @@ def evaluate_case(case: Case, submission: Path, *, device: str,
                 record["speedup_vs_graph_cuda_event"] = graph_event / cand_event
                 best = min(best, graph_event)
             record["speedup_vs_best_baseline_cuda_event"] = best / cand_event
-        if case.family == "spec_verify":
-            spec = reference(case, perf_inputs)
-            accepted = int(spec["accepted_count"].sum().item())
-            committed = int(spec["committed_count"].sum().item())
-            proposed = case.params["batch"] * case.params["draft_len"]
-            record["spec_accounting"] = {"proposed_draft_tokens": proposed,
-                                         "accepted_draft_tokens": accepted,
-                                         "committed_tokens": committed,
-                                         "acceptance_fraction": accepted / proposed}
     audit = record["launch_audit"]["status"]
     record["status"] = ("correctness_only" if torch.device(device).type == "cpu" else
                         "ok_provisional" if audit == "within_budget" else
@@ -264,16 +256,78 @@ def _worker(args: argparse.Namespace) -> int:
     return 0
 
 
+def _docker_worker_command(args: argparse.Namespace, case: Case,
+                           tempdir: Path, result_path: Path) -> tuple[list[str], str, str]:
+    """Run only this case in a disposable, unprivileged container."""
+    submission = Path(args.submission).resolve()
+    run_id = uuid.uuid4().hex
+    name = f"megabench-{run_id}"
+    label = f"org.megabench.run={run_id}"
+    if submission.is_relative_to(ROOT):
+        container_submission = Path("/workspace") / submission.relative_to(ROOT)
+        extra_mount: list[str] = []
+    else:
+        container_submission = Path("/submission") / submission.name
+        extra_mount = ["--volume", f"{submission.parent}:/submission:ro"]
+    cmd = ["docker", "run", "--rm", "--pull", "never", "--name", name,
+           "--label", label, "--network", "none", "--read-only",
+           "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+           "--pids-limit", "1024", "--shm-size", "1g",
+           "--user", f"{os.getuid()}:{os.getgid()}",
+           "--tmpfs", "/tmp:rw,exec,nosuid,size=8g",
+           "--env", "HOME=/tmp", "--env", "XDG_CACHE_HOME=/tmp/cache",
+           "--env", "TRITON_CACHE_DIR=/tmp/triton",
+           "--env", "TORCH_EXTENSIONS_DIR=/tmp/torch_extensions",
+           "--workdir", "/workspace",
+           "--volume", f"{ROOT}:/workspace:ro",
+           "--volume", f"{tempdir}:/results:rw", *extra_mount]
+    for group in os.getgroups():
+        cmd.extend(["--group-add", str(group)])
+    if args.docker_gpus:
+        cmd.extend(["--gpus", args.docker_gpus])
+    cmd.extend([args.docker_image, "python", "-m", "megabench", "_worker",
+                "--case", case.id, "--submission", str(container_submission),
+                "--device", args.device, "--trials", str(args.trials),
+                "--warmup", str(args.warmup), "--reps", str(args.reps),
+                "--result", f"/results/{result_path.name}"])
+    if not args.graph_baseline:
+        cmd.append("--no-graph-baseline")
+    return cmd, name, run_id
+
+
+def _stop_owned_container(name: str, run_id: str) -> str | None:
+    """On timeout, stop only the container carrying our unique run label."""
+    try:
+        inspected = subprocess.run(
+            ["docker", "inspect", "--format",
+             '{{ index .Config.Labels "org.megabench.run" }}', name],
+            capture_output=True, text=True, timeout=10)
+        if inspected.returncode or inspected.stdout.strip() != run_id:
+            return "timed-out container could not be verified for cleanup"
+        stopped = subprocess.run(["docker", "stop", "--time", "1", name],
+                                 capture_output=True, text=True, timeout=15)
+        if stopped.returncode:
+            return f"could not stop timed-out container: {stopped.stderr[-500:]}"
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"could not stop timed-out container: {type(exc).__name__}: {exc}"
+    return None
+
+
 def _run_one(args: argparse.Namespace, case: Case, tempdir: Path) -> dict:
     if not case.ready:
         return {"case": case.to_dict(), "status": "not_implemented", "reason": case.note}
     result_path = tempdir / f"{case.id}.json"
-    cmd = [sys.executable, "-m", "megabench", "_worker", "--case", case.id,
-           "--submission", str(Path(args.submission).resolve()), "--device", args.device,
-           "--trials", str(args.trials), "--warmup", str(args.warmup),
-           "--reps", str(args.reps), "--result", str(result_path)]
-    if not args.graph_baseline:
-        cmd.append("--no-graph-baseline")
+    container = None
+    if args.docker_image:
+        cmd, name, run_id = _docker_worker_command(args, case, tempdir, result_path)
+        container = (name, run_id)
+    else:
+        cmd = [sys.executable, "-m", "megabench", "_worker", "--case", case.id,
+               "--submission", str(Path(args.submission).resolve()), "--device", args.device,
+               "--trials", str(args.trials), "--warmup", str(args.warmup),
+               "--reps", str(args.reps), "--result", str(result_path)]
+        if not args.graph_baseline:
+            cmd.append("--no-graph-baseline")
     try:
         proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
                               timeout=args.timeout)
@@ -285,10 +339,21 @@ def _run_one(args: argparse.Namespace, case: Case, tempdir: Path) -> dict:
             result = {"case": case.to_dict(), "status": "worker_failed",
                       "reason": f"worker exited {proc.returncode}",
                       "stderr_tail": proc.stderr[-4000:]}
+        if container:
+            result["evaluation_runtime"] = {"kind": "docker", "image": args.docker_image,
+                                            "gpus": args.docker_gpus}
         return result
     except subprocess.TimeoutExpired:
-        return {"case": case.to_dict(), "status": "timeout",
-                "reason": f"worker exceeded {args.timeout}s"}
+        result = {"case": case.to_dict(), "status": "timeout",
+                  "reason": f"worker exceeded {args.timeout}s"}
+        if container:
+            warning = _stop_owned_container(*container)
+            if warning:
+                result["cleanup_warning"] = warning
+        return result
+    except OSError as exc:
+        return {"case": case.to_dict(), "status": "worker_failed",
+                "reason": f"could not start worker: {type(exc).__name__}: {exc}"}
 
 
 def _output_path(value: str | None) -> Path:
@@ -302,19 +367,21 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m megabench")
     sub = parser.add_subparsers(dest="command", required=True)
     listing = sub.add_parser("list", help="list agent-writing challenge cells")
-    listing.add_argument("--suite", choices=("smoke", "core", "planned", "all"),
+    listing.add_argument("--suite", choices=("core", "p0", "p1", "p2", "p3", "planned", "all"),
                          default="all")
     listing.add_argument("--json", action="store_true")
     evaluation = sub.add_parser("evaluate", help="evaluate a submission, one process/case")
     evaluation.add_argument("--submission", required=True)
-    evaluation.add_argument("--suite", choices=("smoke", "core", "planned", "all"),
-                            default="smoke")
+    evaluation.add_argument("--suite", choices=("core", "p0", "p1", "p2", "p3", "planned", "all"),
+                            default="core")
     evaluation.add_argument("--case", action="append", dest="ids")
     evaluation.add_argument("--device", default="cuda:0")
     evaluation.add_argument("--trials", type=int, default=3)
     evaluation.add_argument("--warmup", type=int, default=2)
     evaluation.add_argument("--reps", type=int, default=5)
     evaluation.add_argument("--timeout", type=int, default=180)
+    evaluation.add_argument("--docker-image", help="run each case in this existing local image")
+    evaluation.add_argument("--docker-gpus", help="Docker GPU selection, e.g. device=6")
     evaluation.add_argument("--no-graph-baseline", dest="graph_baseline",
                             action="store_false")
     evaluation.add_argument("--output")
@@ -338,10 +405,17 @@ def main(argv: list[str] | None = None) -> int:
         else:
             for case in cases:
                 state = "ready" if case.ready else "planned"
-                print(f"{case.id:30} {case.category:24} {case.params} [{state}]")
+                print(f"{case.id:44} {case.suite.upper():3} {state:7} "
+                      f"{case.model} / {case.phase}")
         return 0
     if min(args.trials, args.reps, args.timeout) < 1 or args.warmup < 0:
         parser.error("trials, reps, timeout must be positive; warmup >= 0")
+    if args.docker_gpus and not args.docker_image:
+        parser.error("--docker-gpus requires --docker-image")
+    if args.docker_image and args.docker_image.startswith("-"):
+        parser.error("--docker-image must be an image name or digest")
+    if args.docker_image and args.device.startswith("cuda") and not args.docker_gpus:
+        parser.error("CUDA Docker evaluation requires explicit --docker-gpus")
     submission = Path(args.submission).resolve()
     if not submission.is_file():
         parser.error(f"submission does not exist: {submission}")

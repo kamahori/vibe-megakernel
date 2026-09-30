@@ -1,4 +1,8 @@
-"""Backend-neutral challenge definitions for agent-written megakernels."""
+"""Whole-model inference challenges for agent-written megakernels.
+
+Only cases with an implemented oracle are ready for evaluation. Planned cases
+stay visible without entering a score.
+"""
 
 from __future__ import annotations
 
@@ -9,9 +13,11 @@ from dataclasses import asdict, dataclass
 class Case:
     id: str
     family: str
+    model: str
+    phase: str
     params: dict[str, int]
     category: str
-    suite: str = "core"
+    suite: str
     backend: str = "cuda"
     gpus: int = 1
     tp: int = 1
@@ -19,68 +25,101 @@ class Case:
     max_gpu_launches: int = 1
     atol: float = 0.0
     rtol: float = 0.0
-    ready: bool = True
+    ready: bool = False
     note: str = ""
 
     def __post_init__(self) -> None:
-        if not self.id or not self.family or any(v < 1 for v in self.params.values()):
+        if not self.id or not self.family or not self.model or not self.phase:
             raise ValueError(f"invalid case {self.id}")
+        if any(v < 1 for v in self.params.values()):
+            raise ValueError(f"invalid dimensions in {self.id}")
         if min(self.gpus, self.tp, self.ep, self.max_gpu_launches) < 1:
             raise ValueError(f"invalid execution geometry in {self.id}")
+        if self.suite not in ("p0", "p1", "p2", "p3"):
+            raise ValueError(f"invalid priority in {self.id}")
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
 CASES: tuple[Case, ...] = (
-    Case("stencil-b4-n128-t4", "stencil", {"batch": 4, "width": 128, "steps": 4},
-         "iterative_science", suite="smoke", atol=1e-5, rtol=1e-4),
-    Case("stencil-b8-n512-t8", "stencil", {"batch": 8, "width": 512, "steps": 8},
-         "iterative_science", atol=1e-5, rtol=1e-4),
-    Case("decoder-b1-h64-s32", "decoder", {"batch": 1, "hidden": 64,
-         "context": 32, "intermediate": 128}, "dense_llm", suite="smoke",
-         atol=0.03, rtol=0.03),
-    Case("decoder-b4-h64-s128", "decoder", {"batch": 4, "hidden": 64,
-         "context": 128, "intermediate": 128}, "dense_llm",
-         atol=0.03, rtol=0.03),
-    Case("moe-b4-h64-e4-k2", "moe", {"batch": 4, "hidden": 64,
-         "experts": 4, "intermediate": 128, "topk": 2}, "routed_moe",
-         suite="smoke", atol=0.03, rtol=0.03),
-    Case("moe-b16-h128-e8-k2", "moe", {"batch": 16, "hidden": 128,
-         "experts": 8, "intermediate": 256, "topk": 2}, "routed_moe",
-         atol=0.03, rtol=0.03),
-    Case("quant-w8-b1-h64-i128", "quant_mlp", {"batch": 1, "hidden": 64,
-         "intermediate": 128, "bits": 8}, "quantized_llm", suite="smoke",
-         atol=0.03, rtol=0.03),
-    Case("quant-w8-b8-h128-i256", "quant_mlp", {"batch": 8, "hidden": 128,
-         "intermediate": 256, "bits": 8}, "quantized_llm",
-         atol=0.03, rtol=0.03),
-    Case("quant-w4-b1-h64-i128", "quant_mlp", {"batch": 1, "hidden": 64,
-         "intermediate": 128, "bits": 4}, "quantized_llm",
-         atol=0.03, rtol=0.03),
-    Case("quant-w4-b8-h128-i256", "quant_mlp", {"batch": 8, "hidden": 128,
-         "intermediate": 256, "bits": 4}, "quantized_llm",
-         atol=0.03, rtol=0.03),
-    Case("spec-b1-k2-v128", "spec_verify", {"batch": 1, "draft_len": 2,
-         "vocab": 128}, "speculative_decoding", suite="smoke", note=
-         "Draft+target verification and commit; not a full model decode."),
-    Case("spec-b8-k4-v256", "spec_verify", {"batch": 8, "draft_len": 4,
-         "vocab": 256}, "speculative_decoding", note=
-         "Accepted draft prefix and target fallback/bonus are scored exactly."),
-    Case("spec-b8-k8-v256", "spec_verify", {"batch": 8, "draft_len": 8,
-         "vocab": 256}, "speculative_decoding"),
-    Case("decoder-tp2-b1-h128-s128", "decoder", {"batch": 1,
-         "hidden": 128, "context": 128, "intermediate": 256}, "dense_llm",
-         suite="planned", gpus=2, tp=2, ready=False,
-         note="Multi-GPU submission protocol and communication audit pending."),
-    Case("moe-ep2-b16-h128-e8", "moe", {"batch": 16, "hidden": 128,
-         "experts": 8, "intermediate": 256, "topk": 2}, "routed_moe",
-         suite="planned", gpus=2, ep=2, ready=False,
-         note="Expert-parallel placement and collective audit pending."),
+    Case("dense-step-qwen3-06b-b1-s128", "dense_step", "Qwen/Qwen3-0.6B",
+         "decode", {"batch": 1, "context": 128, "layers": 28,
+                    "hidden": 1024, "q_heads": 16, "kv_heads": 8,
+                    "head_dim": 128, "intermediate": 3072, "vocab": 151936},
+         "dense_llm", "p0", ready=True, atol=0.002, rtol=0.002,
+         note="Full 28-layer synthetic-weight decode; checkpoint tier pending."),
+    Case("moe-step-qwen3-30b-a3b-b1-s128", "moe_step",
+         "Qwen/Qwen3-30B-A3B", "decode",
+         {"batch": 1, "context": 128, "layers": 48, "hidden": 2048,
+          "q_heads": 32, "kv_heads": 4, "head_dim": 128,
+          "experts": 128, "topk": 8, "intermediate": 768, "vocab": 151936},
+         "routed_moe", "p0", note="Full-model oracle and memory audit pending."),
+    Case("quant-step-gemma3-4b-w8-b1-s128", "quant_step",
+         "google/gemma-3-4b-it", "decode",
+         {"batch": 1, "context": 128, "layers": 34, "hidden": 2560,
+          "bits": 8, "local_window": 1024}, "quantized_llm", "p0",
+         note="Gemma 3 W8A16 oracle and quantization recipe pending."),
+    Case("quant-step-gemma3-4b-w4-b1-s128", "quant_step",
+         "google/gemma-3-4b-it", "decode",
+         {"batch": 1, "context": 128, "layers": 34, "hidden": 2560,
+          "bits": 4, "local_window": 1024}, "quantized_llm", "p0",
+         note="Gemma 3 W4A16 oracle and quantization recipe pending."),
+    Case("spec-target-step-llama31-8b-k4", "spec_target_step",
+         "meta-llama/Llama-3.1-8B-Instruct + EAGLE3", "verify",
+         {"batch": 1, "context": 128, "layers": 32, "draft_depth": 4},
+         "speculative_decoding", "p0",
+         note="EAGLE3 proposal-tree and full-target oracle pending."),
+    Case("gptoss-step-20b-b1-s128", "gptoss_step", "openai/gpt-oss-20b",
+         "decode", {"batch": 1, "context": 128, "layers": 24,
+                    "experts": 32, "topk": 4, "sliding_window": 128},
+         "routed_moe", "p1", note="Native MXFP4 checkpoint oracle pending."),
+    Case("hybrid-step-qwen35-08b-b1-s128", "hybrid_step",
+         "Qwen/Qwen3.5-0.8B", "decode",
+         {"batch": 1, "context": 128, "layers": 24,
+          "linear_layers": 18, "full_attention_layers": 6},
+         "hybrid_llm", "p1", note="DeltaNet and GQA state oracle pending."),
+    Case("vl-decode-step-gemma3-4b-b1-s128", "vl_decode_step",
+         "google/gemma-3-4b-it", "conditioned_decode",
+         {"batch": 1, "context": 128, "layers": 34, "images": 1},
+         "vision_language", "p1",
+         note="Trusted image-conditioned KV fixture and decoder oracle pending."),
+    Case("spec-full-iteration-llama31-8b-k4", "spec_full_iteration",
+         "meta-llama/Llama-3.1-8B-Instruct + EAGLE3", "spec_iteration",
+         {"batch": 1, "context": 128, "layers": 32, "draft_depth": 4},
+         "speculative_decoding", "p2",
+         note="EAGLE3 head, target verification, and state oracle pending."),
+    Case("distributed-step-gemma3-27b-tp2", "distributed_step",
+         "google/gemma-3-27b-it", "decode",
+         {"batch": 1, "context": 128, "layers": 62},
+         "tensor_parallel", "p2", gpus=2, tp=2,
+         note="Multi-process TP protocol and collective audit pending."),
+    Case("distributed-step-qwen3-30b-a3b-tp2-ep2", "distributed_step",
+         "Qwen/Qwen3-30B-A3B", "decode",
+         {"batch": 1, "context": 128, "layers": 48,
+          "experts": 128, "topk": 8},
+         "expert_parallel", "p2", gpus=4, tp=2, ep=2,
+         note="Multi-process TP/EP protocol and collective audit pending."),
+    Case("deepseek-v32-step", "deepseek_v32_step",
+         "deepseek-ai/DeepSeek-V3.2", "decode",
+         {"batch": 1, "context": 128, "layers": 61,
+          "experts": 256, "topk": 8},
+         "frontier_moe", "p3", gpus=8, tp=8,
+         note="FP8 MLA/DSA oracle, checkpoint staging, and topology audit pending."),
+    Case("glm52-step", "glm52_step", "zai-org/GLM-5.2-FP8", "decode",
+         {"batch": 1, "context": 128, "layers": 78,
+          "experts": 256, "topk": 8},
+         "frontier_moe", "p3", gpus=8, tp=8,
+         note="FP8 DSA oracle, checkpoint staging, and topology audit pending."),
+    Case("kimi-k3-step", "kimi_k3_step", "moonshotai/Kimi-K3",
+         "decode", {"batch": 1, "context": 128, "layers": 93,
+                    "experts": 896, "topk": 16},
+         "frontier_hybrid", "p3", gpus=16, tp=16,
+         note="KDA/MLA oracle and memory-fit topology audit pending; GPU count provisional."),
 )
 
 
-def select_cases(suite: str = "smoke", ids: list[str] | None = None) -> list[Case]:
+def select_cases(suite: str = "core", ids: list[str] | None = None) -> list[Case]:
     by_id = {case.id: case for case in CASES}
     if ids:
         missing = sorted(set(ids) - by_id.keys())
@@ -91,6 +130,8 @@ def select_cases(suite: str = "smoke", ids: list[str] | None = None) -> list[Cas
         return list(CASES)
     if suite == "core":
         return [case for case in CASES if case.ready]
-    if suite in ("smoke", "planned"):
+    if suite == "planned":
+        return [case for case in CASES if not case.ready]
+    if suite in ("p0", "p1", "p2", "p3"):
         return [case for case in CASES if case.suite == suite]
     raise ValueError(f"unknown suite {suite}")

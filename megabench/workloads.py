@@ -1,15 +1,11 @@
-"""Independent PyTorch oracles and seeded inputs for agent challenges.
-
-These define *semantics*, not candidate implementations. Keep all candidate
-compilation, DSL imports, and optimization outside this module.
-"""
+"""Trusted input generator and PyTorch oracle for ready whole-model cases."""
 
 from __future__ import annotations
 
-import math
-
 import torch
-import torch.nn.functional as F
+
+from qwen3_ref import Config as Qwen3Config
+from qwen3_ref import RefDecoder
 
 from .cases import Case
 
@@ -17,151 +13,89 @@ from .cases import Case
 Inputs = dict[str, torch.Tensor]
 Outputs = dict[str, torch.Tensor]
 
+QWEN3_WEIGHT_NAMES = (
+    "ln1", "wq", "wk", "wv", "qn", "kn", "wo", "ln2", "wg", "wu",
+    "wd", "fnorm", "embed",
+)
+
+
+def _qwen3_config(case: Case) -> Qwen3Config:
+    p = case.params
+    return Qwen3Config(
+        hidden=p["hidden"], layers=p["layers"], q_heads=p["q_heads"],
+        kv_heads=p["kv_heads"], head_dim=p["head_dim"],
+        inter=p["intermediate"], vocab=p["vocab"],
+        max_seq=p["context"] + 1,
+    )
+
+
+def _qwen3_inputs(case: Case, seed: int, device: str) -> Inputs:
+    p = case.params
+    if p["batch"] != 1:
+        raise NotImplementedError("Qwen3 oracle currently handles batch one")
+    cfg = _qwen3_config(case)
+    gen = torch.Generator(device=device).manual_seed(seed)
+    h, layers, inter, d = cfg.hidden, cfg.layers, cfg.inter, cfg.head_dim
+    qdim, kdim = cfg.q_heads * d, cfg.kv_heads * d
+
+    def weight(*shape: int, fan_in: int) -> torch.Tensor:
+        return (torch.randn(shape, generator=gen, device=device) *
+                fan_in ** -0.5).to(torch.bfloat16)
+
+    def norm(*shape: int) -> torch.Tensor:
+        return (1 + 0.1 * torch.randn(shape, generator=gen,
+                                      device=device)).to(torch.bfloat16)
+
+    inputs = {
+        "token": torch.randint(cfg.vocab, (), generator=gen,
+                               device=device, dtype=torch.int64),
+        "ln1": norm(layers, h),
+        "wq": weight(layers, qdim, h, fan_in=h),
+        "wk": weight(layers, kdim, h, fan_in=h),
+        "wv": weight(layers, kdim, h, fan_in=h),
+        "qn": norm(layers, d),
+        "kn": norm(layers, d),
+        "wo": weight(layers, h, qdim, fan_in=qdim),
+        "ln2": norm(layers, h),
+        "wg": weight(layers, inter, h, fan_in=h),
+        "wu": weight(layers, inter, h, fan_in=h),
+        "wd": weight(layers, h, inter, fan_in=inter),
+        "fnorm": norm(h),
+        "embed": (torch.randn((cfg.vocab, h), generator=gen,
+                               device=device) * 0.02).to(torch.bfloat16),
+        "kcache": (torch.randn((layers, p["context"], cfg.kv_heads, d),
+                               generator=gen, device=device) * 0.1).to(torch.bfloat16),
+        "vcache": (torch.randn((layers, p["context"], cfg.kv_heads, d),
+                               generator=gen, device=device) * 0.1).to(torch.bfloat16),
+    }
+    return inputs
+
 
 def make_inputs(case: Case, seed: int, device: str = "cpu") -> Inputs:
-    p = case.params
-    gen = torch.Generator(device="cpu").manual_seed(seed)
-
-    def normal(*shape: int, scale: float = 1.0, dtype=torch.bfloat16) -> torch.Tensor:
-        return (torch.randn(shape, generator=gen) * scale).to(dtype)
-
-    if case.family == "stencil":
-        inputs = {"x": normal(p["batch"], p["width"], dtype=torch.float32),
-                  "alpha": torch.tensor(0.15 + (seed % 7) * 0.01,
-                                        dtype=torch.float32)}
-    elif case.family == "decoder":
-        b, h, s, i = (p[k] for k in ("batch", "hidden", "context", "intermediate"))
-        scale = h ** -0.5
-        inputs = {"x": normal(b, h), "kcache": normal(b, s, h, scale=0.5),
-                  "vcache": normal(b, s, h, scale=0.5),
-                  "norm1": normal(h, scale=0.1, dtype=torch.float32) + 1,
-                  "norm2": normal(h, scale=0.1, dtype=torch.float32) + 1,
-                  "wq": normal(h, h, scale=scale),
-                  "wk": normal(h, h, scale=scale),
-                  "wv": normal(h, h, scale=scale),
-                  "wo": normal(h, h, scale=scale),
-                  "wg": normal(i, h, scale=scale),
-                  "wu": normal(i, h, scale=scale),
-                  "wd": normal(h, i, scale=i ** -0.5)}
-    elif case.family == "moe":
-        b, h, e, i = (p[k] for k in ("batch", "hidden", "experts",
-                                     "intermediate"))
-        inputs = {"x": normal(b, h), "router": normal(e, h, scale=h ** -0.5),
-                  "w_up": normal(e, i, h, scale=h ** -0.5),
-                  "w_down": normal(e, h, i, scale=i ** -0.5)}
-    elif case.family == "quant_mlp":
-        b, h, i, bits = (p[k] for k in ("batch", "hidden", "intermediate", "bits"))
-        qlo, qhi = (-8, 8) if bits == 4 else (-127, 128)
-
-        def weight(rows: int, cols: int) -> torch.Tensor:
-            q = torch.randint(qlo, qhi, (rows, cols), generator=gen,
-                              dtype=torch.int8)
-            if bits == 8:
-                return q
-            # Two signed 4-bit values per byte, biased by +8.
-            lo = (q[:, 0::2].to(torch.int16) + 8).to(torch.uint8)
-            hi = (q[:, 1::2].to(torch.int16) + 8).to(torch.uint8)
-            return lo | (hi << 4)
-
-        inputs = {"x": normal(b, h), "norm": normal(h, scale=0.1,
-                  dtype=torch.float32) + 1,
-                  "w_gate": weight(i, h), "w_up": weight(i, h),
-                  "w_down": weight(h, i),
-                  "s_gate": normal(i, scale=0.001, dtype=torch.float32).abs() + 0.008,
-                  "s_up": normal(i, scale=0.001, dtype=torch.float32).abs() + 0.008,
-                  "s_down": normal(h, scale=0.001, dtype=torch.float32).abs() + 0.008}
-    elif case.family == "spec_verify":
-        b, k, v = (p[key] for key in ("batch", "draft_len", "vocab"))
-        draft = normal(b, k, v, dtype=torch.float32)
-        target = normal(b, k + 1, v, dtype=torch.float32)
-        proposed = draft.argmax(-1)
-        for row in range(b):
-            accept = (seed + 3 * row) % (k + 1)
-            for step in range(k):
-                token = int(proposed[row, step])
-                chosen = token if step < accept else (token + 1) % v
-                target[row, step, chosen] = 100.0
-        inputs = {"draft_logits": draft, "target_logits": target}
-    else:
-        raise ValueError(f"no generator for {case.family}")
-    return {name: value.to(device) for name, value in inputs.items()}
-
-
-def _rmsnorm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-5) * weight
-
-
-def _dequant(weight: torch.Tensor, scale: torch.Tensor, bits: int) -> torch.Tensor:
-    if bits == 8:
-        q = weight.float()
-    else:
-        lo = (weight & 15).to(torch.int16) - 8
-        hi = (weight >> 4).to(torch.int16) - 8
-        q = torch.stack((lo, hi), dim=-1).flatten(-2).float()
-    return q * scale.float().unsqueeze(-1)
+    if not case.ready:
+        raise NotImplementedError(f"{case.id}: {case.note}")
+    if case.family == "dense_step" and case.model == "Qwen/Qwen3-0.6B":
+        return _qwen3_inputs(case, seed, device)
+    raise NotImplementedError(f"no input generator for {case.id}")
 
 
 def reference(case: Case, t: Inputs) -> Outputs:
-    p = case.params
-    if case.family == "stencil":
-        x, alpha = t["x"], t["alpha"]
-        for _ in range(p["steps"]):
-            x = (1 - 2 * alpha) * x + alpha * (torch.roll(x, 1, -1) +
-                                                torch.roll(x, -1, -1))
-        return {"y": x}
-    if case.family == "decoder":
-        x = t["x"].float()
-        n1 = _rmsnorm(x, t["norm1"].float())
-        q = n1 @ t["wq"].float().T
-        k = n1 @ t["wk"].float().T
-        v = n1 @ t["wv"].float().T
-        kc = torch.cat((t["kcache"].float(), k[:, None, :]), dim=1)
-        vc = torch.cat((t["vcache"].float(), v[:, None, :]), dim=1)
-        scores = (kc * q[:, None, :]).sum(-1) / math.sqrt(p["hidden"])
-        context = (scores.softmax(-1)[:, :, None] * vc).sum(1)
-        z = x + context @ t["wo"].float().T
-        n2 = _rmsnorm(z, t["norm2"].float())
-        gate = F.silu(n2 @ t["wg"].float().T)
-        up = n2 @ t["wu"].float().T
-        y = z + (gate * up) @ t["wd"].float().T
-        return {"y": y.bfloat16(), "kcache": kc.bfloat16(),
-                "vcache": vc.bfloat16()}
-    if case.family == "moe":
-        x = t["x"].float()
-        scores = x @ t["router"].float().T
-        values, indices = scores.topk(p["topk"], dim=-1)
-        probs = values.softmax(-1)
-        result = x.clone()
-        for slot in range(p["topk"]):
-            expert = indices[:, slot]
-            up = torch.bmm(t["w_up"][expert].float(), x[:, :, None]).squeeze(-1)
-            act = F.silu(up)
-            down = torch.bmm(t["w_down"][expert].float(), act[:, :, None]).squeeze(-1)
-            result = result + probs[:, slot, None] * down
-        return {"y": result.bfloat16(), "expert_ids": indices.to(torch.int32)}
-    if case.family == "quant_mlp":
-        x = t["x"].float()
-        n = _rmsnorm(x, t["norm"].float())
-        bits = p["bits"]
-        gate = n @ _dequant(t["w_gate"], t["s_gate"], bits).T
-        up = n @ _dequant(t["w_up"], t["s_up"], bits).T
-        down = (F.silu(gate) * up) @ _dequant(
-            t["w_down"], t["s_down"], bits).T
-        return {"y": (x + down).bfloat16()}
-    if case.family == "spec_verify":
-        draft = t["draft_logits"].argmax(-1)
-        target = t["target_logits"].argmax(-1)
-        k = p["draft_len"]
-        equal_prefix = (draft == target[:, :k]).to(torch.int64).cumprod(-1)
-        accepted = equal_prefix.sum(-1)
-        committed = torch.full((p["batch"], k + 1), -1, dtype=torch.int64,
-                               device=draft.device)
-        for step in range(k):
-            committed[:, step] = torch.where(
-                accepted > step, draft[:, step],
-                torch.where(accepted == step, target[:, step], -1))
-        committed[:, k] = torch.where(accepted == k, target[:, k], -1)
-        return {"accepted_count": accepted,
-                "committed_count": accepted + 1,
-                "committed_tokens": committed}
-    raise ValueError(f"no oracle for {case.family}")
+    if not case.ready:
+        raise NotImplementedError(f"{case.id}: {case.note}")
+    if case.family == "dense_step" and case.model == "Qwen/Qwen3-0.6B":
+        cfg = _qwen3_config(case)
+        weights = {name: t[name] for name in QWEN3_WEIGHT_NAMES}
+        ref = RefDecoder(cfg, weights, device=str(t["token"].device),
+                         lazy_cast=True)
+        context = case.params["context"]
+        ref.k_cache[:, :context] = t["kcache"].float()
+        ref.v_cache[:, :context] = t["vcache"].float()
+        ref.pos = context
+        logits = ref.step(int(t["token"].item()))
+        return {
+            "logits": logits.float(),
+            "next_token": logits.argmax().to(torch.int64),
+            "k_write": ref.k_cache[:, context].to(torch.bfloat16),
+            "v_write": ref.v_cache[:, context].to(torch.bfloat16),
+        }
+    raise NotImplementedError(f"no PyTorch oracle for {case.id}")
