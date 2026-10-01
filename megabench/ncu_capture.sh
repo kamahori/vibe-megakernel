@@ -1,1 +1,0 @@
-integrations/ncu_capture.sh
