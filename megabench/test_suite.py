@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from argparse import Namespace
@@ -214,6 +215,19 @@ class HarnessTests(unittest.TestCase):
             result = _run_one(Namespace(), case, Path(directory))
         self.assertEqual(result["status"], "not_implemented")
 
+    def test_timeout_records_submission_for_aggregation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            submission = root / "candidate" / "submission.py"
+            args = Namespace(submission=str(submission), docker_image=None,
+                             device="cpu", trials=1, warmup=0, reps=1,
+                             graph_baseline=False, timeout=1)
+            with patch("megabench.runner.subprocess.run",
+                       side_effect=subprocess.TimeoutExpired("worker", 1)):
+                result = _run_one(args, TINY_DENSE, root)
+        self.assertEqual(result["status"], "timeout")
+        self.assertEqual(result["submission"], str(submission))
+
     def test_cli_lists_new_cases(self) -> None:
         with redirect_stdout(StringIO()) as output:
             self.assertEqual(main(["list", "--suite", "core", "--json"]), 0)
@@ -241,6 +255,13 @@ class HarnessTests(unittest.TestCase):
             self.assertAlmostEqual(summary["provisional_geomean_speedup"], 2.0)
             self.assertIsNone(aggregate_sessions(paths[:4], "p0", "codex")
                               ["provisional_geomean_speedup"])
+            timed_out = json.loads(paths[-1].read_text())
+            timed_out["status"] = "timeout"
+            timed_out.pop("speedup_vs_best_baseline_cuda_event")
+            paths[-1].write_text(json.dumps(timed_out) + "\n")
+            failed_summary = aggregate_sessions(paths, "p0", "codex")
+            self.assertEqual(failed_summary["passed"], 4)
+            self.assertIsNone(failed_summary["provisional_geomean_speedup"])
             duplicate = json.loads(paths[-1].read_text())
             duplicate["session"]["id"] = "trial-0"
             paths[-1].write_text(json.dumps(duplicate) + "\n")

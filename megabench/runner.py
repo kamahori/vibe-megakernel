@@ -356,6 +356,7 @@ def _stop_owned_container(name: str, run_id: str) -> str | None:
 def _run_one(args: argparse.Namespace, case: Case, tempdir: Path) -> dict:
     if not case.ready:
         return {"case": case.to_dict(), "status": "not_implemented", "reason": case.note}
+    submission = str(Path(args.submission).resolve())
     result_path = tempdir / f"{case.id}.json"
     container = None
     if args.docker_image:
@@ -379,12 +380,14 @@ def _run_one(args: argparse.Namespace, case: Case, tempdir: Path) -> dict:
             result = {"case": case.to_dict(), "status": "worker_failed",
                       "reason": f"worker exited {proc.returncode}",
                       "stderr_tail": proc.stderr[-4000:]}
+        result["submission"] = submission
         if container:
             result["evaluation_runtime"] = {"kind": "docker", "image": args.docker_image,
                                             "gpus": args.docker_gpus}
         return result
     except subprocess.TimeoutExpired:
-        result = {"case": case.to_dict(), "status": "timeout",
+        result = {"case": case.to_dict(), "submission": submission,
+                  "status": "timeout",
                   "reason": f"worker exceeded {args.timeout}s"}
         if container:
             warning = _stop_owned_container(*container)
@@ -392,7 +395,8 @@ def _run_one(args: argparse.Namespace, case: Case, tempdir: Path) -> dict:
                 result["cleanup_warning"] = warning
         return result
     except OSError as exc:
-        return {"case": case.to_dict(), "status": "worker_failed",
+        return {"case": case.to_dict(), "submission": submission,
+                "status": "worker_failed",
                 "reason": f"could not start worker: {type(exc).__name__}: {exc}"}
 
 
