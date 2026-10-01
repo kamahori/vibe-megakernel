@@ -10,7 +10,7 @@ index 0ad5ae59..22c601b8 100644
 +`VIBESYS_MEGABENCH_NCU_MCP_COMMAND` to the absolute `ncu-mcp-server` executable
 +adds the external `ncu_mcp` server to implementer sessions only. With the
 +variable unset, no server is attached. Set `NCU_PATH` to the case checkout's
-+absolute `megabench/ncu_capture.sh` path to capture only the profiler window.
++absolute `megabench/integrations/ncu_capture.sh` path to capture only the profiler window.
 +The executable's virtual environment, the MegaBench Python environment, and
 +the real CUDA toolkit directory must be readable in the local agent sandbox;
 +grant them with colon-separated `VIBESYS_AGENT_SANDBOX_ALLOW` entries. For an

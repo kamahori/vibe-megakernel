@@ -3,8 +3,23 @@
 MegaBench evaluates submitted implementations of a **complete model inference
 step**. A decode task begins with a token and prior model state, runs every
 decoder layer, and returns logits, the greedy next token, and new state. The
-[task catalog](MODEL_STEP_TASKS.md) describes each architecture and timed
+[task catalog](docs/MODEL_STEP_TASKS.md) describes each architecture and timed
 boundary; [`cases.py`](cases.py) is the active machine-readable catalog.
+
+## Repository layout
+
+- [`cases.py`](cases.py), [`workloads.py`](workloads.py), `p0_*.py`, and
+  [`runner.py`](runner.py) define the catalog, input generators, PyTorch
+  references, correctness checks, timing, and aggregation.
+- [`docs/`](docs/) holds the task catalog, the one-case agent brief, and the
+  session protocol.
+- [`integrations/`](integrations/) holds the VibeSys adapter and NCU profiling
+  helpers. The original Python module commands remain available as wrappers.
+- [`tests/`](tests/) contains the suite tests; [`examples/`](examples/) contains
+  a reference submission.
+- `experiments/YYYY-MM-DD/HH-MM-SS-<campaign>/`, `runs/`, and `archive/` hold
+  local runs and historical material. They are ignored by Git. Existing
+  experiment paths remain available through symlinks.
 
 ## Active catalog
 
@@ -35,7 +50,7 @@ synthetic draft head to generate a linear four-token proposal chain outside
 timing; the timed task runs the full 32-layer Llama target and commit logic.
 Correctness trials include raw draft proposals, full acceptance, and rollback
 after one accepted token. Pinned paired checkpoints and branched trees remain
-future tiers described in the [catalog](MODEL_STEP_TASKS.md).
+future tiers described in the [catalog](docs/MODEL_STEP_TASKS.md).
 
 The former small fusion suite is retired. Its suite definition and results are
 preserved locally in `megabench/archive/legacy-small-suite-2026-09-30/`,
@@ -65,11 +80,11 @@ and tolerances. The included
 the API and CPU correctness path. Its many PyTorch GPU launches fail the
 megakernel launch gate.
 
-Use the [agent task brief](AGENT_TASK.md) when comparing implementations. One
+Use the [agent task brief](docs/AGENT_TASK.md) when comparing implementations. One
 case receives one fresh agent session and candidate checkout. The evaluator
 accepts one case and records its method and session ID; aggregation reads five
 separate case results. A suite-wide prompt or a shared candidate submission
-does not define an agent benchmark run. The [session protocol](SESSION_PROTOCOL.md)
+does not define an agent benchmark run. The [session protocol](docs/SESSION_PROTOCOL.md)
 specifies the isolation and aggregation rules.
 Experimental results are recorded in GitHub issues: the [one-case P0
 comparison](https://github.com/kamahori/vibe-megakernel/issues/1), the
@@ -82,7 +97,7 @@ directories.
 ## Run
 
 ```bash
-.venv/bin/python -m unittest megabench.test_suite
+.venv/bin/python -m unittest megabench.tests.test_suite
 .venv/bin/python -m megabench list --suite p0
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m megabench evaluate \
   --submission /absolute/path/to/solution.py \

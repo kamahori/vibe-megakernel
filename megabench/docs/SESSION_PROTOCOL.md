@@ -49,7 +49,7 @@ the candidate checkout and expose the same server/tools to both methods. Give
 each session its own report directory. The server's `profile` tool accepts one
 executable path; a case-specific executable can call
 `python -m megabench.ncu_profile_case --case CASE_ID --submission PATH`.
-Set `NCU_PATH` to `megabench/ncu_capture.sh` so only the CUDA profiler
+Set `NCU_PATH` to `megabench/integrations/ncu_capture.sh` so only the CUDA profiler
 start/stop window is captured. Pass `kernel_filter="regex:<model kernel name>"`,
 `set="basic"`, `launch_count=1`, and the assigned physical GPU to `profile`,
 then use `read_report_details` for feedback. Obtain the model kernel name from
@@ -68,11 +68,11 @@ real directory rather than a symlink. Otherwise the trusted evaluator may
 have Torch while the coding agent cannot import it.
 
 For VibeSys checkout `667a08f8502ba180ac784c7e03c55ac28c43a7f2`, apply
-[`integrations/vibesys_ncu_mcp.patch`](integrations/vibesys_ncu_mcp.patch) to
+[`integrations/vibesys_ncu_mcp.patch`](../integrations/vibesys_ncu_mcp.patch) to
 enable the optional NCU tool in its multi-agent implementer. Set
 `VIBESYS_MEGABENCH_NCU_MCP_COMMAND` to the absolute path of the installed
 `ncu-mcp-server`, and `NCU_PATH` to the case checkout's
-`megabench/ncu_capture.sh`. Add the NCU server virtual environment to
+`megabench/integrations/ncu_capture.sh`. Add the NCU server virtual environment to
 `VIBESYS_AGENT_SANDBOX_ALLOW` alongside the shared Python and real CUDA
 toolkit directories. Use the real CUDA toolkit `bin` directory in `PATH`;
 the `/usr/local/cuda` symlink can break sandbox setup.

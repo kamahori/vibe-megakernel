@@ -1,7 +1,7 @@
 # MegaBench model-step task list
 
 This is the active whole-model benchmark deck. The exact case IDs and readiness
-states are in [`cases.py`](cases.py). All five P0 cells are runnable in a
+states are in [`cases.py`](../cases.py). All five P0 cells are runnable in a
 synthetic-weight tier; P1–P3 remain planned. `--suite core` selects the five
 P0 cells. A model-step case exercises every layer in its stated model
 phase, from token or modality input through final logits and state updates.
