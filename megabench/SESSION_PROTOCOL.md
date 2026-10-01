@@ -41,6 +41,22 @@ sessions, one per case, with equivalent session limits. MPK is evaluated as a
 per-case implementation too; a native launcher probe alone is not a case
 submission. Keep all candidate code and raw logs outside tracked source.
 
+## Optional Nsight Compute feedback
+
+The [syfi ncu MCP server](https://github.com/kamahori/mlsys-contest-syfi-fully-agent/tree/main/full-agent-pipeline/mcps/ncu-mcp)
+can provide performance counters to either agent method. Install it outside
+the candidate checkout and expose the same server/tools to both methods. Give
+each session its own report directory. The server's `profile` tool accepts one
+executable path; a case-specific executable can call
+`python -m megabench.ncu_profile_case --case CASE_ID --submission PATH`.
+Set `NCU_PATH` to `megabench/ncu_capture.sh` so only the CUDA profiler
+start/stop window is captured. Pass `kernel_filter="regex:<model kernel name>"`,
+`set="basic"`, `launch_count=1`, and the assigned physical GPU to `profile`,
+then use `read_report_details` for feedback. Obtain the model kernel name from
+the candidate's source or the evaluator's launch audit; without the filter,
+setup kernels may be captured instead. NCU measurements are diagnostic and
+do not replace MegaBench correctness, launch audit, or latency scoring.
+
 For VibeSys, run `python -m megabench.make_vibesys_case_task --case CASE_ID`
 inside a fresh checkout. This creates a case-specific objective and a
 protected evaluator under `.vibesys/tasks/CASE_ID/`. Run VibeSys with that
@@ -50,3 +66,15 @@ coding sandboxes, expose the shared Python environment and CUDA toolkit as
 read-only resources with `VIBESYS_AGENT_SANDBOX_ALLOW`, using the toolkit's
 real directory rather than a symlink. Otherwise the trusted evaluator may
 have Torch while the coding agent cannot import it.
+
+For VibeSys checkout `667a08f8502ba180ac784c7e03c55ac28c43a7f2`, apply
+[`integrations/vibesys_ncu_mcp.patch`](integrations/vibesys_ncu_mcp.patch) to
+enable the optional NCU tool in its multi-agent implementer. Set
+`VIBESYS_MEGABENCH_NCU_MCP_COMMAND` to the absolute path of the installed
+`ncu-mcp-server`, and `NCU_PATH` to the case checkout's
+`megabench/ncu_capture.sh`. Add the NCU server virtual environment to
+`VIBESYS_AGENT_SANDBOX_ALLOW` alongside the shared Python and real CUDA
+toolkit directories. Use the real CUDA toolkit `bin` directory in `PATH`;
+the `/usr/local/cuda` symlink can break sandbox setup.
+If `ncu-mcp-server` was installed in editable mode, also expose its source
+directory; the virtual environment alone does not contain the Python package.

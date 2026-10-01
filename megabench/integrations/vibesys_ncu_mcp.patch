@@ -1,0 +1,236 @@
+diff --git a/docs/contributing/agent-drivers.md b/docs/contributing/agent-drivers.md
+index 0ad5ae59..22c601b8 100644
+--- a/docs/contributing/agent-drivers.md
++++ b/docs/contributing/agent-drivers.md
+@@ -317,6 +317,20 @@ written, because the image resolves its own. That distinction is one keyword
+ argument (`pin_interpreter`) on `_as_mcp_server`, not a container/host branch
+ elsewhere in the driver.
+ 
++For a MegaBench `multi-agent` run, setting
++`VIBESYS_MEGABENCH_NCU_MCP_COMMAND` to the absolute `ncu-mcp-server` executable
++adds the external `ncu_mcp` server to implementer sessions only. With the
++variable unset, no server is attached. Set `NCU_PATH` to the case checkout's
++absolute `megabench/ncu_capture.sh` path to capture only the profiler window.
++The executable's virtual environment, the MegaBench Python environment, and
++the real CUDA toolkit directory must be readable in the local agent sandbox;
++grant them with colon-separated `VIBESYS_AGENT_SANDBOX_ALLOW` entries. For an
++editable `ncu-mcp` install, also grant its `src` directory because the venv's
++`.pth` file imports the package from that external path. Put the
++real CUDA `bin` directory (for example `/usr/local/cuda-13.1/bin`) in `PATH`,
++not the `/usr/local/cuda/bin` symlink, which bubblewrap cannot create inside
++the sandbox.
++
+ ## Usage records
+ 
+ `AgentClient` writes one row per invocation to `<log_dir>/usage.jsonl`, whether
+diff --git a/libs/vs-runtime/src/vs_runtime/_agent_sessions.py b/libs/vs-runtime/src/vs_runtime/_agent_sessions.py
+index 4ab3277b..d0c7f071 100644
+--- a/libs/vs-runtime/src/vs_runtime/_agent_sessions.py
++++ b/libs/vs-runtime/src/vs_runtime/_agent_sessions.py
+@@ -332,7 +332,6 @@ class RuntimeAgentSessions:
+                         managed_workspace,
+                         member_id,
+                         validated_paths,
+-                        bound_tool_ids,
+                         tool_servers,
+                         session_id=session_id,
+                     )
+@@ -352,7 +351,6 @@ class RuntimeAgentSessions:
+         workspace: RuntimeWorkspace,
+         member_id: str | None,
+         writable_paths: tuple[str, ...],
+-        bound_tool_ids: tuple[str, ...],
+         tool_servers: tuple[ToolServerDescriptor, ...],
+         session_id: str,
+     ) -> RuntimeAgentSession:
+@@ -367,7 +365,7 @@ class RuntimeAgentSessions:
+             role,
+             supported_capabilities,
+             member_id=member_id,
+-            has_bound_tools=bool(bound_tool_ids),
++            has_bound_tools=bool(tool_servers),
+         )
+         return RuntimeAgentSession(
+             execution,
+diff --git a/libs/vs-runtime/tests/test_agent_sessions.py b/libs/vs-runtime/tests/test_agent_sessions.py
+index 486d0b96..c39bc5fc 100644
+--- a/libs/vs-runtime/tests/test_agent_sessions.py
++++ b/libs/vs-runtime/tests/test_agent_sessions.py
+@@ -1082,6 +1082,35 @@ def test_role_extra_tools_are_resolved_once_and_fixed_for_the_session() -> None:
+     assert dict(bound_tools[0].env)["SOCKET"] == "/agent/host.sock"
+ 
+ 
++def test_empty_optional_tool_binding_does_not_require_mcp_capability() -> None:
++    role = AgentRole(
++        id="worker",
++        system_prompt="Work.",
++        extra_tools=(AgentTool(id="optional"),),
++    )
++    client = FakeAgentClient(
++        model="fake-model",
++        capabilities=AgentCapabilities(session_reuse=True, tool_servers=False),
++    ).enqueue_text("worker", "done")
++
++    async def scenario() -> None:
++        runtime = _runtime(
++            role,
++            _RuntimeEffects(
++                _ClientFactory(client),
++                _EnvironmentOpener(_environment()),
++                FakeAgentExecutionLifecycleSink(),
++                tool_bindings={"optional": lambda _binding: ()},
++            ),
++        )
++        session = await runtime.agents.create_session(role, workspace=runtime.workspaces.root)
++        assert await session.turn("work") == "done"
++        await runtime.workspaces.close()
++
++    asyncio.run(scenario())
++    assert client.calls_for("worker")[0].tool_servers is None
++
++
+ def test_environment_client_turn_and_cleanup_share_one_worker_thread() -> None:
+     role = AgentRole(id="worker", system_prompt="Work.")
+     threads: list[tuple[str, int]] = []
+diff --git a/src/vibesys/composition.py b/src/vibesys/composition.py
+index c6adfaad..7c878096 100644
+--- a/src/vibesys/composition.py
++++ b/src/vibesys/composition.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from dataclasses import dataclass, replace
+ from pathlib import Path
+ from types import MappingProxyType
+@@ -187,6 +188,48 @@ def _profiler_tool(
+     )
+ 
+ 
++_MEGABENCH_NCU_COMMAND_ENV = "VIBESYS_MEGABENCH_NCU_MCP_COMMAND"
++
++
++def _megabench_ncu_tool(
++    _context: object, binding: AgentToolBindingContext
++) -> tuple[ToolServerDescriptor, ...]:
++    """Attach the optional external NCU server to one multi-agent implementer."""
++    raw_command = os.environ.get(_MEGABENCH_NCU_COMMAND_ENV)
++    if not raw_command:
++        return ()
++    command = Path(raw_command).expanduser()
++    if not command.is_absolute() or not command.is_file() or not os.access(command, os.X_OK):
++        raise ConfigurationError(
++            ConfigurationDiagnostic(
++                code="megabench_ncu_mcp_command_invalid",
++                stage="agent_tool_binding",
++                message=(
++                    f"{_MEGABENCH_NCU_COMMAND_ENV} must name an absolute, executable file: "
++                    f"{raw_command}"
++                ),
++            )
++        )
++    ncu_path = os.environ.get("NCU_PATH")
++    if ncu_path:
++        selected_path = Path(ncu_path)
++        env = (
++            (
++                "NCU_PATH",
++                binding.agent_path(selected_path) if selected_path.is_absolute() else ncu_path,
++            ),
++        )
++    else:
++        env = ()
++    return (
++        StdioServerDescriptor(
++            name="ncu_mcp",
++            command=binding.agent_path(command),
++            env=env,
++        ),
++    )
++
++
+ def _issue_board_tool(
+     _host: object, _binding: AgentToolBindingContext
+ ) -> tuple[ToolServerDescriptor, ...]:
+@@ -235,6 +278,7 @@ AGENT_TOOL_BINDINGS: Mapping[
+ ] = {
+     "evaluation": _evaluation_tool,
+     "issue-board": _issue_board_tool,
++    "megabench-ncu": _megabench_ncu_tool,
+     "profiler": _profiler_tool,
+ }
+ """Built-in agent tools bound by product composition, not orchestration policy."""
+diff --git a/src/vibesys/orchestration/multi/agents.py b/src/vibesys/orchestration/multi/agents.py
+index ece80e65..0e4a065a 100644
+--- a/src/vibesys/orchestration/multi/agents.py
++++ b/src/vibesys/orchestration/multi/agents.py
+@@ -1,6 +1,6 @@
+ """Fixed agent declarations owned by the multi-agent orchestration."""
+ 
+-from vs_runtime.api import AgentCapability, AgentRole, WorkspaceAccess
++from vs_runtime.api import AgentCapability, AgentRole, AgentTool, WorkspaceAccess
+ 
+ DESIGNER = AgentRole(
+     id="orchestrator",
+@@ -29,6 +29,7 @@ IMPLEMENTER = AgentRole(
+         "evidence, and report the exact observed outcome. Return only the requested "
+         "structured response."
+     ),
++    extra_tools=(AgentTool(id="megabench-ncu"),),
+     workspace_access=WorkspaceAccess.READ_WRITE,
+     required_capabilities=frozenset({AgentCapability.SESSION_REUSE}),
+ )
+diff --git a/tests/vibesys/orchestration/test_explicit_agent_sessions.py b/tests/vibesys/orchestration/test_explicit_agent_sessions.py
+index bbdd12e1..2ce0afa1 100644
+--- a/tests/vibesys/orchestration/test_explicit_agent_sessions.py
++++ b/tests/vibesys/orchestration/test_explicit_agent_sessions.py
+@@ -20,6 +20,7 @@ from vibesys.config import Config
+ from vibesys.constants import ComputeBackend
+ from vibesys.inputs import load_input_bundle
+ from vibesys.orchestration.issue_queue import PLUGIN as ISSUE_QUEUE_PLUGIN
++from vibesys.orchestration.multi.agents import IMPLEMENTER as MULTI_IMPLEMENTER
+ from vibesys.orchestration.profilers import ProfilerKind
+ from vibesys.orchestration.single import PLUGIN
+ from vibesys.run.contracts import RunRequest
+@@ -598,7 +599,12 @@ def test_session_closes_agent_when_bound_tool_requires_unsupported_mcp(
+         [client],
+         body,
+         declaration=(role,),
+-        configuration=_RunConfiguration(tool_bindings=AGENT_TOOL_BINDINGS),
++        configuration=_RunConfiguration(
++            profiler_kind=ProfilerKind.OTEL,
++            domain="microservices",
++            agent_backend="cli",
++            tool_bindings=AGENT_TOOL_BINDINGS,
++        ),
+     )
+     assert client.closed
+     assert not client.calls
+@@ -652,6 +658,26 @@ def test_session_resolves_bound_tools_once_and_reuses_specs_for_every_turn(
+     ]
+ 
+ 
++def test_megabench_ncu_is_absent_without_run_opt_in(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.delenv("VIBESYS_MEGABENCH_NCU_MCP_COMMAND", raising=False)
++    client = FakeAgentClient(session_reuse=True).enqueue_text("implementer", "done")
++
++    async def body(ctx: Run) -> None:
++        session = await ctx.agents.create_session(MULTI_IMPLEMENTER, workspace=ctx.workspaces.root)
++        assert await session.turn("implement") == "done"
++
++    _run_with_clients(
++        tmp_path,
++        [client],
++        body,
++        declaration=(MULTI_IMPLEMENTER,),
++        configuration=_RunConfiguration(tool_bindings=AGENT_TOOL_BINDINGS),
++    )
++    assert client.calls[0].tool_servers is None
++
++
+ def test_tool_resolver_receives_selected_workspace_once(tmp_path: Path) -> None:
+     client = FakeAgentClient(capabilities=AgentCapabilities(session_reuse=True, tool_servers=True))
+     role = AgentRole(
