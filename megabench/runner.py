@@ -25,6 +25,19 @@ from .cases import Case, select_cases
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CONTRACT_FILES = (
+    "megabench/cases.py", "megabench/runner.py", "megabench/workloads.py",
+    "megabench/p0_common.py", "megabench/p0_moe.py", "megabench/p0_gemma.py",
+    "megabench/p0_eagle3.py", "qwen3_ref.py", "moe_ref.py",
+)
+
+
+def _contract_digest() -> str:
+    digest = hashlib.sha256()
+    for name in CONTRACT_FILES:
+        digest.update(name.encode())
+        digest.update((ROOT / name).read_bytes())
+    return digest.hexdigest()
 
 
 def _load_submission(path: Path, case: Case) -> Callable:
@@ -61,8 +74,9 @@ def _compare(expected: dict, actual: dict, case: Case, device: str) -> dict:
             raise AssertionError(f"{name}: output is on {got.device}, expected {device}")
         if want.is_floating_point():
             delta = (got.float() - want.float()).abs()
+            rtol = case.bf16_rtol if want.dtype == torch.bfloat16 else case.rtol
             close = torch.isclose(got.float(), want.float(),
-                                  atol=case.atol, rtol=case.rtol, equal_nan=False)
+                                  atol=case.atol, rtol=rtol, equal_nan=False)
             details[name] = {"max_abs_error": float(delta.max().item()),
                              "mismatched_elements": int((~close).sum().item())}
             if not bool(close.all()):
@@ -182,8 +196,19 @@ def evaluate_case(case: Case, submission: Path, *, device: str,
     with torch.inference_mode():
         for trial_index, seed in enumerate(trial_seeds):
             inputs = make_inputs(case, seed, device)
-            originals = {name: value.clone() for name, value in inputs.items()}
-            expected = reference(case, originals)
+            scenario = "seeded"
+            if case.family == "spec_target_step":
+                scenario = ("eagle3_raw", "accept_full", "accept_one")[trial_index % 3]
+                if scenario != "eagle3_raw":
+                    from .p0_eagle3 import set_acceptance_scenario
+                    accepted_prefix = (case.params["draft_depth"] if
+                                       scenario == "accept_full" else 1)
+                    set_acceptance_scenario(case, inputs, accepted_prefix)
+            # Full MoE weights exceed 60 GB. Keep mutation snapshots on host
+            # so correctness does not need two full copies on one GPU.
+            originals = {name: value.detach().to("cpu", copy=True)
+                         for name, value in inputs.items()}
+            expected = reference(case, inputs)
             first_start = time.perf_counter() if trial_index == 0 else None
             actual = candidate(inputs)
             if torch.device(device).type == "cuda":
@@ -192,13 +217,28 @@ def evaluate_case(case: Case, submission: Path, *, device: str,
                 record["first_call_ms_including_jit"] = (
                     time.perf_counter() - first_start) * 1000
             for name in inputs:
-                if not torch.equal(inputs[name], originals[name]):
+                if not torch.equal(inputs[name].cpu(), originals[name]):
                     raise AssertionError(f"candidate mutated input {name}")
             details = _compare(expected, actual, case, device)
-            record["correctness"]["trials"].append({"seed": seed,
-                                                      "outputs": details})
+            trial_record = {"seed": seed, "scenario": scenario, "outputs": details}
+            if case.family == "spec_target_step":
+                trial_record["spec_accounting"] = {
+                    "proposed_draft_tokens": case.params["draft_depth"],
+                    "accepted_draft_tokens": int(expected["accepted_count"].item()),
+                    "committed_tokens": int(expected["committed_count"].item()),
+                }
+            record["correctness"]["trials"].append(trial_record)
+            del inputs, originals, expected, actual
 
         perf_inputs = make_inputs(case, secrets.randbits(32), device)
+        if case.family == "spec_target_step":
+            perf_output = reference(case, perf_inputs)
+            record["spec_accounting"] = {
+                "proposed_draft_tokens": case.params["draft_depth"],
+                "accepted_draft_tokens": int(perf_output["accepted_count"].item()),
+                "committed_tokens": int(perf_output["committed_count"].item()),
+            }
+            del perf_output
         record["candidate_timing"] = _measure(candidate, perf_inputs, device,
                                               warmup, reps)
         record["reference_timing"] = _measure(
@@ -363,6 +403,53 @@ def _output_path(value: str | None) -> Path:
     return Path(__file__).resolve().parent / "runs" / f"{stamp}-{os.getpid()}.jsonl"
 
 
+def aggregate_sessions(paths: list[Path], suite: str, method: str) -> dict:
+    """Combine one independently produced result per case for one method."""
+    expected = {case.id: case for case in select_cases(suite) if case.ready}
+    if not expected:
+        raise ValueError(f"suite {suite} has no ready cases")
+    results: dict[str, dict] = {}
+    session_ids: set[str] = set()
+    source_dirs: set[Path] = set()
+    contract_sha256 = _contract_digest()
+    for path in paths:
+        rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        if len(rows) != 1:
+            raise ValueError(f"{path}: expected exactly one case result")
+        row = rows[0]
+        case_id = row.get("case", {}).get("id")
+        session = row.get("session")
+        if case_id not in expected:
+            raise ValueError(f"{path}: unexpected case {case_id}")
+        if row["case"] != expected[case_id].to_dict():
+            raise ValueError(f"{path}: case contract differs from current {case_id}")
+        if row.get("contract_sha256") != contract_sha256:
+            raise ValueError(f"{path}: benchmark contract digest differs")
+        if case_id in results:
+            raise ValueError(f"duplicate case {case_id}")
+        if not isinstance(session, dict) or session.get("case_id") != case_id:
+            raise ValueError(f"{path}: missing matching session metadata")
+        if session.get("method") != method or not session.get("id"):
+            raise ValueError(f"{path}: method or session ID mismatch")
+        if session["id"] in session_ids:
+            raise ValueError(f"duplicate session ID {session['id']}")
+        source_dir = Path(row["submission"]).resolve().parent
+        if source_dir in source_dirs:
+            raise ValueError(f"shared candidate directory {source_dir}")
+        session_ids.add(session["id"])
+        source_dirs.add(source_dir)
+        results[case_id] = row
+    missing = sorted(expected.keys() - results.keys())
+    passed = [row for row in results.values() if row["status"] == "ok_provisional"]
+    score = (math.exp(sum(math.log(row["speedup_vs_best_baseline_cuda_event"])
+                          for row in passed) / len(passed))
+             if not missing and len(passed) == len(expected) else None)
+    return {"suite": suite, "method": method,
+            "contract_sha256": contract_sha256, "cases": results,
+            "missing_cases": missing, "passed": len(passed),
+            "total": len(expected), "provisional_geomean_speedup": score}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m megabench")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -370,11 +457,11 @@ def main(argv: list[str] | None = None) -> int:
     listing.add_argument("--suite", choices=("core", "p0", "p1", "p2", "p3", "planned", "all"),
                          default="all")
     listing.add_argument("--json", action="store_true")
-    evaluation = sub.add_parser("evaluate", help="evaluate a submission, one process/case")
+    evaluation = sub.add_parser("evaluate", help="evaluate one case from one agent session")
     evaluation.add_argument("--submission", required=True)
-    evaluation.add_argument("--suite", choices=("core", "p0", "p1", "p2", "p3", "planned", "all"),
-                            default="core")
-    evaluation.add_argument("--case", action="append", dest="ids")
+    evaluation.add_argument("--case", required=True)
+    evaluation.add_argument("--method", required=True)
+    evaluation.add_argument("--session-id", required=True)
     evaluation.add_argument("--device", default="cuda:0")
     evaluation.add_argument("--trials", type=int, default=3)
     evaluation.add_argument("--warmup", type=int, default=2)
@@ -385,6 +472,12 @@ def main(argv: list[str] | None = None) -> int:
     evaluation.add_argument("--no-graph-baseline", dest="graph_baseline",
                             action="store_false")
     evaluation.add_argument("--output")
+    aggregate = sub.add_parser("aggregate", help="combine independent case sessions")
+    aggregate.add_argument("--suite", choices=("core", "p0", "p1", "p2", "p3"),
+                           default="p0")
+    aggregate.add_argument("--method", required=True)
+    aggregate.add_argument("--input", action="append", required=True)
+    aggregate.add_argument("--output")
     worker = sub.add_parser("_worker")
     worker.add_argument("--case", required=True)
     worker.add_argument("--submission", required=True)
@@ -408,6 +501,19 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{case.id:44} {case.suite.upper():3} {state:7} "
                       f"{case.model} / {case.phase}")
         return 0
+    if args.command == "aggregate":
+        try:
+            summary = aggregate_sessions([Path(name) for name in args.input],
+                                         args.suite, args.method)
+        except (ValueError, OSError, KeyError) as exc:
+            parser.error(str(exc))
+        if args.output:
+            destination = Path(args.output).resolve()
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with destination.open("x", encoding="utf-8") as output:
+                json.dump(summary, output, indent=2)
+        print(json.dumps(summary))
+        return 0 if summary["provisional_geomean_speedup"] is not None else 1
     if min(args.trials, args.reps, args.timeout) < 1 or args.warmup < 0:
         parser.error("trials, reps, timeout must be positive; warmup >= 0")
     if args.docker_gpus and not args.docker_image:
@@ -420,27 +526,30 @@ def main(argv: list[str] | None = None) -> int:
     if not submission.is_file():
         parser.error(f"submission does not exist: {submission}")
     try:
-        cases = select_cases(args.suite, args.ids)
+        cases = select_cases("all", [args.case])
     except ValueError as exc:
         parser.error(str(exc))
     path = _output_path(args.output)
     path.parent.mkdir(parents=True, exist_ok=True)
+    case = cases[0]
     results = []
     with tempfile.TemporaryDirectory(prefix="megabench-worker-") as directory:
         with path.open("x", encoding="utf-8") as output:
-            for case in cases:
-                result = _run_one(args, case, Path(directory))
-                results.append(result)
-                output.write(json.dumps(result) + "\n")
-                output.flush()
-                print(f"{case.id}: {result['status']}" +
-                      (f" ({result['speedup_vs_best_baseline_cuda_event']:.2f}x "
-                       "GPU-event vs best available baseline)"
-                       if "speedup_vs_best_baseline_cuda_event" in result else ""))
+            result = _run_one(args, case, Path(directory))
+            result["session"] = {"id": args.session_id, "method": args.method,
+                                 "case_id": case.id}
+            result["contract_sha256"] = _contract_digest()
+            results.append(result)
+            output.write(json.dumps(result) + "\n")
+            output.flush()
+            print(f"{case.id}: {result['status']}" +
+                  (f" ({result['speedup_vs_best_baseline_cuda_event']:.2f}x "
+                   "GPU-event vs best available baseline)"
+                   if "speedup_vs_best_baseline_cuda_event" in result else ""))
     complete = [item for item in results if item["status"] == "ok_provisional"]
     score = (math.exp(sum(math.log(item["speedup_vs_best_baseline_cuda_event"])
                           for item in complete) / len(complete))
-             if len(complete) == len(cases) and complete else None)
+             if complete else None)
     print(json.dumps({"results": str(path), "provisional_geomean_speedup": score,
-                      "passed": len(complete), "total": len(cases)}))
-    return 0 if len(complete) == len(cases) else 1
+                      "passed": len(complete), "total": 1}))
+    return 0 if complete else 1

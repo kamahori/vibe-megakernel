@@ -1,10 +1,9 @@
 # MegaBench model-step task list
 
 This is the active whole-model benchmark deck. The exact case IDs and readiness
-states are in [`cases.py`](cases.py). The P0
-`dense-step-qwen3-06b-b1-s128` case is runnable with seeded synthetic BF16
-weights; the other cells are cataloged as planned and cannot score yet.
-`--suite core` selects only runnable cases. A model-step case exercises every layer in its stated model
+states are in [`cases.py`](cases.py). All five P0 cells are runnable in a
+synthetic-weight tier; P1–P3 remain planned. `--suite core` selects the five
+P0 cells. A model-step case exercises every layer in its stated model
 phase, from token or modality input through final logits and state updates.
 The timed boundary and launch policy must be fixed *per phase*: decode and
 speculative verification/iteration have different contracts.
@@ -25,9 +24,9 @@ separately.
 | Priority | Task ID / phase | Model architecture | Complete timed work | Required cells and stressor |
 | --- | --- | --- | --- | --- |
 | P0 | `dense-step-qwen3-06b-b1-s128` / decode | **Qwen3-0.6B**: 28-layer dense GQA decoder, 16 Q/8 KV heads, hidden 1,024. | Token embedding, every decoder layer, Q/K norm, RoPE, attention, SwiGLU, final norm, LM head, greedy token, and every layer's KV append. | **Ready:** B=1, context 128, synthetic BF16 weights and prior KV. Future cells: B=8, context 4,096, ragged lengths and page-boundary writes. |
-| P0 | `moe-step` / decode | **Qwen3-30B-A3B**: 48-layer GQA MoE decoder, 128 experts and top-8 routing. | Full attention and routed experts in every layer, expert reduction, LM head, and KV updates. | B=1 and 8; skewed and balanced routing; short and long context. Use the existing tiny MoE config for development and full geometry where memory allows. |
-| P0 | `quant-step` / decode | **Gemma 3 4B IT text decoder**: 34 layers, five 1,024-token local-attention layers per global-attention layer, QK norm, and GeGLU; quantize the same pinned base weights to W8A16 and W4A16. | Full text decode with quantized linear projections and both local/global KV updates; dequantization is timed. Keep tied embedding/LM head BF16 in the first version. | Matched BF16, W8A16, and W4A16 input cells; contexts on both sides of the local-window boundary. Freeze packing, group size, scales, zero points, and exceptions. |
-| P0 | `spec-target-step` / EAGLE3 verification | **Llama-3.1-8B-Instruct target** with its paired **EAGLE3 draft head** (`yuhuili/EAGLE3-LLaMA3.1-Instruct-8B`). | Given EAGLE3-proposed token IDs, tree parents, and target state, run the full 32-layer target with the proposal attention mask; select the accepted path and correction/bonus token, update target KV, and expose target hidden features for the next draft. Proposal generation is outside this timed task. | K=2/4/8 proposed depth; first/middle/last rejection and full acceptance; B=1/8; linear and branched proposal trees. |
+| P0 | `moe-step-qwen3-30b-a3b-b1-s128` / decode | **Qwen3-30B-A3B**: 48-layer GQA MoE decoder, 128 experts and top-8 routing. | Full attention and routed experts in every layer, expert reduction, independent LM head, and KV updates. | **Ready:** B=1, context 128, full geometry and synthetic BF16 weights. Future: B=8, skewed/balanced routing and longer contexts. |
+| P0 | `quant-step-gemma3-4b-w8-b1-s128` and `quant-step-gemma3-4b-w4-b1-s128` / decode | **Gemma 3 4B IT text decoder**: 34 layers, five 1,024-token local-attention layers per global-attention layer, QK norm, and GeGLU. | Full text decode with quantized linear projections and both local/global KV updates; dequantization is timed. Tied embedding/LM head stays BF16. | **Ready:** B=1, context 128, matched seeded synthetic base weights, symmetric per-row scales, signed W8 or packed signed W4. Future: pinned base checkpoint, BF16 comparison, contexts across local-window boundary. |
+| P0 | `spec-target-step-llama31-8b-k4` / EAGLE3 verification | **Llama-3.1-8B-Instruct target** with an **EAGLE3-shaped draft head**; future checkpoint tier uses `yuhuili/EAGLE3-LLaMA3.1-Instruct-8B`. | Given draft-head proposal IDs and target state, run the full 32-layer target with a linear proposal attention mask; select the accepted path and correction/bonus token, output retained target KV writes and low/mid/high features for the next draft. Proposal generation is outside this timed task. | **Ready:** B=1, context 128, K=4, synthetic one-layer feature-fused draft head, raw proposals and controlled full/partial acceptance. Future: paired checkpoints, branched trees and K=2/8. |
 | P1 | `gptoss-step` / decode | **GPT-OSS-20B**: 24-layer MoE decoder, 32 experts/top-4, alternating 128-token sliding and full attention, with native MXFP4 expert weights. | Full decode including YaRN RoPE, attention sinks, clamped gated experts, LM head, and KV updates. | B=1/8; contexts across a sliding-window boundary; skewed/balanced routes. Use `GPT_OSS_TINY` for development, then checkpoint-accurate MXFP4. |
 | P1 | `hybrid-step` / decode | **Qwen3.5-0.8B text path**: 24 layers, 18 linear-attention/DeltaNet and 6 full-attention layers. | Full text decoder, recurrent state updates, conventional attention, FFNs, final logits, and both state types. | B=1/8, short/long context; reset and continuing state. Vision input is outside this text-path task. |
 | P1 | `vl-decode-step` / conditioned decode | **Gemma 3 4B IT**: 27-layer SigLIP vision tower and 34-layer text decoder with five local layers per global layer. Only the text decoder is in this timed step. | Complete image-conditioned text decode through LM head and local/global KV append, starting from a reference-generated multimodal prefill state. | B=1/4, one vs several images, varied image-token counts and context. The vision tower and prefill are outside timing; report this as conditioned decode, not full vision inference. |
@@ -37,11 +36,10 @@ separately.
 | P3 | `glm52-step` / frontier decode | **GLM-5.2-FP8**: 78-layer GLM MoE with DSA indexer, 256 routed experts/top-8 plus a shared expert. | Full text decode including index selection, sparse attention, expert routing, LM head, and KV update. | Multi-GPU TP+EP; B=1/8, indexer boundary cases and skewed routes. Pin the indexer pattern and FP8 checkpoint before scoring. |
 | P3 | `kimi-k3-step` / frontier hybrid decode | **Kimi-K3 text path**: 93 layers (69 Kimi Delta Attention, 24 gated MLA), 896 routed experts/top-16, native quantized expert weights. | Full text decode including recurrent state, MLA KV, expert routing, attention residuals, and LM head. | Memory-audited multi-GPU placement; B=1/8, reset/continuing state and long context. Vision input is outside this text-path task. |
 
-The first implementation milestone, full `dense-step` B=1 at context 128,
-is active with real layer count and final projection. Its random-weight
-result must remain separate from a future pinned-checkpoint result. Next
-are `moe-step`, `quant-step`, and `spec-target-step`. Small development cells
-should be labeled `dev` and excluded from the score.
+The P0 implementation milestone is active with full layer counts and final
+projections. Random-weight results must remain separate from future pinned
+checkpoint results. Small development cells are labeled `dev` and excluded
+from the score.
 `vl-decode-step` begins with an image-conditioned KV fixture built by the
 trusted reference prefill. It measures the full decoder step but does not
 claim fusion of the vision tower or prompt prefill. The P3 cases require a
@@ -61,8 +59,9 @@ The speculative pair is the
 [Llama-3.1-8B-Instruct target](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct)
 and the [official EAGLE3 draft checkpoint](https://huggingface.co/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B),
 as listed by the [EAGLE project](https://github.com/SafeAILab/EAGLE#eagle-3-models-on-hugging-face).
-Start with greedy acceptance and the project's pinned draft-tree setup; a
-sampling variant needs its own precisely specified acceptance distribution.
+The synthetic P0 target-verification cell uses greedy linear-chain acceptance.
+The project's pinned draft-tree setup and sampling variant need separate
+contracts and paired checkpoints.
 Pin immutable checkpoint and processor revisions when implementing each case;
 the links above identify architecture, not benchmark artifact versions.
 

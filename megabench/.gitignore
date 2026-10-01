@@ -3,3 +3,9 @@ results/
 runs/
 experiments/
 archive/
+AGENT_TRIALS.md
+MPK_TRIAL.md
+P0_CASE_SESSION_TRIAL.md
+P0_TRIAL.md
+*.log
+*.jsonl

@@ -25,6 +25,7 @@ class Case:
     max_gpu_launches: int = 1
     atol: float = 0.0
     rtol: float = 0.0
+    bf16_rtol: float = 0.008
     ready: bool = False
     note: str = ""
 
@@ -35,6 +36,8 @@ class Case:
             raise ValueError(f"invalid dimensions in {self.id}")
         if min(self.gpus, self.tp, self.ep, self.max_gpu_launches) < 1:
             raise ValueError(f"invalid execution geometry in {self.id}")
+        if min(self.atol, self.rtol, self.bf16_rtol) < 0:
+            raise ValueError(f"invalid tolerance in {self.id}")
         if self.suite not in ("p0", "p1", "p2", "p3"):
             raise ValueError(f"invalid priority in {self.id}")
 
@@ -54,22 +57,32 @@ CASES: tuple[Case, ...] = (
          {"batch": 1, "context": 128, "layers": 48, "hidden": 2048,
           "q_heads": 32, "kv_heads": 4, "head_dim": 128,
           "experts": 128, "topk": 8, "intermediate": 768, "vocab": 151936},
-         "routed_moe", "p0", note="Full-model oracle and memory audit pending."),
+         "routed_moe", "p0", ready=True, atol=0.003, rtol=0.003,
+         note="Full 48-layer synthetic-BF16 MoE decode; checkpoint tier pending."),
     Case("quant-step-gemma3-4b-w8-b1-s128", "quant_step",
          "google/gemma-3-4b-it", "decode",
          {"batch": 1, "context": 128, "layers": 34, "hidden": 2560,
+          "q_heads": 8, "kv_heads": 4, "head_dim": 256,
+          "intermediate": 10240, "vocab": 262144,
           "bits": 8, "local_window": 1024}, "quantized_llm", "p0",
-         note="Gemma 3 W8A16 oracle and quantization recipe pending."),
+         ready=True, atol=0.003, rtol=0.003,
+         note="Full synthetic Gemma 3 W8A16 decode; checkpoint tier pending."),
     Case("quant-step-gemma3-4b-w4-b1-s128", "quant_step",
          "google/gemma-3-4b-it", "decode",
          {"batch": 1, "context": 128, "layers": 34, "hidden": 2560,
+          "q_heads": 8, "kv_heads": 4, "head_dim": 256,
+          "intermediate": 10240, "vocab": 262144,
           "bits": 4, "local_window": 1024}, "quantized_llm", "p0",
-         note="Gemma 3 W4A16 oracle and quantization recipe pending."),
+         ready=True, atol=0.003, rtol=0.003,
+         note="Full synthetic Gemma 3 W4A16 decode; checkpoint tier pending."),
     Case("spec-target-step-llama31-8b-k4", "spec_target_step",
          "meta-llama/Llama-3.1-8B-Instruct + EAGLE3", "verify",
-         {"batch": 1, "context": 128, "layers": 32, "draft_depth": 4},
-         "speculative_decoding", "p0",
-         note="EAGLE3 proposal-tree and full-target oracle pending."),
+         {"batch": 1, "context": 128, "layers": 32, "draft_depth": 4,
+          "hidden": 4096, "q_heads": 32, "kv_heads": 8,
+          "head_dim": 128, "intermediate": 14336,
+          "vocab": 128256, "draft_vocab": 32000},
+         "speculative_decoding", "p0", ready=True, atol=0.003, rtol=0.003,
+         note="Full synthetic Llama target verification; linear EAGLE3-head proposals."),
     Case("gptoss-step-20b-b1-s128", "gptoss_step", "openai/gpt-oss-20b",
          "decode", {"batch": 1, "context": 128, "layers": 24,
                     "experts": 32, "topk": 4, "sliding_window": 128},

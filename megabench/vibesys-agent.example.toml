@@ -1,0 +1,13 @@
+[model]
+name = "gpt-6-sol"
+
+[thinking]
+level = "medium"
+
+[agent]
+backend = "cli"
+driver = "agentshim"
+cli_provider = "codex"
+
+[backend]
+name = "cuda"
