@@ -48,7 +48,7 @@ can provide performance counters to either agent method. Install it outside
 the candidate checkout and expose the same server/tools to both methods. Give
 each session its own report directory. The server's `profile` tool accepts one
 executable path; a case-specific executable can call
-`python -m megabench.ncu_profile_case --case CASE_ID --submission PATH`.
+`python -m megabench.integrations.ncu_profile_case --case CASE_ID --submission PATH`.
 Set `NCU_PATH` to `megabench/integrations/ncu_capture.sh` so only the CUDA profiler
 start/stop window is captured. Pass `kernel_filter="regex:<model kernel name>"`,
 `set="basic"`, `launch_count=1`, and the assigned physical GPU to `profile`,
@@ -57,7 +57,7 @@ the candidate's source or the evaluator's launch audit; without the filter,
 setup kernels may be captured instead. NCU measurements are diagnostic and
 do not replace MegaBench correctness, launch audit, or latency scoring.
 
-For VibeSys, run `python -m megabench.make_vibesys_case_task --case CASE_ID`
+For VibeSys, run `python -m megabench.integrations.make_vibesys_case_task --case CASE_ID`
 inside a fresh checkout. This creates a case-specific objective and a
 protected evaluator under `.vibesys/tasks/CASE_ID/`. Run VibeSys with that
 single task name. Its accuracy and benchmark commands only call the assigned

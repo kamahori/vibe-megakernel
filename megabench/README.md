@@ -15,12 +15,12 @@ boundary; [`cases.py`](cases.py) is the active machine-readable catalog.
   used by MegaBench; it does not import the TIRx experiment copies.
 - [`harness/`](harness/) contains the correctness checker, timing and launch
   audit, evaluation runner, and aggregation. `python -m megabench` remains the
-  command-line entry point. Root-level `workloads.py` and `runner.py` preserve
-  existing imports.
+  command-line entry point. Small root-level `runner.py` and `workloads.py`
+  modules preserve imports used by existing submissions and agent workspaces.
 - [`docs/`](docs/) holds the task catalog, the one-case agent brief, and the
   session protocol.
 - [`integrations/`](integrations/) holds the VibeSys adapter and NCU profiling
-  helpers. The original Python module commands remain available as wrappers.
+  commands. The root-level NCU command remains available for agent workspaces.
 - [`tests/`](tests/) contains the suite tests; [`examples/`](examples/) contains
   a reference submission.
 - `experiments/YYYY-MM-DD/HH-MM-SS-<campaign>/`, `runs/`, and `archive/` hold

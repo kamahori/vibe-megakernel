@@ -1,14 +1,4 @@
-"""PyTorch reference for a Qwen3-0.6B-shaped decoder (batch-1 greedy decode).
-
-Architecture (matches Qwen3-0.6B exactly, random weights):
-  hidden 1024, 28 layers, 16 Q heads / 8 KV heads (GQA), head_dim 128,
-  intermediate 3072 (SwiGLU), RMSNorm eps 1e-6, per-head QK-norm,
-  RoPE theta 1e6 (rotate-half), tied embedding / lm_head.
-
-Weights are generated ONCE in bf16 in the exact stacked layout the TIRx
-megakernel consumes; this reference upcasts the same bf16 bits to fp32,
-so any mismatch with the kernel is accumulation order / precision, not data.
-"""
+"""Qwen3 dense decoder used only by MegaBench's PyTorch oracle."""
 
 from __future__ import annotations
 
@@ -31,42 +21,6 @@ class Config:
     max_seq: int = 2048
 
 
-def make_weights(cfg: Config, seed: int = 0, device="cuda") -> dict[str, torch.Tensor]:
-    """Stacked bf16 weights in the layout the megakernel reads (GPU-side RNG:
-    a 30B-class model would take minutes and 128 GB of host RAM on CPU)."""
-    g = torch.Generator(device=device).manual_seed(seed)
-    H, L, I, D = cfg.hidden, cfg.layers, cfg.inter, cfg.head_dim
-    QD, KD = cfg.q_heads * D, cfg.kv_heads * D
-
-    def randw(*shape, fan_in):
-        w = torch.randn(*shape, generator=g, device=device) * (fan_in**-0.5)
-        return w.to(torch.bfloat16)
-
-    def randn_norm(*shape):
-        w = 1.0 + 0.1 * torch.randn(*shape, generator=g, device=device)
-        return w.to(torch.bfloat16)
-
-    ret = {
-        "ln1": randn_norm(L, H),
-        "wq": randw(L, QD, H, fan_in=H),
-        "wk": randw(L, KD, H, fan_in=H),
-        "wv": randw(L, KD, H, fan_in=H),
-        "qn": randn_norm(L, D),
-        "kn": randn_norm(L, D),
-        "wo": randw(L, H, QD, fan_in=QD),
-        "ln2": randn_norm(L, H),
-        "wg": randw(L, I, H, fan_in=H),
-        "wu": randw(L, I, H, fan_in=H),
-        "wd": randw(L, H, I, fan_in=I),
-        "fnorm": randn_norm(H),
-        "embed": (torch.randn(cfg.vocab, H, generator=g, device=device) * 0.02).to(
-            torch.bfloat16
-        ),
-    }
-    torch.cuda.synchronize()
-    return ret
-
-
 def rope_tables(cfg: Config, device="cuda") -> tuple[torch.Tensor, torch.Tensor]:
     """cos/sin[max_seq, head_dim] fp32, HF layout (freqs duplicated across halves)."""
     D = cfg.head_dim
@@ -87,34 +41,20 @@ def _rot_half(x: torch.Tensor) -> torch.Tensor:
 
 
 class RefDecoder:
-    """fp32 eager decoder over the shared bf16 weights, with fp32 KV cache.
+    """Eager fp32 decoder over BF16 task weights, with an fp32 KV cache."""
 
-    lazy_cast=True keeps weights in bf16 and upcasts per use — required for
-    30B-class models where a persistent fp32 copy would not fit in memory.
-    Numerics are identical either way (fp32 math on the same bf16 values).
-    """
-
-    def __init__(self, cfg: Config, w: dict[str, torch.Tensor], device="cuda", lazy_cast=False):
+    def __init__(self, cfg: Config, w: dict[str, torch.Tensor], device="cuda"):
         self.cfg = cfg
-        self.lazy = lazy_cast
         self.w_bf16 = w
-        self.w32 = None if lazy_cast else {k: v.float() for k, v in w.items()}
         self.cos, self.sin = rope_tables(cfg, device)
         L, S = cfg.layers, cfg.max_seq
         self.k_cache = torch.zeros(L, S, cfg.kv_heads, cfg.head_dim, device=device)
         self.v_cache = torch.zeros(L, S, cfg.kv_heads, cfg.head_dim, device=device)
         self.pos = 0
 
-    def reset(self):
-        self.k_cache.zero_()
-        self.v_cache.zero_()
-        self.pos = 0
-
     def _get(self, name, idx=None):
-        if self.lazy:
-            t = self.w_bf16[name] if idx is None else self.w_bf16[name][idx]
-            return t.float()
-        return self.w32[name] if idx is None else self.w32[name][idx]
+        t = self.w_bf16[name] if idx is None else self.w_bf16[name][idx]
+        return t.float()
 
     def step(self, token: int) -> torch.Tensor:
         """One decode step: returns logits[vocab] fp32; advances the KV cache."""
@@ -154,26 +94,3 @@ class RefDecoder:
         logits = g("embed") @ _rms(x, g("fnorm"), cfg.eps)
         self.pos += 1
         return logits
-
-    def generate(self, start_token: int, n_steps: int) -> tuple[list[int], torch.Tensor]:
-        """Greedy decode n_steps tokens. Returns (tokens, last_logits)."""
-        tok = start_token
-        out = []
-        logits = None
-        for _ in range(n_steps):
-            logits = self.step(tok)
-            tok = int(logits.argmax())
-            out.append(tok)
-        return out, logits
-
-
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    cfg = Config()
-    w = make_weights(cfg)
-    ref = RefDecoder(cfg, w)
-    toks, logits = ref.generate(start_token=12345, n_steps=8)
-    print("tokens:", toks)
-    print("logits: mean %.4f std %.4f max %.4f" % (logits.mean(), logits.std(), logits.max()))
-    assert not torch.isnan(logits).any()
-    print("reference OK")

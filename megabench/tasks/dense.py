@@ -71,8 +71,7 @@ def make_inputs(case: Case, seed: int, device: str) -> dict[str, torch.Tensor]:
 def reference(case: Case, t: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     cfg = _qwen3_config(case)
     weights = {name: t[name] for name in QWEN3_WEIGHT_NAMES}
-    ref = RefDecoder(cfg, weights, device=str(t["token"].device),
-                     lazy_cast=True)
+    ref = RefDecoder(cfg, weights, device=str(t["token"].device))
     context = case.params["context"]
     ref.k_cache[:, :context] = t["kcache"].float()
     ref.v_cache[:, :context] = t["vcache"].float()

@@ -15,9 +15,10 @@ from unittest.mock import patch
 import torch
 
 from ..cases import CASES, Case, select_cases
-from ..runner import (_compare, _contract_digest, _docker_worker_command,
-                     _output_path, _run_one, _stop_owned_container,
-                     aggregate_sessions, evaluate_case, main)
+from ..harness.correctness import _compare
+from ..harness.runner import (_contract_digest, _docker_worker_command,
+                              _output_path, _run_one, _stop_owned_container,
+                              aggregate_sessions, evaluate_case, main)
 from ..workloads import make_inputs, reference
 
 
@@ -179,7 +180,7 @@ class HarnessTests(unittest.TestCase):
         self.assertFalse(any("docker.sock" in part for part in cmd))
 
     def test_timeout_cleanup_never_stops_unverified_container(self) -> None:
-        with patch("megabench.runner.subprocess.run") as run:
+        with patch("megabench.harness.runner.subprocess.run") as run:
             run.return_value.returncode = 0
             run.return_value.stdout = "someone-else\n"
             warning = _stop_owned_container("megabench-test", "expected")
@@ -226,7 +227,7 @@ class HarnessTests(unittest.TestCase):
             args = Namespace(submission=str(submission), docker_image=None,
                              device="cpu", trials=1, warmup=0, reps=1,
                              graph_baseline=False, timeout=1)
-            with patch("megabench.runner.subprocess.run",
+            with patch("megabench.harness.runner.subprocess.run",
                        side_effect=subprocess.TimeoutExpired("worker", 1)):
                 result = _run_one(args, TINY_DENSE, root)
         self.assertEqual(result["status"], "timeout")
