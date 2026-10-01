@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from moe_ref import MoeConfig, MoeRefDecoder
+from .references.moe import MoeConfig, MoeRefDecoder
 
 from ..cases import Case
 from .common import fill_layer_weights, random_norm, random_weight

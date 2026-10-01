@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 import torch
 
-from qwen3_ref import _rms, _rot_half, rope_tables
+from .qwen3 import _rms, _rot_half, rope_tables
 
 
 @dataclass

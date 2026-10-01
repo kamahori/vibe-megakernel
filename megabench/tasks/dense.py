@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import torch
 
-from qwen3_ref import Config as Qwen3Config
-from qwen3_ref import RefDecoder
+from .references.qwen3 import Config as Qwen3Config
+from .references.qwen3 import RefDecoder
 
 from ..cases import Case
 

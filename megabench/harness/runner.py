@@ -33,7 +33,8 @@ CONTRACT_FILES = (
     "megabench/harness/benchmark.py", "megabench/tasks/workloads.py",
     "megabench/tasks/dense.py", "megabench/tasks/common.py", "megabench/tasks/moe.py",
     "megabench/tasks/gemma.py", "megabench/tasks/eagle3.py",
-    "qwen3_ref.py", "moe_ref.py",
+    "megabench/tasks/references/qwen3.py",
+    "megabench/tasks/references/moe.py",
 )
 
 
@@ -81,7 +82,8 @@ def evaluate_case(case: Case, submission: Path, *, device: str,
             name in source_text for name in
             ("megabench.workloads", "megabench.tasks.workloads",
              "megabench.tasks.dense", "megabench.tasks.moe",
-             "megabench.tasks.gemma", "megabench.tasks.eagle3")),
+             "megabench.tasks.gemma", "megabench.tasks.eagle3",
+             "megabench.tasks.references")),
     }
     if not case.ready:
         return record | {"status": "not_implemented", "reason": case.note}

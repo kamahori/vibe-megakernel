@@ -10,7 +10,9 @@ boundary; [`cases.py`](cases.py) is the active machine-readable catalog.
 
 - [`cases.py`](cases.py) defines the case catalog.
 - [`tasks/`](tasks/) contains one fixture and PyTorch reference per ready model,
-  shared reference helpers, and the workload dispatcher.
+  shared reference helpers, and the workload dispatcher. Its
+  [`references/`](tasks/references/) package owns the Qwen3 decoder references
+  used by MegaBench; it does not import the TIRx experiment copies.
 - [`harness/`](harness/) contains the correctness checker, timing and launch
   audit, evaluation runner, and aggregation. `python -m megabench` remains the
   command-line entry point. Root-level `workloads.py` and `runner.py` preserve
