@@ -15,9 +15,9 @@ from unittest.mock import patch
 import torch
 
 from ..cases import CASES, Case, select_cases
-from ..runner import (_compare, _contract_digest, _docker_worker_command, _run_one,
-                     aggregate_sessions,
-                     _stop_owned_container, evaluate_case, main)
+from ..runner import (_compare, _contract_digest, _docker_worker_command,
+                     _output_path, _run_one, _stop_owned_container,
+                     aggregate_sessions, evaluate_case, main)
 from ..workloads import make_inputs, reference
 
 
@@ -105,7 +105,7 @@ class CatalogTests(unittest.TestCase):
                 self.assertTrue(all(torch.equal(inputs[k], before[k]) for k in inputs))
 
     def test_quantized_weight_layout_and_shared_base_stream(self) -> None:
-        from ..p0_gemma import dequant
+        from ..tasks.gemma import dequant
 
         w8 = make_inputs(TINY_W8, 4)
         w4 = make_inputs(TINY_W4, 4)
@@ -127,7 +127,7 @@ class CatalogTests(unittest.TestCase):
         self.assertFalse(torch.equal(normal, zero_head))
 
     def test_speculative_acceptance_and_rollback(self) -> None:
-        from ..p0_eagle3 import set_acceptance_scenario
+        from ..tasks.eagle3 import set_acceptance_scenario
 
         values = make_inputs(TINY_SPEC, 17)
         with torch.inference_mode():
@@ -150,6 +150,10 @@ class CatalogTests(unittest.TestCase):
 
 
 class HarnessTests(unittest.TestCase):
+    def test_default_results_stay_under_megabench(self) -> None:
+        self.assertEqual(_output_path(None).parent,
+                         Path(__file__).resolve().parents[1] / "runs")
+
     def test_docker_command_uses_only_scoped_mounts_and_gpu(self) -> None:
         case = select_cases("core")[0]
         args = Namespace(submission=str(REFERENCE_SUBMISSION), device="cuda:0",

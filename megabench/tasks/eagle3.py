@@ -11,8 +11,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .cases import Case
-from .p0_common import fill_layer_weights, random_norm, random_weight, rms, rope
+from ..cases import Case
+from .common import fill_layer_weights, random_norm, random_weight, rms, rope
 
 
 def _eagle3_proposals(case: Case, seed: int, token: torch.Tensor,

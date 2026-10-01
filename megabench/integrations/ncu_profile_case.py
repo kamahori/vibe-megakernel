@@ -13,7 +13,7 @@ import argparse
 from pathlib import Path
 
 from ..cases import select_cases
-from ..runner import _load_submission
+from ..harness.runner import _load_submission
 from ..workloads import make_inputs
 
 

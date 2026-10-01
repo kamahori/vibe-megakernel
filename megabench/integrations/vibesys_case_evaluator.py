@@ -8,7 +8,8 @@ import secrets
 from pathlib import Path
 
 from ..cases import select_cases
-from ..runner import _compare, _load_submission, evaluate_case
+from ..harness.correctness import _compare
+from ..harness.runner import _load_submission, evaluate_case
 from ..workloads import make_inputs, reference
 
 
@@ -32,7 +33,7 @@ def main(case_id: str, argv: list[str] | None = None) -> int:
                 for scenario in scenarios:
                     values = make_inputs(case, secrets.randbits(32), "cuda:0")
                     if scenario in ("full", "partial"):
-                        from ..p0_eagle3 import set_acceptance_scenario
+                        from ..tasks.eagle3 import set_acceptance_scenario
                         set_acceptance_scenario(case, values,
                                                 case.params["draft_depth"] if scenario == "full" else 1)
                     originals = {name: value.detach().to("cpu", copy=True)

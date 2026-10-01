@@ -1,4 +1,4 @@
-from .runner import main
+from .harness.runner import main
 
 
 if __name__ == "__main__":

@@ -7,14 +7,10 @@ import hashlib
 from pathlib import Path
 
 from ..cases import select_cases
+from ..harness.runner import CONTRACT_FILES
 
 
-TRUSTED = (
-    "megabench/cases.py", "megabench/workloads.py", "megabench/runner.py",
-    "megabench/p0_common.py", "megabench/p0_moe.py", "megabench/p0_gemma.py",
-    "megabench/p0_eagle3.py", "megabench/integrations/vibesys_case_evaluator.py",
-    "qwen3_ref.py", "moe_ref.py",
-)
+TRUSTED = (*CONTRACT_FILES, "megabench/integrations/vibesys_case_evaluator.py")
 
 
 def make_task(case_id: str, root: Path) -> Path:

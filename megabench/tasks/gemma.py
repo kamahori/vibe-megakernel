@@ -12,8 +12,8 @@ import math
 import torch
 import torch.nn.functional as F
 
-from .cases import Case
-from .p0_common import random_norm, random_weight, rms, rope
+from ..cases import Case
+from .common import random_norm, random_weight, rms, rope
 
 
 LINEAR_NAMES = ("wq", "wk", "wv", "wo", "wg", "wu", "wd")

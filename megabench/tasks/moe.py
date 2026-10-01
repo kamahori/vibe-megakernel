@@ -6,8 +6,8 @@ import torch
 
 from moe_ref import MoeConfig, MoeRefDecoder
 
-from .cases import Case
-from .p0_common import fill_layer_weights, random_norm, random_weight
+from ..cases import Case
+from .common import fill_layer_weights, random_norm, random_weight
 
 
 WEIGHT_NAMES = (

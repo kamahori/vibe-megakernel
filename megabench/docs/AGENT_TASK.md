@@ -5,7 +5,7 @@ file. Start a fresh agent session and candidate checkout for each case; do not
 carry candidate code or chat context from another case. The case ID must be
 fixed in the session objective before the agent starts.
 Export `build(case: dict) -> run(inputs: dict) -> outputs: dict`. Read
-[`workloads.py`](../workloads.py) for exact input and output semantics and the
+[`tasks/`](../tasks/) for exact input and output semantics and the
 [task catalog](MODEL_STEP_TASKS.md) for model architecture and timed boundary.
 You may use Triton, CUDA C++/extensions, TIRx, another GPU DSL, or a Python
 loader for compiled kernels.

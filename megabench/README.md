@@ -8,9 +8,13 @@ boundary; [`cases.py`](cases.py) is the active machine-readable catalog.
 
 ## Repository layout
 
-- [`cases.py`](cases.py), [`workloads.py`](workloads.py), `p0_*.py`, and
-  [`runner.py`](runner.py) define the catalog, input generators, PyTorch
-  references, correctness checks, timing, and aggregation.
+- [`cases.py`](cases.py) defines the case catalog.
+- [`tasks/`](tasks/) contains one fixture and PyTorch reference per ready model,
+  shared reference helpers, and the workload dispatcher.
+- [`harness/`](harness/) contains the correctness checker, timing and launch
+  audit, evaluation runner, and aggregation. `python -m megabench` remains the
+  command-line entry point. Root-level `workloads.py` and `runner.py` preserve
+  existing imports.
 - [`docs/`](docs/) holds the task catalog, the one-case agent brief, and the
   session protocol.
 - [`integrations/`](integrations/) holds the VibeSys adapter and NCU profiling
@@ -73,8 +77,8 @@ def build(case: dict):
 `run` may allocate outputs but must not mutate inputs. It must compute from
 the current token, weights, and prior state; correctness trials change their
 values. Every P0 cell currently has a one-GPU-kernel launch budget. See
-[`workloads.py`](workloads.py) and the `p0_*.py` modules for tensor names,
-layouts, and exact reference math; [`cases.py`](cases.py) specifies shapes
+[`tasks/`](tasks/) for tensor names, layouts, and exact reference math;
+[`cases.py`](cases.py) specifies shapes
 and tolerances. The included
 [`reference_submission.py`](examples/reference_submission.py) demonstrates
 the API and CPU correctness path. Its many PyTorch GPU launches fail the
