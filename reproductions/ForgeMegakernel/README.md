@@ -43,6 +43,12 @@ The five P0 campaigns are under `megabench/experiments/2026-10-02/06-19-37-forge
 
 These are synthetic-weight MegaBench P0 results, not paper checkpoint or MBU results. The server had other jobs using several B200s during the campaign, so the latencies are provisional. No five-case campaign score is claimed because the MoE and W8 rounds were not accepted by the gate/review loop. The adapter now passes its worker timeout to MegaBench, records early failures without mislabeling them as digest mismatches, uses a fresh extension cache for each gate, and includes the full source manifest and gate result in reviewer input.
 
+The accepted source snapshots, including the later two-round dense Qwen3
+candidate, are in [`p0_candidates/`](p0_candidates/README.md). The dense
+candidate passed three fresh trials with one launch at 3.686 ms CUDA-event p50
+on the shared B200 host; this is still a MegaBench development result, not a
+Forge paper milestone.
+
 ## Paper mapping and status
 
 | Paper component | Local implementation | Evidence and limit |
