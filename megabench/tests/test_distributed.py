@@ -20,17 +20,19 @@ from .test_kimi import development as kimi_development
 
 class DistributedReferenceTests(unittest.TestCase):
     def test_frontier_state_rollouts_match_serial_oracles(self):
-        for case in select_cases('p3'):
-            with self.subTest(case=case.id), tempfile.TemporaryDirectory() as directory:
+        cases = select_cases('p3')
+        checks = [(case,2) for case in cases] + [(case,8) for case in cases[:2]]
+        for case,ranks in checks:
+            with self.subTest(case=case.id,ranks=ranks), tempfile.TemporaryDirectory() as directory:
                 result = subprocess.run(
                     [sys.executable, '-m', 'torch.distributed.run', '--standalone',
-                     '--nproc-per-node=2', '-m', 'megabench.verify_frontier',
+                     f'--nproc-per-node={ranks}', '-m', 'megabench.verify_frontier',
                      '--case', case.id, '--device', 'cpu', '--trials', '2',
                      '--steps', '3', '--output', directory],
                     env=os.environ | {'CUDA_VISIBLE_DEVICES':'', 'OMP_NUM_THREADS':'1'},
                     capture_output=True, text=True, timeout=120)
                 self.assertEqual(result.returncode, 0, (result.stdout+result.stderr)[-12000:])
-                for rank in range(2):
+                for rank in range(ranks):
                     report = json.loads((Path(directory)/f'rank-{rank}.json').read_text())
                     self.assertEqual(report['status'], 'pass')
                     self.assertEqual(report['steps'], 3)

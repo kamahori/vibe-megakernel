@@ -107,6 +107,11 @@ def verify(case, device, trials, full, steps=3):
                                                          'intermediate':512,'dense_intermediate':512})
         else:
             case = development(case)
+            if dist.get_world_size() > 2:
+                # Every FP8 row/column shard must retain whole 128-channel blocks.
+                ranks = dist.get_world_size()
+                case = replace(case,params=case.params | {'q_heads':4*ranks,
+                                                         'intermediate':128*ranks,'dense_intermediate':128*ranks})
         case = replace(case,gpus=dist.get_world_size(),tp=dist.get_world_size())
     report = {'case':case.to_dict(),'rank':rank,'full_geometry':full,'steps':steps,'trials':[],
               'torch':torch.__version__,'cuda':torch.version.cuda}

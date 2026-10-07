@@ -93,6 +93,8 @@ types and cache lengths after each commit; the maximum logit error across
 both trajectories is 6.3478947e-6. Frontier protocol checks also default to
 three committed steps. Development-geometry TP2 rollouts pass for DeepSeek,
 GLM and Kimi, and Kimi's 16-rank CPU rollout passes both seeded histories.
+DeepSeek and GLM also pass eight-rank CPU rollouts with development dimensions
+that retain full native 128-channel FP8 blocks in every TP slice.
 DeepSeek and GLM also match their upstream DSA indexer implementations with
 native activation quantization and partial-context selection; selected IDs
 and emitted FP8 key/scale payloads agree exactly. This checks actual sparse
