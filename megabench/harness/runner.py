@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Callable
 
 from ..cases import Case, select_cases
+from ..sol import (DEFAULT_B200_BANDWIDTH_SOURCE,
+                   DEFAULT_B200_BANDWIDTH_TB_S, estimate_case)
 from ..workloads import make_inputs, reference
 from .benchmark import _audit_launches, _measure
 from .correctness import check_trials
@@ -337,6 +339,18 @@ def main(argv: list[str] | None = None) -> int:
     listing.add_argument("--suite", choices=("core", "p0", "p1", "p2", "p3", "planned", "all"),
                          default="all")
     listing.add_argument("--json", action="store_true")
+    sol = sub.add_parser("sol", help="estimate optimistic HBM speed-of-light floors")
+    sol.add_argument("--suite", choices=("core", "p0", "p1", "p2", "p3", "planned", "all"),
+                     default="core")
+    sol.add_argument("--case", help="show one case, regardless of suite")
+    sol.add_argument("--bandwidth-tb-s", type=float,
+                     default=DEFAULT_B200_BANDWIDTH_TB_S,
+                     help="assumed peak HBM TB/s per GPU (default: B200 8.0)")
+    sol.add_argument("--measured-ms", type=float,
+                     help="candidate CUDA-event median in ms; requires --case")
+    sol.add_argument("--result", type=Path,
+                     help="one MegaBench evaluate JSONL result; requires --case")
+    sol.add_argument("--json", action="store_true")
     evaluation = sub.add_parser("evaluate", help="evaluate one case from one agent session")
     evaluation.add_argument("--submission", required=True)
     evaluation.add_argument("--case", required=True)
@@ -380,6 +394,59 @@ def main(argv: list[str] | None = None) -> int:
                 state = "ready" if case.ready else "planned"
                 print(f"{case.id:44} {case.suite.upper():3} {state:7} "
                       f"{case.model} / {case.phase}")
+        return 0
+    if args.command == "sol":
+        if (args.measured_ms is not None or args.result is not None) and not args.case:
+            parser.error("--measured-ms and --result require --case")
+        if args.measured_ms is not None and args.result is not None:
+            parser.error("use either --measured-ms or --result")
+        try:
+            cases = select_cases("all", [args.case]) if args.case else select_cases(args.suite)
+            measured_ms = args.measured_ms
+            if args.result is not None:
+                rows = [json.loads(line) for line in args.result.read_text().splitlines()
+                        if line.strip()]
+                if len(rows) != 1:
+                    raise ValueError("--result must contain exactly one case result")
+                row = rows[0]
+                if row.get("case") != cases[0].to_dict():
+                    raise ValueError("--result case contract does not match --case")
+                measured_ms = row.get("candidate_timing", {}).get("cuda_event_p50_ms")
+                if measured_ms is None:
+                    raise ValueError("--result has no candidate CUDA-event median")
+            estimates = [estimate_case(case, args.bandwidth_tb_s, measured_ms)
+                         for case in cases]
+        except (ValueError, OSError, KeyError, TypeError) as exc:
+            parser.error(str(exc))
+        report = {
+            "method": "optimistic_one_read_hbm_floor",
+            "assumed_bandwidth_tb_s_per_gpu": args.bandwidth_tb_s,
+            "default_b200_bandwidth_source": DEFAULT_B200_BANDWIDTH_SOURCE,
+            "assumptions": [
+                "Count each used weight and needed old KV element once, plus required outputs.",
+                "MoE counts only selected experts; speculative verification reuses weights across positions.",
+                "Peak bandwidth, perfect reuse, and no scratch, synchronization, or compute costs are assumed.",
+                "This is an HBM lower bound, not a prediction of achievable runtime.",
+            ],
+            "cases": estimates,
+        }
+        if args.json:
+            print(json.dumps(report, indent=2))
+        else:
+            print(f"Optimistic one-read HBM floor at {args.bandwidth_tb_s:g} TB/s per GPU")
+            print("Peak-bandwidth lower bound; excludes compute, scratch, and synchronization.")
+            for item in estimates:
+                if item["status"] == "estimated":
+                    suffix = (f"  gap {item['gap_to_hbm_floor_x']:.1f}x"
+                              if "gap_to_hbm_floor_x" in item else "")
+                    print(f"{item['case_id']:44} {item['minimum_gb']:7.3f} GB  "
+                          f"{item['hbm_floor_ms']:7.3f} ms{suffix}")
+                    if args.case:
+                        for component in item["components"]:
+                            print(f"  {component['name']:40} "
+                                  f"{component['bytes'] / 1e9:8.4f} GB")
+                else:
+                    print(f"{item['case_id']:44} unavailable: {item['reason']}")
         return 0
     if args.command == "aggregate":
         try:

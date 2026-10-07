@@ -20,7 +20,8 @@ boundary; [`cases.py`](cases.py) is the active machine-readable catalog.
 - [`docs/`](docs/) holds the task catalog, the one-case agent brief, and the
   session protocol.
 - [`integrations/`](integrations/) holds the VibeSys adapter and NCU profiling
-  commands. The root-level NCU command remains available for agent workspaces.
+  commands. [`make_agent_workspace.py`](make_agent_workspace.py) creates a small
+  workspace for one case and one agent session.
 - [`tests/`](tests/) contains the suite tests; [`examples/`](examples/) contains
   a reference submission.
 - `experiments/YYYY-MM-DD/HH-MM-SS-<campaign>/`, `runs/`, and `archive/` hold
@@ -87,7 +88,7 @@ the API and CPU correctness path. Its many PyTorch GPU launches fail the
 megakernel launch gate.
 
 Use the [agent task brief](docs/AGENT_TASK.md) when comparing implementations. One
-case receives one fresh agent session and candidate checkout. The evaluator
+case receives one fresh agent session and minimal candidate workspace. The evaluator
 accepts one case and records its method and session ID; aggregation reads five
 separate case results. A suite-wide prompt or a shared candidate submission
 does not define an agent benchmark run. The [session protocol](docs/SESSION_PROTOCOL.md)
@@ -102,15 +103,51 @@ directories.
 
 ## Run
 
+Create a workspace for each session before starting its agent. For example:
+
+```bash
+.venv/bin/python -m megabench.make_agent_workspace \
+  --case dense-step-qwen3-06b-b1-s128 \
+  --agent vibesys \
+  --output megabench/experiments/2026-10-01/12-00-00-example/dense-vibesys
+```
+
+Use `--agent plain` or `--agent kernelagent` for those methods. Each workspace
+contains `TASK.md`, `case.json`, only that case's PyTorch reference and its
+imports, `submission.py`, and `check_candidate`, `profile_candidate`, and `sol_info`
+commands. VibeSys also gets its one-case task configuration; KernelAgent gets
+`problem.txt` and `test.py`. The trusted evaluator stays in the main repository
+and is called by the workspace commands. The workspace begins with a small Git
+commit for agent tools that track changes. Start the agent from this directory
+and give it `TASK.md` as its objective; it does not need the full benchmark
+checkout. The output path must be new, so prior experiments are preserved.
+
 ```bash
 .venv/bin/python -m unittest megabench.tests.test_suite
 .venv/bin/python -m megabench list --suite p0
+.venv/bin/python -m megabench sol --suite p0 --json
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m megabench evaluate \
   --submission /absolute/path/to/solution.py \
   --case dense-step-qwen3-06b-b1-s128 \
   --method plain-codex --session-id dense-run-1 \
   --reps 20 --timeout 900
 ```
+
+`sol` reports an optimistic one-read HBM floor for each ready case, using
+8 TB/s peak bandwidth for one B200 by default (the [DGX B200 specification](https://www.nvidia.com/en-eu/data-center/dgx-b200/)
+lists 64 TB/s across eight GPUs). For a single case, it also
+prints the byte breakdown. To compare a candidate's CUDA-event median with
+the floor, use `--case CASE_ID --result /path/to/evaluate.jsonl`, or pass
+`--measured-ms VALUE`. Set `--bandwidth-tb-s` for a different GPU or bandwidth
+assumption. Each agent workspace exposes the same command as
+`./sol_info --json` and accepts `--result` after a local check.
+
+The floor counts used weights once, needed old KV cache, and required outputs.
+For MoE it counts selected experts; for EAGLE3 it assumes target weights are
+reused across the five verification positions. It excludes scratch traffic,
+compute time, and synchronization, so it is a lower bound rather than an
+achievable latency target. `--suite all` marks planned cases unavailable until
+their oracle and tensor geometry are defined.
 
 Repeat in four other fresh agent sessions, each with its own `--case`,
 `--session-id`, candidate directory, and output JSONL. Then combine the five
