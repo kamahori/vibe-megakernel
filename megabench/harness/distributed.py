@@ -17,7 +17,7 @@ import torch.multiprocessing as mp
 
 from ..cases import Case
 from ..tasks.parallel import initialize
-from ..workloads import make_inputs, reference
+from ..workloads import make_inputs, oracle, reference
 from .benchmark import _audit_launches, _measure
 from .correctness import _compare
 
@@ -82,6 +82,7 @@ def _rank_worker(rank: int, contract: dict, submission: str, device_kind: str,
                 inputs = fresh_inputs(case, seed, device)
                 originals = {name: value.detach().to("cpu", copy=True) for name, value in inputs.items()}
                 expected = reference(case, inputs)
+                exact = oracle(case, inputs)
                 local_error, details = None, None
                 try:
                     first_start = time.perf_counter() if trial == 0 else None
@@ -90,7 +91,7 @@ def _rank_worker(rank: int, contract: dict, submission: str, device_kind: str,
                         torch.cuda.synchronize(device)
                     if first_start is not None:
                         result["first_call_ms_including_jit"] = (time.perf_counter()-first_start)*1000
-                    details = _compare(expected, actual, case, device)
+                    details = _compare(expected, actual, case, device, exact)
                     for name in inputs:
                         if not torch.equal(inputs[name].cpu(), originals[name]):
                             raise AssertionError(f"candidate mutated input {name}")
@@ -98,7 +99,7 @@ def _rank_worker(rank: int, contract: dict, submission: str, device_kind: str,
                     local_error = f"trial {trial}: {type(exc).__name__}: {exc}"
                 agree(local_error)
                 result["correctness"]["trials"].append({"seed": seed, "outputs": details})
-                del inputs, originals, expected, actual
+                del inputs, originals, expected, exact, actual
             perf_inputs = fresh_inputs(case, shared_seed(), device)
             dist.barrier()
             result["candidate_timing"] = _measure(candidate, perf_inputs, device, warmup, reps)

@@ -201,11 +201,14 @@ should run on a dedicated worker host.
 
 For each ready case, the harness generates fresh randomized inputs and checks
 every output key, shape, dtype, device, and value against its PyTorch oracle.
-Integer tokens must match exactly; floating outputs use the case tolerance.
-BF16 state outputs use the separate `bf16_rtol` (0.008 by default) so a
-rounding step from a different reduction order does not reject an otherwise
-matching full-model computation. Logits are widened BF16 head outputs in FP32
-tensors and retain the tighter `rtol` for submission grading.
+Output keys, shapes and dtypes must match the BF16 reference. Values are
+graded against an FP32 oracle: the same operator graph with BF16 activation
+rounding removed. Each floating output's relative L2 error and peak absolute
+error may reach `noise_factor` (2 by default) times the BF16 reference's own
+error against that oracle, plus the case `rtol`/`bf16_rtol` and `atol` floors.
+Each integer element must match the BF16 reference or the oracle; a greedy
+token may also be any token whose FP32 logit lies within the band of the top
+logit. See `docs/REFERENCE_PRECISION.md` for the calibration.
 Input mutation is rejected. Cold first-call time is reported separately.
 Warm timing records synchronized host and CUDA-event latency for the candidate
 and eager reference. Where capture succeeds, it also times a CUDA Graph
