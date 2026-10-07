@@ -24,7 +24,7 @@ def _compare(expected: dict, actual: dict, case: Case, device: str) -> dict:
         if got.shape != want.shape or got.dtype != want.dtype:
             raise AssertionError(f"{name}: expected {tuple(want.shape)} {want.dtype}, "
                                  f"got {tuple(got.shape)} {got.dtype}")
-        if got.device.type != torch.device(device).type:
+        if got.device != want.device:
             raise AssertionError(f"{name}: output is on {got.device}, expected {device}")
         if want.is_floating_point():
             delta = (got.float() - want.float()).abs()
@@ -54,10 +54,13 @@ def check_trials(case: Case, candidate: Callable, device: str,
     for trial_index, seed in enumerate(trial_seeds):
         inputs = make_inputs(case, seed, device)
         scenario = "seeded"
-        if case.family == "spec_target_step":
+        if case.family in ("spec_target_step", "spec_full_iteration"):
             scenario = ("eagle3_raw", "accept_full", "accept_one")[trial_index % 3]
             if scenario != "eagle3_raw":
-                from ..tasks.eagle3 import set_acceptance_scenario
+                if case.family == "spec_target_step":
+                    from ..tasks.eagle3 import set_acceptance_scenario
+                else:
+                    from ..tasks.speculative import set_acceptance_scenario
                 accepted_prefix = (case.params["draft_depth"] if
                                    scenario == "accept_full" else 1)
                 set_acceptance_scenario(case, inputs, accepted_prefix)
@@ -77,7 +80,7 @@ def check_trials(case: Case, candidate: Callable, device: str,
                 raise AssertionError(f"candidate mutated input {name}")
         details = _compare(expected, actual, case, device)
         trial_record = {"seed": seed, "scenario": scenario, "outputs": details}
-        if case.family == "spec_target_step":
+        if case.family in ("spec_target_step", "spec_full_iteration"):
             trial_record["spec_accounting"] = {
                 "proposed_draft_tokens": case.params["draft_depth"],
                 "accepted_draft_tokens": int(expected["accepted_count"].item()),

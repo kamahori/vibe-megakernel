@@ -8,7 +8,7 @@ from megabench.workloads import reference
 
 
 def build(case: dict):
-    challenge = Case(**case)
+    challenge = Case(**{key: value for key, value in case.items() if key != "execution"})
 
     def run(inputs: dict):
         return reference(challenge, inputs)

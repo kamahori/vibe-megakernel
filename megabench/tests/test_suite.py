@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from argparse import Namespace
@@ -17,7 +18,7 @@ import torch
 from ..cases import CASES, Case, select_cases
 from ..harness.correctness import _compare
 from ..harness.runner import (_contract_digest, _docker_worker_command,
-                              _output_path, _run_one, _stop_owned_container,
+                              _output_path, _run_one, _run_local_worker, _stop_owned_container,
                               aggregate_sessions, evaluate_case, main)
 from ..workloads import make_inputs, reference
 
@@ -64,9 +65,9 @@ class CatalogTests(unittest.TestCase):
         self.assertTrue(all("step" in case.id or "iteration" in case.id
                             for case in CASES))
         self.assertEqual({case.id for case in select_cases("core")},
-                         {case.id for case in select_cases("p0")})
-        self.assertEqual(len(select_cases("core")), 5)
-        self.assertEqual(len(select_cases("planned")), len(CASES) - 5)
+                         {case.id for case in CASES if case.ready})
+        self.assertTrue(all(case.ready for case in select_cases("p0")))
+        self.assertEqual(len(select_cases("core"))+len(select_cases("planned")), len(CASES))
         self.assertEqual({c.params["bits"] for c in CASES
                           if c.family == "quant_step"}, {4, 8})
         self.assertTrue(any("EAGLE3" in c.model for c in CASES))
@@ -151,6 +152,25 @@ class CatalogTests(unittest.TestCase):
 
 
 class HarnessTests(unittest.TestCase):
+    def test_local_timeout_stops_spawned_rank_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = Path(directory) / 'child.pid'
+            source = ('import subprocess, sys, time\n'
+                      'from pathlib import Path\n'
+                      'child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])\n'
+                      f'Path({str(pid_file)!r}).write_text(str(child.pid))\n'
+                      'time.sleep(60)\n')
+            with self.assertRaises(subprocess.TimeoutExpired):
+                _run_local_worker([sys.executable,'-c',source],timeout=2)
+            child = int(pid_file.read_text())
+            state_file = Path(f'/proc/{child}/stat')
+            try:
+                state = state_file.read_text().split()[2]
+            except (FileNotFoundError, ProcessLookupError):
+                state = 'gone'
+            # A dead child may await init's reap; it owns no CPU or GPU.
+            self.assertIn(state, ('gone', 'Z'))
+
     def test_default_results_stay_under_megabench(self) -> None:
         self.assertEqual(_output_path(None).parent,
                          Path(__file__).resolve().parents[1] / "runs")
@@ -227,7 +247,7 @@ class HarnessTests(unittest.TestCase):
             args = Namespace(submission=str(submission), docker_image=None,
                              device="cpu", trials=1, warmup=0, reps=1,
                              graph_baseline=False, timeout=1)
-            with patch("megabench.harness.runner.subprocess.run",
+            with patch("megabench.harness.runner._run_local_worker",
                        side_effect=subprocess.TimeoutExpired("worker", 1)):
                 result = _run_one(args, TINY_DENSE, root)
         self.assertEqual(result["status"], "timeout")
@@ -237,9 +257,9 @@ class HarnessTests(unittest.TestCase):
         with redirect_stdout(StringIO()) as output:
             self.assertEqual(main(["list", "--suite", "core", "--json"]), 0)
         cases = json.loads(output.getvalue())
-        self.assertEqual(len(cases), 5)
+        self.assertEqual(len(cases), len(select_cases("core")))
         self.assertEqual({case["id"] for case in cases},
-                         {case.id for case in select_cases("p0")})
+                         {case.id for case in select_cases("core")})
 
     def test_aggregate_requires_independent_case_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

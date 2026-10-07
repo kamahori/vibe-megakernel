@@ -36,16 +36,18 @@ boundary; [`cases.py`](cases.py) is the active machine-readable catalog.
 | P0 | Qwen3-30B-A3B MoE, full decode | Ready with synthetic BF16 weights |
 | P0 | Gemma 3 4B local/global attention, W8A16 and W4A16 full decode | Both ready with synthetic quantized weights |
 | P0 | Llama 3.1 8B target with EAGLE3 proposal verification | Ready with synthetic weights and a linear proposal chain |
-| P1 | GPT-OSS-20B native MXFP4 MoE decode | Planned |
-| P1 | Qwen3.5-0.8B DeltaNet/attention hybrid decode | Planned |
-| P1 | Gemma 3 4B image-conditioned text decode | Planned |
-| P2 | Llama 3.1 8B plus EAGLE3 full speculative iteration | Planned |
-| P2 | Gemma 3 27B TP decode; Qwen3-30B-A3B TP/EP decode | Planned |
-| P3 | DeepSeek-V3.2, GLM-5.2-FP8, and Kimi-K3 full decode | Planned |
+| P1 | GPT-OSS-20B native MXFP4 MoE decode | Ready with synthetic native packed experts |
+| P1 | Qwen3.5-0.8B DeltaNet/attention hybrid decode | Ready with synthetic reset/continuing state |
+| P1 | Gemma 3 4B image-conditioned text decode | Ready with synthetic SigLIP/projector/prefill fixtures |
+| P2 | Llama 3.1 8B plus EAGLE3 full speculative iteration | Ready with synthetic draft, verify and both KV commits |
+| P2 | Gemma 3 27B TP decode; Qwen3-30B-A3B TP/EP decode | Implemented; full GPU verification pending |
+| P3 | DeepSeek-V3.2, GLM-5.2-FP8, and Kimi-K3 full decode | Native synthetic references implemented; full GPU verification pending |
 
-`list --suite core` and `list --suite p0` select the five ready P0 cells. `--suite p1`
-through `p3`, `planned`, and `all` expose the rest of the catalog; an
+`list --suite core` selects every enabled case; `--suite p0` selects the original five.
+`--suite p1` through `p3`, `planned`, and `all` expose their catalog subsets; an
 unimplemented case returns `not_implemented` and cannot contribute to a score.
+The [non-P0 validation record](docs/NON_P0_VALIDATION.md) describes native
+formats, timed boundaries, verification commands, and pending GPU checks.
 All P0 cells use full model layer counts and seeded synthetic weights. They
 are a **shape/semantics tier**, not checkpoint accuracy. The Qwen3 MoE case
 uses all 128 experts with top-8 routing and a separate LM head. Gemma W8 and
@@ -133,7 +135,7 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m megabench evaluate \
   --reps 20 --timeout 900
 ```
 
-`sol` reports an optimistic one-read HBM floor for each ready case, using
+`sol` reports an optimistic one-read HBM floor for P0 cases, using
 8 TB/s peak bandwidth for one B200 by default (the [DGX B200 specification](https://www.nvidia.com/en-eu/data-center/dgx-b200/)
 lists 64 TB/s across eight GPUs). For a single case, it also
 prints the byte breakdown. To compare a candidate's CUDA-event median with
@@ -146,7 +148,7 @@ The floor counts used weights once, needed old KV cache, and required outputs.
 For MoE it counts selected experts; for EAGLE3 it assumes target weights are
 reused across the five verification positions. It excludes scratch traffic,
 compute time, and synchronization, so it is a lower bound rather than an
-achievable latency target. `--suite all` marks planned cases unavailable until
+achievable latency target. Families without a traffic model return `unavailable`. `--suite all` marks planned cases unavailable until
 their oracle and tensor geometry are defined.
 
 Repeat in four other fresh agent sessions, each with its own `--case`,

@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from ..cases import Case
-from .common import random_norm, random_weight, rms, rope
+from .common import fill_layer_weights, random_norm, random_weight, rms, rope
 
 
 LINEAR_NAMES = ("wq", "wk", "wv", "wo", "wg", "wu", "wd")
@@ -83,8 +83,11 @@ def make_inputs(case: Case, seed: int, device: str) -> dict[str, torch.Tensor]:
         "wd": (layers, h, inter),
     }
     for name, shape in shapes.items():
-        values[name], values[f"{name}_scale"] = _quantized_stack(
-            g, device, shape, p["bits"])
+        if p["bits"] == 16:
+            values[name] = fill_layer_weights(g, device, shape, shape[-1])
+        else:
+            values[name], values[f"{name}_scale"] = _quantized_stack(
+                g, device, shape, p["bits"])
     cache_shape = (layers, p["context"], p["kv_heads"], d)
     values["kcache"] = random_weight(g, device, cache_shape, d)
     values["vcache"] = random_weight(g, device, cache_shape, d)
@@ -100,7 +103,8 @@ def reference(case: Case, values: dict[str, torch.Tensor]) -> dict[str, torch.Te
     k_writes, v_writes = [], []
 
     def linear(name: str, layer: int, vec: torch.Tensor) -> torch.Tensor:
-        matrix = dequant(values[name][layer], values[f"{name}_scale"][layer], bits)
+        matrix = (values[name][layer].float() if bits == 16 else
+                  dequant(values[name][layer], values[f"{name}_scale"][layer], bits))
         return matrix @ vec
 
     for layer in range(p["layers"]):
@@ -121,7 +125,7 @@ def reference(case: Case, values: dict[str, torch.Tensor]) -> dict[str, torch.Te
         ks = torch.cat((values["kcache"][layer, start:].float(), k[None]), dim=0)
         vs = torch.cat((values["vcache"][layer, start:].float(), v[None]), dim=0)
         grouped_q = q.view(kvh, qh // kvh, d)
-        scores = torch.einsum("gqd,tgd->gqt", grouped_q, ks) * d ** -0.5
+        scores = torch.einsum("gqd,tgd->gqt", grouped_q, ks) * p.get("query_pre_attn_scalar", d) ** -0.5
         probs = scores.softmax(dim=-1)
         attn = torch.einsum("gqt,tgd->gqd", probs, vs).reshape(qh * d)
         x = x + rms(linear("wo", layer, attn), values["ln2"][layer], gemma=True)

@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import secrets
 from pathlib import Path
 
 from ..cases import select_cases
-from ..harness.correctness import _compare
+from ..harness.correctness import check_trials
 from ..harness.runner import _load_submission, evaluate_case
-from ..workloads import make_inputs, reference
 
 
 def main(case_id: str, argv: list[str] | None = None) -> int:
@@ -26,26 +24,16 @@ def main(case_id: str, argv: list[str] | None = None) -> int:
     if args.mode == "accuracy":
         import torch
 
-        scenarios = ("raw", "full", "partial") if case.family == "spec_target_step" else ("seed1", "seed2")
         try:
-            candidate = _load_submission(submission, case)
-            with torch.inference_mode():
-                for scenario in scenarios:
-                    values = make_inputs(case, secrets.randbits(32), "cuda:0")
-                    if scenario in ("full", "partial"):
-                        from ..tasks.eagle3 import set_acceptance_scenario
-                        set_acceptance_scenario(case, values,
-                                                case.params["draft_depth"] if scenario == "full" else 1)
-                    originals = {name: value.detach().to("cpu", copy=True)
-                                 for name, value in values.items()}
-                    expected = reference(case, values)
-                    actual = candidate(values)
-                    torch.cuda.synchronize()
-                    for name, value in values.items():
-                        if not torch.equal(value.cpu(), originals[name]):
-                            raise AssertionError(f"candidate mutated input {name}")
-                    _compare(expected, actual, case, "cuda:0")
-                    del values, originals, expected, actual
+            if case.gpus > 1:
+                result = evaluate_case(case, submission, device="cuda:0", trials=3,
+                                       warmup=0, reps=1, graph_baseline=False)
+                if result.get("correctness", {}).get("status") != "pass":
+                    raise AssertionError(result.get("reason", result["status"]))
+            else:
+                candidate = _load_submission(submission, case)
+                with torch.inference_mode():
+                    check_trials(case, candidate, "cuda:0", 3)
         except Exception as exc:
             print(json.dumps({"case": case_id, "status": "fail",
                               "reason": f"{type(exc).__name__}: {exc}"}))

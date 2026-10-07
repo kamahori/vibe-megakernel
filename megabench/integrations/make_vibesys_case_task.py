@@ -60,14 +60,18 @@ def make_task(case_id: str, root: Path,
     reference = ("reference/megabench/tasks" if (root / "reference").is_dir()
                  else "megabench/tasks")
     module = {"dense_step": "dense", "moe_step": "moe",
-              "quant_step": "gemma", "spec_target_step": "eagle3"}[case.family]
+              "quant_step": "gemma", "spec_target_step": "eagle3",
+              "gptoss_step": "gptoss", "hybrid_step": "hybrid",
+              "vl_decode_step": "vision", "spec_full_iteration": "speculative",
+              "distributed_step": "distributed", "deepseek_v32_step": "frontier",
+              "glm52_step": "frontier", "kimi_k3_step": "kimi"}[case.family]
     (task / "OBJECTIVE.md").write_text(
         f"# One MegaBench case: {case_id}\n\n"
         f"Implement only `{case_id}`: {case.model}, {case.phase}, geometry "
         f"`{case.params}`. Read `{brief}` and `{reference}/{module}.py`, this case's "
         "PyTorch oracle. Edit only `submission.py` and candidate-owned helper "
         "files. Compute every required output from current inputs in at most "
-        "one GPU kernel launch; preserve all inputs. Do not use prior candidate "
+        "one GPU kernel launch per rank, including communication; preserve all inputs. Do not use prior candidate "
         "code or other checkouts. The evaluator checks only this assigned "
         "case against a protected benchmark outside this workspace.\n")
     return task

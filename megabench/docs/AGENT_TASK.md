@@ -39,8 +39,11 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m megabench evaluate \
 
 Run one such command per independently produced candidate. Use `aggregate`
 with one result JSONL per case only after all case sessions are finished.
-P1–P3 and `planned` list future tasks that do not score until their reference
-contracts are implemented. A
+`core` selects all enabled synthetic tasks; `planned` selects cases whose
+verification has not finished. Distributed cases run one process per GPU and
+include communication inside their one-launch-per-rank budget. `build(case)`
+receives a rank-specific `execution` dictionary with process-group handles.
+Logits are vocabulary shards, and `next_token` is global. A
 `--device cpu` run checks correctness only and has no megakernel score. For
 containerized evaluation, add `--docker-image IMAGE` and
 `--docker-gpus device=N`; the image must already be local and include PyTorch and your kernel
