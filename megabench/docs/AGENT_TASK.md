@@ -1,7 +1,7 @@
 # Standard task brief for a whole-model megakernel agent
 
 Implement exactly one ready [MegaBench case](../cases.py) in a Python submission
-file. Start a fresh agent session and candidate checkout for each case; do not
+file. Start a fresh agent session and minimal candidate workspace for each case; do not
 carry candidate code or chat context from another case. The case ID must be
 fixed in the session objective before the agent starts.
 Export `build(case: dict) -> run(inputs: dict) -> outputs: dict`. Read
