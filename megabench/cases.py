@@ -26,6 +26,9 @@ class Case:
     atol: float = 0.0
     rtol: float = 0.0
     bf16_rtol: float = 0.008
+    # Graded error may reach this multiple of the BF16 reference's own error
+    # against the FP32 oracle (see docs/REFERENCE_PRECISION.md).
+    noise_factor: float = 2.0
     ready: bool = False
     note: str = ""
 
@@ -36,7 +39,7 @@ class Case:
             raise ValueError(f"invalid dimensions in {self.id}")
         if min(self.gpus, self.tp, self.ep, self.max_gpu_launches) < 1:
             raise ValueError(f"invalid execution geometry in {self.id}")
-        if min(self.atol, self.rtol, self.bf16_rtol) < 0:
+        if min(self.atol, self.rtol, self.bf16_rtol) < 0 or self.noise_factor < 1:
             raise ValueError(f"invalid tolerance in {self.id}")
         if self.suite not in ("p0", "p1", "p2", "p3"):
             raise ValueError(f"invalid priority in {self.id}")

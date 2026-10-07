@@ -7,6 +7,7 @@ import importlib
 import torch
 
 from ..cases import Case
+from .oracle import fp32_reference
 
 
 Inputs = dict[str, torch.Tensor]
@@ -32,10 +33,18 @@ def make_inputs(case: Case, seed: int, device: str = "cpu") -> Inputs:
     return module.make_inputs(case, seed, device)
 
 
-def reference(case: Case, t: Inputs) -> Outputs:
+def _module(case: Case):
     if not case.ready:
         raise NotImplementedError(f"{case.id}: {case.note}")
     if case.family not in TASK_MODULES:
         raise NotImplementedError(f"no PyTorch oracle for {case.id}")
-    module = importlib.import_module(f"{__package__}.{TASK_MODULES[case.family]}")
-    return module.reference(case, t)
+    return importlib.import_module(f"{__package__}.{TASK_MODULES[case.family]}")
+
+
+def reference(case: Case, t: Inputs) -> Outputs:
+    return _module(case).reference(case, t)
+
+
+def oracle(case: Case, t: Inputs) -> Outputs:
+    """The reference's operator graph without BF16 activation rounding."""
+    return fp32_reference(_module(case), case, t)

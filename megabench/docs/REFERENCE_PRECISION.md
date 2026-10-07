@@ -38,12 +38,52 @@ This follows the mixed precision pattern in
 [Gemma3](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma3/modeling_gemma3.py),
 and [GPT-OSS](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt_oss/modeling_gpt_oss.py).
 Fused serving kernels can have different internal rounding boundaries; the
-eager reference defines MegaBench's particular numerical contract.
+eager reference defines output formats and the BF16 noise scale, not a
+bitwise target.
+
+## Grading band
+
+BF16 rounding differences compound through the model. On the full synthetic
+Qwen3-0.6B decode, the BF16 reference differs from FP32 math by 3.8-5.0%
+relative L2 in logits (max absolute error about 0.14). A BF16 schedule that
+differs only by exactly accumulated matmuls fails 71% of logit elements under
+the former elementwise `rtol=0.002`. The real Qwen3-0.6B checkpoint shows
+1.5-2.5% BF16-to-FP32 logit drift, so this is a property of BF16 execution,
+amplified about twofold by the synthetic weights.
+
+`harness/correctness.py` therefore grades against an FP32 oracle
+(`tasks/oracle.py`). The oracle executes the same task reference under a
+dispatch mode that widens BF16 compute, casts and factories to FP32, while
+quantized payloads, scales, integer tensors and data movement keep their
+native types. On every single-process family, its outputs match the former
+FP32 references to FP32 precision, except where those rounded outputs or
+convolution inputs to BF16.
+
+For each floating output, with errors measured against the oracle:
+
+- relative L2 error <= `noise_factor` x reference relative L2 error + `rtol`
+  (`bf16_rtol` for BF16 outputs);
+- max absolute error <= `noise_factor` x reference max absolute error +
+  `atol` + `rtol` x max |oracle|.
+
+Each integer element must equal the BF16 reference or the oracle. A greedy
+token on an unsharded vocabulary may also be any token whose oracle logit is
+within `noise_factor` x the reference's RMS logit error of the oracle maximum.
+
+Over four seeds on the full dense case, alternative BF16 schedules (SDPA
+attention, FP32-weighted RMSNorm, exact matmul accumulation) had 0.84-1.22x
+the reference's error. `noise_factor=2` accepts them. Gross errors such as
+missing state, a corrupted layer or scaled logits fail. Subtle bugs below the
+BF16 noise floor are not distinguishable: a 10x RMSNorm epsilon or a 1%
+attention scale error measured 1.1-1.5x. Native FP8 frontier cases have
+much wider bands, because small perturbations flip power-of-two scales,
+sparse-index selections and routes.
 
 ## Validation and historical results
 
-Submission output keys, public logit dtype and correctness tolerances are
-unchanged. The contract digest changes automatically because it includes the
+Submission output keys and public logit dtype are unchanged. Value grading
+uses the oracle band above instead of elementwise tolerances around the
+reference. The contract digest changes automatically because it includes the
 reference sources. Existing Claude, Codex and MPK results measure the previous
 FP32 execution contract and require fresh grading for comparisons against
 these references. Historical experiments are preserved.
@@ -52,8 +92,7 @@ CPU checks cover operator dtypes, input/payload preservation, exact BF16 Qwen3
 agreement with upstream Transformers, BF16 upstream whole-model checks for
 other available architectures, and state/rollback behavior. Distributed
 serial diagnostics reproduce each TP partial projection's BF16 rounding.
-They compare widened logits at BF16 precision; submission grading retains
-its existing tighter FP32-logit tolerance. FP8 MLA absorption/expansion is
+They compare widened logits at BF16 precision. FP8 MLA absorption/expansion is
 checked before the next quantization boundary using a 5% relative RMS bound,
 because the schedules have distinct BF16 rounding and FP8 latent quantization
 boundaries.
