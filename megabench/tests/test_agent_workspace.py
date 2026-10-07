@@ -10,6 +10,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,6 +18,7 @@ from ..cases import select_cases
 from ..integrations.make_agent_workspace import make_workspace
 from ..tasks.workloads import TASK_MODULES
 from .test_non_p0 import tiny_hybrid, tiny_vision, tiny_speculative
+from .test_frontier import development as frontier_development
 
 
 MODULE_BY_FAMILY = TASK_MODULES
@@ -25,20 +27,26 @@ MODULE_BY_FAMILY = TASK_MODULES
 class AgentWorkspaceTests(unittest.TestCase):
     def test_new_snapshots_generate_inputs_and_execute_in_isolation(self) -> None:
         # Import-only checks miss fixtures that replace the Case dataclass.
-        for case in (tiny_hybrid(), tiny_vision(), tiny_speculative()):
+        frontier_cases = [replace(frontier_development(case), gpus=1, tp=1, ready=True)
+                          for case in select_cases('p3')
+                          if case.family in ('deepseek_v32_step', 'glm52_step')]
+        for case in (tiny_hybrid(), tiny_vision(), tiny_speculative(), *frontier_cases):
             with self.subTest(case=case.id), tempfile.TemporaryDirectory() as directory:
                 with patch('megabench.integrations.make_agent_workspace.select_cases',
                            return_value=[case]):
                     project = make_workspace(case.id, Path(directory) / 'workspace',
                                              agent='plain')
                 module = MODULE_BY_FAMILY[case.family]
+                frontier = case.family in ('deepseek_v32_step', 'glm52_step')
+                fixture_args = ', rank=0' if frontier else ''
+                reference_args = ', serial=True' if frontier else ''
                 result = subprocess.run(
                     [sys.executable, '-c',
                      'import torch; torch.set_num_threads(1); '
                      'from megabench.cases import CASE; '
                      f'from megabench.tasks import {module} as task; '
-                     'values = task.make_inputs(CASE, 17, "cpu"); '
-                     'outputs = task.reference(CASE, values); '
+                     f'values = task.make_inputs(CASE, 17, "cpu"{fixture_args}); '
+                     f'outputs = task.reference(CASE, values{reference_args}); '
                      'assert torch.isfinite(outputs["logits"]).all()'],
                     cwd=project, env=os.environ | {'PYTHONPATH': str(project / 'reference')},
                     capture_output=True, text=True, timeout=60)
