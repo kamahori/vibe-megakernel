@@ -141,10 +141,13 @@ def verify(case, device, trials, full, steps=3):
                     raise AssertionError('reference mutated its runtime inputs')
                 keys = ('next_token','expert_ids','cache_length') if module is kimi else ('next_token','sparse_indices','expert_ids')
                 replicated = {key:actual[key].cpu().tolist() for key in keys}
+                shard_keys = ('logits','recurrent_state','conv_state') if module is kimi else ('logits',)
+                state_hash = input_digest({name:value for name,value in actual.items() if name not in shard_keys})
+                replicated['native_state_sha256'] = state_hash
                 all_ranks = [None]*current.gpus
                 dist.all_gather_object(all_ranks,replicated)
                 if any(value != replicated for value in all_ranks):
-                    raise AssertionError('ranks disagree on global token, index selection or expert routing')
+                    raise AssertionError('ranks disagree on replicated native state, global token, index selection or expert routing')
                 details = None
                 if not full:
                     expected = module.reference(serial_case,serial_values,serial=True) if rank == 0 else None
@@ -153,7 +156,8 @@ def verify(case, device, trials, full, steps=3):
                         serial_case,serial_values = advance_state(serial_case,serial_values,expected)
                 trajectory.append({'step':step,'input_context':current.params['context'],
                                    'reset':bool(values['reset']) if module is kimi else False,
-                                   'next_token':int(actual['next_token']),'serial_comparison':details})
+                                   'next_token':int(actual['next_token']),'replicated_state_sha256':state_hash,
+                                   'serial_comparison':details})
                 if step+1 < steps:
                     current,values = advance_state(current,values,actual)
             if not full:
@@ -172,6 +176,10 @@ def verify(case, device, trials, full, steps=3):
             print(json.dumps({'case':case.id,'rank':rank,'seed':seed,'status':'pass','full_geometry':full}),flush=True)
             del values,perf_inputs,actual,repeated,changed
     report['status'] = 'pass'
+    if device.startswith('cuda'):
+        report['gpu_memory'] = {'total_bytes':torch.cuda.get_device_properties(device).total_memory,
+                                'peak_allocated_bytes':torch.cuda.max_memory_allocated(device),
+                                'peak_reserved_bytes':torch.cuda.max_memory_reserved(device)}
     return report
 
 

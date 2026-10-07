@@ -12,6 +12,7 @@ import os
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -38,7 +39,19 @@ def serial_oracle(case: Case, values: dict) -> dict:
     if "gemma" in case.model.lower():
         return gemma.reference(replace(case, params=case.params | {"bits": 16}), values)
     renamed = values | {"wrt": values["router"]}
-    return moe.reference(case, renamed)
+    selected = []
+    topk = torch.topk
+    def capture_routing(logits, *args, **kwargs):
+        result = topk(logits, *args, **kwargs)
+        if logits.shape == (case.params['experts'],):
+            selected.append(result.indices.clone())
+        return result
+    # Observe the independent decoder's router without changing its math.
+    with patch('torch.topk', capture_routing):
+        result = moe.reference(case, renamed)
+    if len(selected) != case.params['layers']:
+        raise AssertionError('serial oracle did not expose every layer\'s expert routing')
+    return result | {'expert_ids':torch.stack(selected)}
 
 
 def verify(case: Case, device: str, trials: int, full: bool) -> dict:
@@ -65,9 +78,11 @@ def verify(case: Case, device: str, trials: int, full: bool) -> dict:
             expected_shapes = {"logits": (case.params["vocab"],), "next_token": (),
                                "k_write": (case.params["layers"], case.params["kv_heads"], case.params["head_dim"]),
                                "v_write": (case.params["layers"], case.params["kv_heads"], case.params["head_dim"])}
+            if 'experts' in case.params:
+                expected_shapes['expert_ids'] = (case.params['layers'],case.params['topk'])
             if rank != 0:
                 expected = {name: torch.empty(shape, device=device,
-                            dtype=torch.int64 if name == "next_token" else
+                            dtype=torch.int64 if name in ("next_token", "expert_ids") else
                             torch.bfloat16 if name.endswith("write") else torch.float32)
                             for name, shape in expected_shapes.items()}
             for name in expected_shapes:
@@ -78,6 +93,8 @@ def verify(case: Case, device: str, trials: int, full: bool) -> dict:
                       "next_token": expected["next_token"],
                       "k_write": expected["k_write"].chunk(case.tp, dim=1)[tensor_rank],
                       "v_write": expected["v_write"].chunk(case.tp, dim=1)[tensor_rank]}
+            if 'experts' in case.params:
+                wanted['expert_ids'] = expected['expert_ids']
             detail = _compare(wanted, {name: actual[name] for name in wanted}, case, device)
             if before != input_digest(values):
                 raise AssertionError('reference mutated its runtime inputs')
@@ -90,6 +107,11 @@ def verify(case: Case, device: str, trials: int, full: bool) -> dict:
             print(json.dumps({"case": case.id, "rank": rank, "seed": seed, "status": "pass"}), flush=True)
             del values, before, actual, expected, wanted
     report["status"] = "pass"
+    if device.startswith('cuda'):
+        report['gpu_memory'] = {'total_bytes':torch.cuda.get_device_properties(device).total_memory,
+                                'peak_allocated_bytes':torch.cuda.max_memory_allocated(device),
+                                'peak_reserved_bytes':torch.cuda.max_memory_reserved(device),
+                                'includes_serial_oracle_on_rank_zero':rank == 0}
     return report
 
 

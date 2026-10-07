@@ -14,7 +14,7 @@ Kimi-K3 is deferred at the user's request; it remains visible and disabled.
 | Gemma 3 4B vision-conditioned decode | Synthetic full SigLIP encoder, projector and multimodal prefill build the fixture; all 34 text layers are timed | Upstream vision/projector/prefill checks and image dependence; full B200 geometry passed three seeds; enabled |
 | Llama 3.1 8B + EAGLE3 full iteration | Actual draft head, proposal tree, full target verification, greedy acceptance, both KV commits/rollback and next-draft features | Upstream target ancestor-mask/features tests, K=2/4/8 and partial/full/reject acceptance; full B200 K=4 run passed; enabled |
 | Gemma 3 27B TP2 | All 62 layers with vocabulary/head/intermediate shards and live TP reductions | Two-rank CPU outputs match the independent serial decoder; full two-GPU rerun queued; disabled pending that check |
-| Qwen3-30B-A3B TP2/EP2 | All 48 layers, contiguous EP expert ownership, TP attention/FFN and distributed greedy token | Four-rank CPU outputs match the independent serial decoder; full four-GPU rerun queued; disabled pending that check |
+| Qwen3-30B-A3B TP2/EP2 | All 48 layers, contiguous EP expert ownership, TP attention/FFN and distributed greedy token | Four-rank CPU logits, KV and global expert IDs match the independent serial decoder; full four-GPU rerun queued; disabled pending that check |
 | DeepSeek-V3.2 TP8 | All 61 layers, block FP8 weights/activation quantization, MLA, Hadamard FP8 indexer, grouped routing and shared expert | Independent expanded MLA, YaRN, routing and quantization tests; CPU TP and candidate harness pass; full eight-GPU check queued; disabled |
 | GLM-5.2-FP8 TP8 | All 78 layers, block FP8 weights, MLA, scheduled full/shared indexers and MoE | Independent expanded MLA, FP8 and routing tests; CPU TP and candidate harness pass; full eight-GPU check queued; disabled |
 | Kimi-K3 TP16 | All 93 layers, 69 KDA/24 gated MLA, attention residuals, BF16 latent/shared paths and native MXFP4 routed experts | Official pinned decoder/FLA oracle, eight-step independent KDA recurrence and 16-rank CPU protocol pass; deferred by request; disabled |
@@ -95,6 +95,8 @@ three committed steps. Development-geometry TP2 rollouts pass for DeepSeek,
 GLM and Kimi, and Kimi's 16-rank CPU rollout passes both seeded histories.
 DeepSeek and GLM also pass eight-rank CPU rollouts with development dimensions
 that retain full native 128-channel FP8 blocks in every TP slice.
+Every rollout also checks exact agreement on raw bytes of the replicated
+native state across ranks, including paired FP8 payloads and scales.
 DeepSeek and GLM also match their upstream DSA indexer implementations with
 native activation quantization and partial-context selection; selected IDs
 and emitted FP8 key/scale payloads agree exactly. This checks actual sparse
