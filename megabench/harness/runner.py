@@ -10,6 +10,7 @@ import math
 import os
 import platform
 import secrets
+import signal
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,13 @@ CONTRACT_FILES = (
     "megabench/harness/benchmark.py", "megabench/tasks/workloads.py",
     "megabench/tasks/dense.py", "megabench/tasks/common.py", "megabench/tasks/moe.py",
     "megabench/tasks/gemma.py", "megabench/tasks/eagle3.py",
+    "megabench/tasks/gptoss.py", "megabench/tasks/hybrid.py",
+    "megabench/tasks/vision.py", "megabench/tasks/speculative.py",
+    "megabench/tasks/quantization.py", "megabench/tasks/model_specs.json",
+    "megabench/harness/distributed.py", "megabench/tasks/distributed.py",
+    "megabench/tasks/parallel.py",
+    "megabench/tasks/frontier.py",
+    "megabench/tasks/kimi.py",
     "megabench/tasks/references/qwen3.py",
     "megabench/tasks/references/moe.py",
 )
@@ -48,7 +56,7 @@ def _contract_digest() -> str:
     return digest.hexdigest()
 
 
-def _load_submission(path: Path, case: Case) -> Callable:
+def _load_submission(path: Path, case: Case, *, execution: dict | None = None) -> Callable:
     spec = importlib.util.spec_from_file_location("megabench_candidate", path)
     if spec is None or spec.loader is None:
         raise ValueError(f"cannot import submission {path}")
@@ -58,7 +66,10 @@ def _load_submission(path: Path, case: Case) -> Callable:
     build = getattr(module, "build", None)
     if not callable(build):
         raise TypeError("submission must export build(case: dict) -> callable")
-    runner = build(case.to_dict())
+    contract = case.to_dict()
+    if execution is not None:
+        contract["execution"] = execution
+    runner = build(contract)
     if not callable(runner):
         raise TypeError("build(case) must return a callable run(inputs)")
     return runner
@@ -85,6 +96,10 @@ def evaluate_case(case: Case, submission: Path, *, device: str,
             ("megabench.workloads", "megabench.tasks.workloads",
              "megabench.tasks.dense", "megabench.tasks.moe",
              "megabench.tasks.gemma", "megabench.tasks.eagle3",
+             "megabench.tasks.gptoss", "megabench.tasks.hybrid",
+             "megabench.tasks.vision", "megabench.tasks.speculative",
+             "megabench.tasks.distributed", "megabench.tasks.frontier",
+             "megabench.tasks.kimi",
              "megabench.tasks.references")),
     }
     if not case.ready:
@@ -96,8 +111,9 @@ def evaluate_case(case: Case, submission: Path, *, device: str,
         record["hardware"].update(gpu_name=props.name,
                                   gpu_memory_bytes=props.total_memory)
     if case.gpus != 1:
-        return record | {"status": "not_implemented", "reason":
-                         "multi-GPU submission protocol is not implemented"}
+        from .distributed import evaluate_distributed
+        return record | evaluate_distributed(case, submission, device=device, trials=trials,
+                                             warmup=warmup, reps=reps)
 
     build_start = time.perf_counter()
     candidate = _load_submission(submission, case)
@@ -109,7 +125,7 @@ def evaluate_case(case: Case, submission: Path, *, device: str,
             record["first_call_ms_including_jit"] = first_call_ms
 
         perf_inputs = make_inputs(case, secrets.randbits(32), device)
-        if case.family == "spec_target_step":
+        if case.family in ("spec_target_step", "spec_full_iteration"):
             perf_output = reference(case, perf_inputs)
             record["spec_accounting"] = {
                 "proposed_draft_tokens": case.params["draft_depth"],
@@ -231,6 +247,22 @@ def _stop_owned_container(name: str, run_id: str) -> str | None:
     return None
 
 
+def _run_local_worker(cmd: list[str], timeout: float) -> subprocess.CompletedProcess:
+    """Own the worker's process group so a timeout also stops spawned ranks."""
+    with subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, start_new_session=True) as worker:
+        try:
+            stdout, stderr = worker.communicate(timeout=timeout)
+        except BaseException:
+            try:
+                os.killpg(worker.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            worker.communicate()
+            raise
+        return subprocess.CompletedProcess(cmd, worker.returncode, stdout, stderr)
+
+
 def _run_one(args: argparse.Namespace, case: Case, tempdir: Path) -> dict:
     if not case.ready:
         return {"case": case.to_dict(), "status": "not_implemented", "reason": case.note}
@@ -248,8 +280,8 @@ def _run_one(args: argparse.Namespace, case: Case, tempdir: Path) -> dict:
         if not args.graph_baseline:
             cmd.append("--no-graph-baseline")
     try:
-        proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
-                              timeout=args.timeout)
+        proc = (subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=args.timeout)
+                if container else _run_local_worker(cmd, args.timeout))
         if result_path.exists():
             result = json.loads(result_path.read_text(encoding="utf-8"))
             if proc.returncode:

@@ -21,6 +21,14 @@ REFERENCE_FILES = {
                  "references/moe.py"),
     "quant_step": ("gemma.py", "common.py"),
     "spec_target_step": ("eagle3.py", "common.py"),
+    "gptoss_step": ("gptoss.py", "quantization.py", "common.py"),
+    "hybrid_step": ("hybrid.py", "common.py"),
+    "vl_decode_step": ("vision.py", "gemma.py", "common.py"),
+    "spec_full_iteration": ("speculative.py", "eagle3.py", "common.py"),
+    "distributed_step": ("distributed.py", "parallel.py", "common.py"),
+    "deepseek_v32_step": ("frontier.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
+    "glm52_step": ("frontier.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
+    "kimi_k3_step": ("kimi.py", "frontier.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
 }
 OUTPUT_KEYS = {
     "dense_step": ("logits", "next_token", "k_write", "v_write"),
@@ -29,6 +37,18 @@ OUTPUT_KEYS = {
     "spec_target_step": ("logits", "accepted_count", "committed_count",
                          "committed_tokens", "cache_length", "target_features",
                          "k_write", "v_write"),
+    "gptoss_step": ("logits", "next_token", "k_write", "v_write", "expert_ids"),
+    "hybrid_step": ("logits", "next_token", "k_write", "v_write",
+                    "recurrent_state", "conv_state", "cache_length"),
+    "vl_decode_step": ("logits", "next_token", "k_write", "v_write"),
+    "distributed_step": ("logits", "next_token", "k_write", "v_write"),
+    "deepseek_v32_step": ("logits", "next_token", "kv_write", "kv_scale_write", "pe_write", "index_k_write", "index_scale_write", "sparse_indices", "expert_ids"),
+    "glm52_step": ("logits", "next_token", "kv_write", "kv_scale_write", "pe_write", "index_k_write", "index_scale_write", "sparse_indices", "expert_ids"),
+    "kimi_k3_step": ("logits", "next_token", "kv_write", "pe_write", "recurrent_state", "conv_state", "expert_ids", "cache_length"),
+    "spec_full_iteration": ("logits", "proposed_tokens", "tree_parents", "accepted_count",
+                            "proposed_count", "committed_count", "committed_tokens",
+                            "cache_length", "draft_cache_length", "target_features",
+                            "draft_hidden", "k_write", "v_write", "draft_k_write", "draft_v_write"),
 }
 
 
@@ -53,11 +73,11 @@ def _write_reference(project: Path, benchmark_root: Path, case: Case) -> str:
         destination = target / "tasks" / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
-    (target / "cases.py").write_text(
-        "\"\"\"Case metadata for this reference snapshot.\"\"\"\n"
-        "from types import SimpleNamespace\n"
-        "Case = SimpleNamespace\n"
-        f"CASE = Case(**{case.to_dict()!r})\n")
+    # Keep the real dataclass: hybrid fixtures call dataclasses.replace().
+    # Copy only its definition and the assigned geometry, never the catalog.
+    definition = (benchmark_root / "megabench/cases.py").read_text().split(
+        "CASES: tuple[Case, ...] = (", 1)[0]
+    (target / "cases.py").write_text(definition + f"CASE = Case(**{case.to_dict()!r})\n")
     module = files[0].removesuffix(".py")
     (project / "reference/README.md").write_text(
         "# Assigned PyTorch reference\n\n"
@@ -106,8 +126,21 @@ def _write_kernelagent_task(project: Path, benchmark_root: Path,
         "`kernel_function(inputs: dict) -> dict`. Run `test.py` for local "
         "correctness. The campaign driver wraps this function as a MegaBench "
         "`build(case)` submission.\n")
+    if case.gpus > 1:
+        (project / "test.py").write_text(
+            "import sys\nfrom pathlib import Path\n"
+            f"sys.path.insert(0, {str(benchmark_root)!r})\n"
+            "from megabench.cases import select_cases\n"
+            "from megabench.harness.runner import evaluate_case\n"
+            "if __name__ == '__main__':\n"
+            f"    case = select_cases('all', [{case.id!r}])[0]\n"
+            "    result = evaluate_case(case, Path(__file__).with_name('submission.py'), "
+            "device='cuda:0', trials=3, warmup=1, reps=3)\n"
+            "    assert result['status'] == 'ok_provisional', result\n")
+        return
     scenarios = (("eagle3_raw", "accept_full", "accept_one")
-                 if case.family == "spec_target_step" else ("seeded",))
+                 if case.family in ("spec_target_step", "spec_full_iteration") else ("seeded",))
+    spec_module = "speculative" if case.family == "spec_full_iteration" else "eagle3"
     (project / "test.py").write_text(
         "import sys\nimport torch\n"
         f"sys.path.insert(0, {str(benchmark_root)!r})\n"
@@ -120,7 +153,7 @@ def _write_kernelagent_task(project: Path, benchmark_root: Path,
         f"    for index, scenario in enumerate({scenarios!r}):\n"
         "        inputs = make_inputs(case, 104729 + index, 'cuda:0')\n"
         "        if scenario in ('accept_full', 'accept_one'):\n"
-        "            from megabench.tasks.eagle3 import set_acceptance_scenario\n"
+        f"            from megabench.tasks.{spec_module} import set_acceptance_scenario\n"
         "            prefix = case.params['draft_depth'] if scenario == 'accept_full' else 1\n"
         "            set_acceptance_scenario(case, inputs, prefix)\n"
         "        originals = {name: value.detach().to('cpu', copy=True) "
@@ -169,16 +202,29 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "Edit `submission.py` and your own helper files. Export "
         "`build(case: dict) -> run(inputs: dict) -> outputs: dict`. "
     )
+    outputs = OUTPUT_KEYS[case.family]
+    if case.family == "distributed_step" and "qwen" in case.model.lower():
+        outputs += ("expert_ids",)
+    topology = (
+        f"The evaluator starts {case.gpus} rank processes, with TP={case.tp}, EP={case.ep}. "
+        "`build(case)` receives `case['execution']`: rank, world_size, tp_rank, ep_rank, "
+        "device, backend, and live tp_group/ep_group handles. "
+        "Weights and vocabulary logits use the reference's rank-local layouts. "
+        "Compressed MLA KV and DSA index state are replicated; conventional KV and KDA heads are sharded. "
+        "`next_token` is the global greedy token. Complete all communication inside run. "
+        "The budget includes NCCL kernels and is one GPU launch per rank. "
+        "Use an allocation with all required GPUs visible. Nsight capture of spawned "
+        "ranks requires `--target-processes all`.\n\n" if case.gpus > 1 else "")
     (project / "TASK.md").write_text(
         f"# {case.id}\n\n"
         f"Implement one complete {case.model} {case.phase} step with the "
         f"public geometry in `case.json`. Read `reference/megabench/tasks/{module}.py` "
         "and its included helpers for input layouts and exact PyTorch math.\n\n"
         + interface +
-        f"Return {', '.join(f'`{key}`' for key in OUTPUT_KEYS[case.family])}. "
+        f"Return {', '.join(f'`{key}`' for key in outputs)}. "
         "Compute from current runtime weights, token, KV cache, and any draft "
         "inputs; preserve all inputs. The complete step must use at most "
-        "one GPU kernel launch.\n\n"
+        "one GPU kernel launch per rank.\n\n" + topology
         + ("Use `test.py` for local correctness. " if agent == "kernelagent"
            else "") +
         "Use `./check_candidate` for local correctness, launch auditing, "
@@ -189,8 +235,8 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "`--profile-from-start off` to capture the warmed marker window. "
         "Use `./sol_info --json` for an optimistic HBM "
         "speed-of-light floor and byte breakdown; pass `--result PATH` for "
-        "the gap to a checked CUDA-event result. The default assumes one "
-        "B200 GPU at 8 TB/s. These commands load the trusted benchmark outside "
+        "the gap to a checked CUDA-event result where a traffic model is available. "
+        "The default bandwidth is 8 TB/s per B200. These commands load the trusted benchmark outside "
         "this workspace; final grading is run separately.\n")
     _write_tools(project, benchmark_root, case)
     if agent == "vibesys":

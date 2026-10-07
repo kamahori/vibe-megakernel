@@ -62,7 +62,7 @@ def _eagle3_proposals(case: Case, seed: int, token: torch.Tensor,
     return torch.tensor(proposals, dtype=torch.int64, device=device)
 
 
-def make_inputs(case: Case, seed: int, device: str) -> dict[str, torch.Tensor]:
+def make_inputs(case: Case, seed: int, device: str, *, proposals: bool = True) -> dict[str, torch.Tensor]:
     p = case.params
     if p["batch"] != 1:
         raise NotImplementedError("EAGLE3 target fixture currently handles batch one")
@@ -74,7 +74,6 @@ def make_inputs(case: Case, seed: int, device: str) -> dict[str, torch.Tensor]:
                           dtype=torch.int64)
     values = {
         "token": token,
-        "draft_tokens": _eagle3_proposals(case, seed, token, device),
         "ln1": random_norm(g, device, (layers, h)),
         "ln2": random_norm(g, device, (layers, h)),
         "fnorm": random_norm(g, device, (h,)),
@@ -88,6 +87,8 @@ def make_inputs(case: Case, seed: int, device: str) -> dict[str, torch.Tensor]:
         "embed": random_weight(g, device, (p["vocab"], h), h),
         "lm_head": random_weight(g, device, (p["vocab"], h), h),
     }
+    if proposals:
+        values["draft_tokens"] = _eagle3_proposals(case, seed, token, device)
     cache_shape = (layers, p["context"], p["kv_heads"], d)
     values["kcache"] = random_weight(g, device, cache_shape, d)
     values["vcache"] = random_weight(g, device, cache_shape, d)

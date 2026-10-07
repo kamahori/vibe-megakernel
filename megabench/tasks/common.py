@@ -27,6 +27,25 @@ def rope(x: torch.Tensor, positions: torch.Tensor, theta: float,
     return x * cos + rotated * sin
 
 
+def llama31_rope(x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    """Llama 3.1's wavelength-dependent factor-8 extension, original size 8192."""
+    width = x.shape[-1]
+    inv = 500_000.0 ** (-torch.arange(0, width, 2, device=x.device,
+                                    dtype=torch.float64) / width)
+    wavelength = 2 * torch.pi / inv
+    smooth = (8192 / wavelength - 1) / 3
+    blended = (1 - smooth) * inv / 8 + smooth * inv
+    inv = torch.where(wavelength > 8192, inv / 8,
+                      torch.where(wavelength < 2048, inv, blended))
+    phase = torch.outer(positions.to(torch.float64), inv)
+    phase = torch.cat((phase, phase), -1)
+    cos, sin = phase.cos().float(), phase.sin().float()
+    while cos.ndim < x.ndim:
+        cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
+    half = width // 2
+    return x * cos + torch.cat((-x[..., half:], x[..., :half]), -1) * sin
+
+
 def random_weight(generator: torch.Generator, device: str, shape: tuple[int, ...],
                   fan_in: int) -> torch.Tensor:
     return (torch.randn(shape, generator=generator, device=device) *

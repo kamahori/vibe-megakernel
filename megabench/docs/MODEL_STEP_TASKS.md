@@ -2,8 +2,10 @@
 
 This is the active whole-model benchmark deck. The exact case IDs and readiness
 states are in [`cases.py`](../cases.py). All five P0 cells are runnable in a
-synthetic-weight tier; P1–P3 remain planned. `--suite core` selects the five
-P0 cells. A model-step case exercises every layer in its stated model
+synthetic-weight tier. All P1 and P2 tasks are also enabled after full GPU validation.
+DeepSeek and GLM frontier references are enabled after full eight-GPU validation;
+Kimi is deferred.
+`--suite core` selects every enabled cell. A model-step case exercises every layer in its stated model
 phase, from token or modality input through final logits and state updates.
 The timed boundary and launch policy must be fixed *per phase*: decode and
 speculative verification/iteration have different contracts.
@@ -12,8 +14,8 @@ The priority order is intentional. Full dense and MoE decode establish the
 central megakernel claim; quantization and speculation change the dataflow;
 Gemma's local/global attention, vision-conditioned decode, and distributed
 cases test whether the approach generalizes. Frontier-scale models are P3
-because their checkpoint and communication requirements need a separate
-multi-GPU harness.
+because their native formats and memory requirements need the multi-process
+harness and an appropriate GPU allocation.
 Architecture-shaped random weights are useful for early correctness tests,
 but the final checkpoint tier must use pinned public weights and tokenizer/
 processor revisions. Shape-only success and checkpoint agreement are reported

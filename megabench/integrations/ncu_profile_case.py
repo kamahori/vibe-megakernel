@@ -10,11 +10,49 @@ PyTorch setup can launch unrelated GPU kernels.
 from __future__ import annotations
 
 import argparse
+import tempfile
+from datetime import timedelta
 from pathlib import Path
 
 from ..cases import select_cases
 from ..harness.runner import _load_submission
 from ..workloads import make_inputs
+
+
+def capture(rank: int, contract: dict, submission: str, seed: int, rendezvous: str | None = None) -> None:
+    import torch
+    import torch.distributed as dist
+    from ..cases import Case
+    from ..tasks.parallel import initialize
+
+    case = Case(**contract)
+    device = f"cuda:{rank}"
+    torch.cuda.set_device(rank)
+    execution = None
+    if rendezvous:
+        dist.init_process_group('nccl', init_method=rendezvous, rank=rank,
+                                world_size=case.gpus, timeout=timedelta(minutes=10))
+        ctx = initialize(case)
+        execution = {'rank': rank, 'world_size': case.gpus, 'tp_rank': ctx.tp_rank,
+                     'ep_rank': ctx.ep_rank, 'tp_group': ctx.tp_group, 'ep_group': ctx.ep_group,
+                     'backend': 'nccl', 'device': device}
+    try:
+        with torch.inference_mode():
+            inputs = make_inputs(case, seed, device)
+            candidate = _load_submission(Path(submission), case, execution=execution)
+            candidate(inputs)
+            torch.cuda.synchronize(device)
+            if rendezvous:
+                dist.barrier()
+            torch.cuda.cudart().cudaProfilerStart()
+            try:
+                candidate(inputs)
+                torch.cuda.synchronize(device)
+            finally:
+                torch.cuda.cudart().cudaProfilerStop()
+    finally:
+        if rendezvous:
+            dist.destroy_process_group()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -33,17 +71,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if not torch.cuda.is_available():
         parser.error("a CUDA GPU is required for ncu profiling")
-    with torch.inference_mode():
-        inputs = make_inputs(case, args.seed, "cuda:0")
-        candidate = _load_submission(submission, case)
-        candidate(inputs)  # compile and warm the submission outside the capture
-        torch.cuda.synchronize()
-        torch.cuda.cudart().cudaProfilerStart()
-        try:
-            candidate(inputs)
-            torch.cuda.synchronize()
-        finally:
-            torch.cuda.cudart().cudaProfilerStop()
+    if torch.cuda.device_count() < case.gpus:
+        parser.error(f"{case.id} requires {case.gpus} visible GPUs")
+    if case.gpus == 1:
+        capture(0, case.to_dict(), str(submission), args.seed)
+    else:
+        with tempfile.TemporaryDirectory(prefix='megabench-ncu-') as directory:
+            torch.multiprocessing.spawn(capture, nprocs=case.gpus, join=True,
+                args=(case.to_dict(), str(submission), args.seed,
+                      (Path(directory) / 'rendezvous').as_uri()))
     print(f"Captured one steady-state run of {case.id}: {submission}")
     return 0
 
