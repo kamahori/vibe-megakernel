@@ -17,7 +17,7 @@ import torch.nn.functional as F
 
 from ..cases import Case
 from . import gemma
-from .common import fill_layer_weights, random_norm, random_weight, rms, rope
+from .common import attention, fill_layer_weights, random_norm, random_weight, rms, rope
 
 
 def vision_inputs(case: Case, seed: int, device: str) -> dict[str, torch.Tensor]:
@@ -51,14 +51,14 @@ def image_features(case: Case, values: dict[str, torch.Tensor]) -> torch.Tensor:
     p = case.params
     heads, h = p["vision_heads"], p["vision_hidden"]
     dim = h // heads
-    x = F.conv2d(values["pixels"].float(), values["patch_weight"].float(),
-                 values["patch_bias"].float(), stride=p["patch_size"])
-    x = x.flatten(2).transpose(1, 2) + values["position"].float()
+    x = F.conv2d(values["pixels"].to(torch.bfloat16), values["patch_weight"],
+                 values["patch_bias"], stride=p["patch_size"])
+    x = x.flatten(2).transpose(1, 2) + values["position"]
     for layer in range(p["vision_layers"]):
-        normalized = F.layer_norm(x, (h,), values["norm1"][layer].float(),
-                                  values["norm1_bias"][layer].float(), eps=1e-6)
-        projected = [(normalized @ values[name][layer].float().T +
-                      values[name + "_bias"][layer].float()).view(
+        normalized = F.layer_norm(x, (h,), values["norm1"][layer],
+                                  values["norm1_bias"][layer], eps=1e-6)
+        projected = [F.linear(normalized, values[name][layer],
+                              values[name + "_bias"][layer]).view(
                           p["images"], -1, heads, dim).transpose(1, 2)
                      for name in ("q", "k", "v")]
         query, key, content = projected
@@ -67,19 +67,19 @@ def image_features(case: Case, values: dict[str, torch.Tensor]) -> torch.Tensor:
         attention = F.scaled_dot_product_attention(query, key, content,
                                                     dropout_p=0.0, is_causal=False)
         attention = attention.transpose(1, 2).reshape_as(x)
-        x = x + attention @ values["o"][layer].float().T + values["o_bias"][layer].float()
-        normalized = F.layer_norm(x, (h,), values["norm2"][layer].float(),
-                                  values["norm2_bias"][layer].float(), eps=1e-6)
-        up = normalized @ values["up"][layer].float().T + values["up_bias"][layer].float()
-        x = x + F.gelu(up, approximate="tanh") @ values["down"][layer].float().T + values["down_bias"][layer].float()
-    x = F.layer_norm(x, (h,), values["final_norm"].float(), values["final_bias"].float(), eps=1e-6)
+        x = x + F.linear(attention, values["o"][layer], values["o_bias"][layer])
+        normalized = F.layer_norm(x, (h,), values["norm2"][layer],
+                                  values["norm2_bias"][layer], eps=1e-6)
+        up = F.linear(normalized, values["up"][layer], values["up_bias"][layer])
+        x = x + F.linear(F.gelu(up, approximate="tanh"), values["down"][layer], values["down_bias"][layer])
+    x = F.layer_norm(x, (h,), values["final_norm"], values["final_bias"], eps=1e-6)
     side = p["image_size"] // p["patch_size"]
     output_side = math.isqrt(p["image_tokens"])
     if output_side ** 2 != p["image_tokens"] or side % output_side:
         raise ValueError("image tokens must form a square pooling grid dividing patch grid")
     x = x.transpose(1, 2).reshape(p["images"], h, side, side)
     x = F.avg_pool2d(x, side // output_side).flatten(2).transpose(1, 2)
-    return rms(x, values["projector_norm"], gemma=True) @ values["projector"].float()
+    return rms(x, values["projector_norm"], gemma=True) @ values["projector"]
 
 
 def prefill(case: Case, values: dict[str, torch.Tensor],
@@ -88,16 +88,16 @@ def prefill(case: Case, values: dict[str, torch.Tensor],
     p = case.params
     steps, d = embeddings.shape[0], p["head_dim"]
     qh, kvh = p["q_heads"], p["kv_heads"]
-    x = embeddings.float()
+    x = embeddings.to(torch.bfloat16)
     positions = torch.arange(steps, device=x.device)
     causal = positions[None, :] <= positions[:, None]
     same_image = (image_blocks[:, None] == image_blocks[None, :]) & (image_blocks[:, None] >= 0)
     k_writes, v_writes = [], []
     for layer in range(p["layers"]):
         normalized = rms(x, values["ln1"][layer], gemma=True)
-        query = (normalized @ values["wq"][layer].float().T).view(steps, qh, d)
-        key = (normalized @ values["wk"][layer].float().T).view(steps, kvh, d)
-        content = (normalized @ values["wv"][layer].float().T).view(steps, kvh, d)
+        query = (normalized @ values["wq"][layer].T).view(steps, qh, d)
+        key = (normalized @ values["wk"][layer].T).view(steps, kvh, d)
+        content = (normalized @ values["wv"][layer].T).view(steps, kvh, d)
         query = rms(query, values["qn"][layer], gemma=True)
         key = rms(key, values["kn"][layer], gemma=True)
         local = (layer + 1) % 6 != 0
@@ -105,16 +105,14 @@ def prefill(case: Case, values: dict[str, torch.Tensor],
         query, key = rope(query, positions, theta, factor=factor), rope(key, positions, theta, factor=factor)
         k_writes.append(key.to(torch.bfloat16))
         v_writes.append(content.to(torch.bfloat16))
-        scores = torch.einsum("tgqd,sgd->tgqs", query.view(steps, kvh, qh // kvh, d), key) * d ** -0.5
         allowed = causal | same_image
         if local:
             allowed = allowed & (positions[None, :] > positions[:, None] - p["local_window"])
-        probabilities = scores.masked_fill(~allowed[:, None, None], -torch.inf).softmax(-1)
-        attention = torch.einsum("tgqs,sgd->tgqd", probabilities, content).reshape(steps, qh * d)
-        x = x + rms(attention @ values["wo"][layer].float().T, values["ln2"][layer], gemma=True)
+        attn = attention(query, key, content, allowed=allowed).reshape(steps, qh * d)
+        x = x + rms(attn @ values["wo"][layer].T, values["ln2"][layer], gemma=True)
         normalized = rms(x, values["ln3"][layer], gemma=True)
-        gate, up = normalized @ values["wg"][layer].float().T, normalized @ values["wu"][layer].float().T
-        x = x + rms((F.gelu(gate, approximate="tanh") * up) @ values["wd"][layer].float().T,
+        gate, up = normalized @ values["wg"][layer].T, normalized @ values["wu"][layer].T
+        x = x + rms((F.gelu(gate, approximate="tanh") * up) @ values["wd"][layer].T,
                     values["ln4"][layer], gemma=True)
     return torch.stack(k_writes), torch.stack(v_writes)
 
@@ -127,7 +125,7 @@ def make_inputs(case: Case, seed: int, device: str) -> dict[str, torch.Tensor]:
     features = image_features(case, vision).reshape(-1, p["hidden"])
     generator = torch.Generator(device=device).manual_seed(seed ^ 0xCA5E)
     prompt = torch.randint(p["vocab"], (p["context"],), generator=generator, device=device)
-    embeddings = torch.cat((features, values["embed"][prompt].float() * math.sqrt(p["hidden"])))
+    embeddings = torch.cat((features, values["embed"][prompt] * torch.tensor(math.sqrt(p["hidden"]), device=device, dtype=torch.bfloat16)))
     blocks = torch.cat((torch.arange(p["images"], device=device).repeat_interleave(p["image_tokens"]),
                         torch.full((p["context"],), -1, device=device, dtype=torch.int64)))
     values["kcache"], values["vcache"] = prefill(text_case, values, embeddings, blocks)

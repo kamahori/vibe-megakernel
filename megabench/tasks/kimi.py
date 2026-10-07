@@ -132,14 +132,14 @@ def make_inputs(case: Case, seed: int, device: str, *, rank: int | None = None):
 
 
 def situ(gate,up):
-    return 4*torch.tanh(gate.float()/4)*gate.float().sigmoid()*(25*torch.tanh(up.float()/25))
+    return (4*torch.tanh(gate.float()/4)*gate.float().sigmoid()*(25*torch.tanh(up.float()/25))).to(gate.dtype)
 
 
 def attention_residual(prefix,blocks,norm,projection):
     values = torch.stack([*blocks,prefix])
     normalized = rms(values,norm,eps=1e-5)
-    probability = (normalized@projection.float()).softmax(0)
-    return (probability[:,None]*values).sum(0)
+    probability = (normalized.float()@projection.float()).softmax(0)
+    return (probability[:,None]*values.float()).sum(0).to(values.dtype)
 
 
 def kda_step(query,key,value,gate,beta,A_log,dt_bias,state):
@@ -162,14 +162,14 @@ def reference(case: Case,values,*,serial=False):
     h,d,heads = p['hidden'],p['head_dim'],p['q_heads']//tp
     chunk,offset = p['vocab']//tp,ctx.tp_rank*(p['vocab']//tp)
     token = int(values['token'])
-    prefix = values['embed'][token-offset].float() if offset <= token < offset+chunk else torch.zeros(h,device=values['token'].device)
+    prefix = values['embed'][token-offset] if offset <= token < offset+chunk else torch.zeros(h,device=values['token'].device,dtype=torch.bfloat16)
     prefix = sum_value(prefix)
     blocks,latent_writes,pe_writes,recurrent,conv_writes,routes = [],[],[],[],[],[]
     reset = bool(values['reset'])
     for layer in range(p['layers']):
         name = f'l{layer}_'
         def project(key,value):
-            return values[name+key].float()@value
+            return values[name+key]@value.to(torch.bfloat16)
         hidden = attention_residual(prefix,blocks,values['attention_res_norm'][layer],values['attention_res_proj'][layer]) if blocks else prefix
         if layer%p['attn_res_block_size'] == 0:
             blocks.append(prefix)
@@ -185,19 +185,19 @@ def reference(case: Case,values,*,serial=False):
             pe_writes.append(pe.to(torch.bfloat16))
             old_latent = values[name+'kv_cache'][:0] if reset else values[name+'kv_cache']
             old_pe = values[name+'pe_cache'][:0] if reset else values[name+'pe_cache']
-            all_latent = torch.cat((old_latent.float(),latent[None]))
-            all_pe = torch.cat((old_pe.float(),pe[None]))
-            weight = values[name+'kb'].float().view(heads,nr+vd,kr)
+            all_latent = torch.cat((old_latent,latent[None]))
+            all_pe = torch.cat((old_pe,pe[None]))
+            weight = values[name+'kb'].view(heads,nr+vd,kr)
             absorbed = torch.einsum('hd,hdc->hc',query[:,:nr],weight[:,:nr])
-            probability = ((absorbed@all_latent.T+query[:,nr:]@all_pe.T)/(nr+rd)**0.5).softmax(-1)
-            output = torch.einsum('hc,hdc->hd',probability@all_latent,weight[:,nr:]).flatten()
+            probability = ((absorbed.float()@all_latent.float().T+query[:,nr:].float()@all_pe.float().T)/(nr+rd)**0.5).softmax(-1)
+            output = torch.einsum('hc,hdc->hd',probability.to(torch.bfloat16)@all_latent,weight[:,nr:]).flatten()
             output = output*project('output_gate',normalized).sigmoid()
             attention = sum_value(project('o',output))
         else:
             raw = torch.stack([project(key,normalized) for key in ('q','k','v')])
             old = torch.zeros_like(values[name+'conv_state']) if reset else values[name+'conv_state']
             conv = torch.cat((old[...,1:],raw.to(torch.bfloat16)[...,None]),-1)
-            q,k,v = F.silu((conv.float()*values[name+'conv_weight'].float()).sum(-1)).view(3,heads,d)
+            q,k,v = F.silu((conv.float()*values[name+'conv_weight'].float()).sum(-1).to(torch.bfloat16)).view(3,heads,d)
             gate = project('fb',project('fa',normalized)).view(heads,d)
             beta = project('beta',normalized)
             state = torch.zeros_like(values[name+'recurrent_state']) if reset else values[name+'recurrent_state']
@@ -213,22 +213,22 @@ def reference(case: Case,values,*,serial=False):
             output = sum_value(project('down',situ(project('gate',normalized),project('up',normalized))))
             routes.append(torch.full((p['topk'],),-1,device=normalized.device,dtype=torch.int64))
         else:
-            indices,weights = route(values[name+'router'].float()@normalized,values[name+'router_bias'],p['topk'],1,1,scaling=1.)
+            indices,weights = route(values[name+'router'].float()@normalized.float(),values[name+'router_bias'],p['topk'],1,1,scaling=1.)
             routes.append(indices)
             latent = project('latent_down',normalized)
             expert_sum = torch.zeros(p['latent_hidden'],device=latent.device)
             for slot,expert in enumerate(indices.tolist()):
                 def expert_weight(key):
-                    return unpack_mxfp4(values[name+key+'_blocks'][expert],values[name+key+'_scales'][expert])
-                expert_sum = expert_sum+(expert_weight('down')@situ(expert_weight('gate')@latent,expert_weight('up')@latent))*weights[slot]
+                    return unpack_mxfp4(values[name+key+'_blocks'][expert],values[name+key+'_scales'][expert]).to(torch.bfloat16)
+                expert_sum = expert_sum+(expert_weight('down')@situ(expert_weight('gate')@latent,expert_weight('up')@latent)).float()*weights[slot]
             expert_sum = sum_value(expert_sum)
-            routed = project('latent_up',rms(expert_sum,values[name+'latent_norm'],eps=1e-5))
+            routed = project('latent_up',rms(expert_sum.to(torch.bfloat16),values[name+'latent_norm'],eps=1e-5))
             shared = sum_value(project('shared_down',situ(project('shared_gate',normalized),project('shared_up',normalized))))
             output = routed+shared
         prefix = prefix+output
     hidden = attention_residual(prefix,blocks,values['output_res_norm'],values['output_res_proj'])
-    logits = values['lm_head'].float()@rms(hidden,values['fnorm'],eps=1e-5)
-    return {'logits':logits,'next_token':logits.argmax() if serial else greedy_token(logits,offset,ctx.tp_group),
+    logits = values['lm_head']@rms(hidden,values['fnorm'],eps=1e-5)
+    return {'logits':logits.float(),'next_token':logits.argmax() if serial else greedy_token(logits,offset,ctx.tp_group),
             'kv_write':torch.stack(latent_writes),'pe_write':torch.stack(pe_writes),
             'recurrent_state':torch.stack(recurrent),'conv_state':torch.stack(conv_writes),
             'expert_ids':torch.stack(routes),'cache_length':torch.tensor(1 if reset else p['context']+1,device=logits.device)}

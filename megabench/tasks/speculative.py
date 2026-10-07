@@ -16,7 +16,7 @@ import torch.nn.functional as F
 
 from ..cases import Case
 from . import eagle3
-from .common import llama31_rope, random_norm, random_weight, rms, rope
+from .common import attention, llama31_rope, random_norm, random_weight, rms, rope
 
 
 def make_inputs(case: Case, seed: int, device: str) -> dict[str, torch.Tensor]:
@@ -55,23 +55,21 @@ def draft_step(case: Case, values: dict[str, torch.Tensor], token: torch.Tensor,
                position: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     p = case.params
     qh, kvh, d = p["q_heads"], p["kv_heads"], p["head_dim"]
-    embedding = rms(values["embed"][token].float(), values["draft_input_norm"], eps=1e-5)
+    embedding = rms(values["embed"][token], values["draft_input_norm"], eps=1e-5)
     normalized = rms(hidden, values["draft_hidden_norm"], eps=1e-5)
     combined = torch.cat((embedding, normalized))
-    query = (values["draft_wq"].float() @ combined).view(qh, d)
-    key = (values["draft_wk"].float() @ combined).view(kvh, d)
-    value = (values["draft_wv"].float() @ combined).view(kvh, d)
+    query = (values["draft_wq"] @ combined).view(qh, d)
+    key = (values["draft_wk"] @ combined).view(kvh, d)
+    value = (values["draft_wv"] @ combined).view(kvh, d)
     pos = torch.tensor([position], device=hidden.device)
     query, key = rope(query, pos, 10_000.0), rope(key, pos, 10_000.0)
-    all_keys, all_content = torch.cat((keys.float(), key[None])), torch.cat((content.float(), value[None]))
-    grouped = query.view(kvh, qh // kvh, d)
-    probability = (torch.einsum("gqd,tgd->gqt", grouped, all_keys) * d ** -0.5).softmax(-1)
-    attention = torch.einsum("gqt,tgd->gqd", probability, all_content).flatten()
-    hidden = hidden + values["draft_wo"].float() @ attention
+    all_keys, all_content = torch.cat((keys, key[None])), torch.cat((content, value[None]))
+    attn = attention(query, all_keys, all_content).flatten()
+    hidden = hidden + values["draft_wo"] @ attn
     normalized = rms(hidden, values["draft_post_norm"], eps=1e-5)
-    hidden = hidden + values["draft_wd"].float() @ (
-        F.silu(values["draft_wg"].float() @ normalized) *
-        (values["draft_wu"].float() @ normalized))
+    hidden = hidden + values["draft_wd"] @ (
+        F.silu(values["draft_wg"] @ normalized) *
+        (values["draft_wu"] @ normalized))
     return hidden, key.to(torch.bfloat16), value.to(torch.bfloat16)
 
 
@@ -79,7 +77,7 @@ def draft_tree(case: Case, values: dict[str, torch.Tensor]) -> dict:
     p = case.params
     budget, width = p["draft_depth"], p.get("tree_width", 1)
     tokens, parents, depths = [values["token"]], [-1], [0]
-    incoming = [values["draft_fc"].float() @ values["target_features"].float().flatten()]
+    incoming = [values["draft_fc"] @ values["target_features"].flatten()]
     hidden, k_writes, v_writes = [], [], []
     node = 0
     while node < len(tokens):
@@ -96,7 +94,7 @@ def draft_tree(case: Case, values: dict[str, torch.Tensor]) -> dict:
         k_writes.append(key)
         v_writes.append(value)
         if len(tokens) <= budget:
-            scores = values["draft_lm_head"].float() @ rms(state, values["draft_final_norm"], eps=1e-5)
+            scores = values["draft_lm_head"] @ rms(state, values["draft_final_norm"], eps=1e-5)
             count = min(width, budget + 1 - len(tokens), p["draft_vocab"])
             chosen = torch.argsort(scores, descending=True, stable=True)[:count]
             for draft_id in chosen:
@@ -115,7 +113,7 @@ def target_tree(case: Case, values: dict[str, torch.Tensor], tree: dict) -> dict
     p = case.params
     qh, kvh, d = p["q_heads"], p["kv_heads"], p["head_dim"]
     context, steps = p["context"], tree["tokens"].numel()
-    x = values["embed"][tree["tokens"]].float()
+    x = values["embed"][tree["tokens"]]
     positions = tree["depths"] + context
     allowed = torch.zeros((steps, context + steps), dtype=torch.bool, device=x.device)
     allowed[:, :context] = True
@@ -131,23 +129,21 @@ def target_tree(case: Case, values: dict[str, torch.Tensor], tree: dict) -> dict
     for layer in range(p["layers"]):
         features.append(x)
         normalized = rms(x, values["ln1"][layer], eps=1e-5)
-        query = (normalized @ values["wq"][layer].float().T).view(steps, qh, d)
-        key = (normalized @ values["wk"][layer].float().T).view(steps, kvh, d)
-        content = (normalized @ values["wv"][layer].float().T).view(steps, kvh, d)
+        query = (normalized @ values["wq"][layer].T).view(steps, qh, d)
+        key = (normalized @ values["wk"][layer].T).view(steps, kvh, d)
+        content = (normalized @ values["wv"][layer].T).view(steps, kvh, d)
         query, key = llama31_rope(query, positions), llama31_rope(key, positions)
         k_writes.append(key.to(torch.bfloat16))
         v_writes.append(content.to(torch.bfloat16))
-        keys = torch.cat((values["kcache"][layer].float(), key))
-        all_content = torch.cat((values["vcache"][layer].float(), content))
-        scores = torch.einsum("tgqd,sgd->tgqs", query.view(steps, kvh, qh // kvh, d), keys) * d ** -0.5
-        probability = scores.masked_fill(~allowed[:, None, None], -torch.inf).softmax(-1)
-        attention = torch.einsum("tgqs,sgd->tgqd", probability, all_content).reshape(steps, qh * d)
-        x = x + attention @ values["wo"][layer].float().T
+        keys = torch.cat((values["kcache"][layer], key))
+        all_content = torch.cat((values["vcache"][layer], content))
+        attn = attention(query, keys, all_content, allowed=allowed).reshape(steps, qh * d)
+        x = x + attn @ values["wo"][layer].T
         normalized = rms(x, values["ln2"][layer], eps=1e-5)
-        x = x + (F.silu(normalized @ values["wg"][layer].float().T) *
-                 (normalized @ values["wu"][layer].float().T)) @ values["wd"][layer].float().T
-    logits = rms(x, values["fnorm"], eps=1e-5) @ values["lm_head"].float().T
-    return {"logits": logits, "k_write": torch.stack(k_writes), "v_write": torch.stack(v_writes),
+        x = x + (F.silu(normalized @ values["wg"][layer].T) *
+                 (normalized @ values["wu"][layer].T)) @ values["wd"][layer].T
+    logits = rms(x, values["fnorm"], eps=1e-5) @ values["lm_head"].T
+    return {"logits": logits.float(), "k_write": torch.stack(k_writes), "v_write": torch.stack(v_writes),
             "features": torch.stack([features[index] for index in feature_layers], dim=1)}
 
 
@@ -200,7 +196,7 @@ def set_acceptance_scenario(case: Case, values: dict[str, torch.Tensor], accepte
         raise ValueError("controlled acceptance requires a valid linear-chain prefix")
     values["lm_head"].zero_()
     values["draft_vocab_map"] = torch.arange(p["draft_vocab"], device=values["token"].device)
-    state = values["draft_fc"].float() @ values["target_features"].float().flatten()
+    state = values["draft_fc"] @ values["target_features"].flatten()
     token = values["token"]
     keys, content = values["draft_kcache"], values["draft_vcache"]
     rows = []

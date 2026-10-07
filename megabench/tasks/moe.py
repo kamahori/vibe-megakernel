@@ -63,13 +63,13 @@ def reference(case: Case, values: dict[str, torch.Tensor]) -> dict[str, torch.Te
     ref = MoeRefDecoder(cfg, {name: values[name] for name in WEIGHT_NAMES},
                         device=str(values["token"].device))
     context = case.params["context"]
-    ref.k_cache[:, :context] = values["kcache"].float()
-    ref.v_cache[:, :context] = values["vcache"].float()
+    ref.k_cache[:, :context] = values["kcache"]
+    ref.v_cache[:, :context] = values["vcache"]
     ref.pos = context
     logits = ref.step(int(values["token"].item()))
     return {
         "logits": logits.float(),
         "next_token": logits.argmax().to(torch.int64),
-        "k_write": ref.k_cache[:, context].to(torch.bfloat16),
-        "v_write": ref.v_cache[:, context].to(torch.bfloat16),
+        "k_write": ref.k_cache[:, context].contiguous(),
+        "v_write": ref.v_cache[:, context].contiguous(),
     }

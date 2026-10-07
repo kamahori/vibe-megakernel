@@ -12,6 +12,21 @@ from ..tasks import gemma, gptoss, hybrid, speculative, vision
 from ..tasks.quantization import FP4_VALUES, pack_mxfp4, unpack_mxfp4
 
 
+def serving_model(model):
+    """BF16 parameters/activations, preserving FP32 rotary frequency buffers.
+
+    Casting an already constructed model also casts its frequency buffers;
+    pretrained serving initialization retains those buffers in FP32.
+    """
+    frequencies = {name: value.clone() for name, value in model.named_buffers()
+                   if "inv_freq" in name}
+    model = model.to(torch.bfloat16).eval()
+    for name, value in frequencies.items():
+        parent, _, field = name.rpartition(".")
+        setattr(model.get_submodule(parent), field, value)
+    return model
+
+
 def tiny_gptoss():
     case = select_cases("p1", ["gptoss-step-20b-b1-s128"])[0]
     return replace(case, params=case.params | {
@@ -102,7 +117,7 @@ class NonP0ReferenceTests(unittest.TestCase):
                                                "high_freq_factor": 4.0, "original_max_position_embeddings": 8192},
                               max_position_embeddings=131072)
         config._attn_implementation = "eager"
-        model = LlamaForCausalLM(config).float().eval()
+        model = serving_model(LlamaForCausalLM(config))
         with torch.no_grad():
             model.model.embed_tokens.weight.copy_(values["embed"])
             model.lm_head.weight.copy_(values["lm_head"])
@@ -126,16 +141,16 @@ class NonP0ReferenceTests(unittest.TestCase):
                     path.reverse()
                     cache = DynamicCache()
                     for index in range(p["layers"]):
-                        cache.update(values["kcache"][index].float().permute(1, 0, 2)[None],
-                                     values["vcache"][index].float().permute(1, 0, 2)[None], index)
+                        cache.update(values["kcache"][index].permute(1, 0, 2)[None],
+                                     values["vcache"][index].permute(1, 0, 2)[None], index)
                     actual = model(input_ids=tree["tokens"][path][None], past_key_values=cache, use_cache=True, output_hidden_states=True)
-                    torch.testing.assert_close(expected["logits"][node], actual.logits[0, -1], rtol=2e-5, atol=2e-5)
+                    torch.testing.assert_close(expected["logits"][node], actual.logits[0, -1].float(), rtol=case.bf16_rtol, atol=case.atol)
                     feature_layers = (min(2, p['layers'] - 1), p['layers'] // 2, max(0, p['layers'] - 3))
                     for slot, index in enumerate(feature_layers):
                         torch.testing.assert_close(expected['features'][node, slot],
-                                                   actual.hidden_states[index][0, -1], rtol=2e-5, atol=2e-5)
+                                                   actual.hidden_states[index][0, -1], rtol=case.bf16_rtol, atol=case.atol)
                     for index in range(p["layers"]):
-                        torch.testing.assert_close(expected["k_write"][index, node].float(),
+                        torch.testing.assert_close(expected["k_write"][index, node],
                                                    cache.layers[index].keys[0, :, -1], rtol=case.bf16_rtol, atol=case.atol)
 
     def test_speculative_acceptance_and_both_cache_rollbacks(self):
@@ -171,7 +186,8 @@ class NonP0ReferenceTests(unittest.TestCase):
                                     image_size=p["image_size"], patch_size=p["patch_size"], layer_norm_eps=1e-6,
                                     vision_use_head=False, hidden_act="gelu_pytorch_tanh")
         config._attn_implementation = "eager"
-        model = SiglipVisionModel(config).float().eval()
+        config._attn_implementation = "sdpa"
+        model = serving_model(SiglipVisionModel(config))
         with torch.no_grad():
             model.embeddings.patch_embedding.weight.copy_(values["patch_weight"])
             model.embeddings.patch_embedding.bias.copy_(values["patch_bias"])
@@ -192,9 +208,9 @@ class NonP0ReferenceTests(unittest.TestCase):
             encoded = model(pixel_values=values["pixels"]).last_hidden_state
             pooled = torch.nn.functional.avg_pool2d(encoded.transpose(1, 2).reshape(1, 32, 4, 4), 2)
             pooled = pooled.flatten(2).transpose(1, 2)
-            expected = rms(pooled, values["projector_norm"], gemma=True) @ values["projector"].float()
+            expected = rms(pooled, values["projector_norm"], gemma=True) @ values["projector"]
             actual = vision.image_features(case, values)
-        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(actual, expected, rtol=case.bf16_rtol, atol=case.atol)
 
     def test_multimodal_prefill_matches_upstream_and_depends_on_image(self):
         from transformers import DynamicCache
@@ -207,7 +223,7 @@ class NonP0ReferenceTests(unittest.TestCase):
         images = vision.vision_inputs(case, 17, "cpu")
         features = vision.image_features(case, images).reshape(-1, p["hidden"])
         prompt = torch.arange(p["context"])
-        embeddings = torch.cat((features, values["embed"][prompt].float() * p["hidden"] ** 0.5))
+        embeddings = torch.cat((features, values["embed"][prompt] * torch.tensor(p["hidden"] ** 0.5, dtype=torch.bfloat16)))
         blocks = torch.tensor([0] * p["image_tokens"] + [-1] * p["context"])
         expected_k, expected_v = vision.prefill(case, values, embeddings, blocks)
         config = Gemma3TextConfig(hidden_size=p["hidden"], intermediate_size=p["intermediate"],
@@ -219,7 +235,7 @@ class NonP0ReferenceTests(unittest.TestCase):
                                                                       "rope_theta": 1_000_000.0},
                                                    "sliding_attention": {"rope_type": "default", "rope_theta": 10_000.0}})
         config._attn_implementation = "eager"
-        model = Gemma3TextModel(config).float().eval()
+        model = serving_model(Gemma3TextModel(config))
         with torch.no_grad():
             model.embed_tokens.weight.copy_(values["embed"])
             model.norm.weight.copy_(values["fnorm"])
@@ -243,9 +259,9 @@ class NonP0ReferenceTests(unittest.TestCase):
             model(inputs_embeds=embeddings[None], attention_mask=masks,
                   past_key_values=cache, use_cache=True)
             for index in range(p["layers"]):
-                torch.testing.assert_close(expected_k[index].float(), cache.layers[index].keys[0].transpose(0, 1),
+                torch.testing.assert_close(expected_k[index], cache.layers[index].keys[0].transpose(0, 1),
                                            rtol=case.bf16_rtol, atol=case.atol)
-                torch.testing.assert_close(expected_v[index].float(), cache.layers[index].values[0].transpose(0, 1),
+                torch.testing.assert_close(expected_v[index], cache.layers[index].values[0].transpose(0, 1),
                                            rtol=case.bf16_rtol, atol=case.atol)
         values["kcache"], values["vcache"] = expected_k, expected_v
         first = vision.reference(case, values)
@@ -271,7 +287,7 @@ class NonP0ReferenceTests(unittest.TestCase):
                               vocab_size=p["vocab"], sliding_window=p["sliding_window"],
                               tie_word_embeddings=False)
         config._attn_implementation = "eager"
-        model = GptOssForCausalLM(config).float().eval()
+        model = serving_model(GptOssForCausalLM(config))
         with torch.no_grad():
             model.model.embed_tokens.weight.copy_(values["embed"])
             model.lm_head.weight.copy_(values["lm_head"])
@@ -294,12 +310,12 @@ class NonP0ReferenceTests(unittest.TestCase):
                 layer.mlp.experts.down_proj_bias.copy_(values["down_bias"][index])
             cache = DynamicCache()
             for index in range(p["layers"]):
-                cache.update(values["kcache"][index].float().permute(1, 0, 2)[None],
-                             values["vcache"][index].float().permute(1, 0, 2)[None], index)
+                cache.update(values["kcache"][index].permute(1, 0, 2)[None],
+                             values["vcache"][index].permute(1, 0, 2)[None], index)
             actual = model(input_ids=values["token"].reshape(1, 1), past_key_values=cache,
                            use_cache=True)
             expected = gptoss.reference(case, values)
-        torch.testing.assert_close(expected["logits"], actual.logits[0, 0], rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(expected["logits"], actual.logits[0, 0].float(), rtol=case.bf16_rtol, atol=case.atol)
         for index in range(p["layers"]):
             key = cache.layers[index].keys[0, :, -1].to(torch.bfloat16)
             value = cache.layers[index].values[0, :, -1].to(torch.bfloat16)
@@ -325,7 +341,7 @@ class NonP0ReferenceTests(unittest.TestCase):
                              "partial_rotary_factor": p["rotary_dim"] / p["head_dim"],
                              "mrope_section": [1, 1, 0], "mrope_interleaved": True})
         config._attn_implementation = "eager"
-        model = Qwen3_5ForCausalLM(config).float().eval()
+        model = serving_model(Qwen3_5ForCausalLM(config))
         values = hybrid.make_inputs(case, 17, "cpu")
         values["reset"].fill_(False)
         with torch.no_grad():
@@ -344,8 +360,8 @@ class NonP0ReferenceTests(unittest.TestCase):
                         getattr(attention, "in_proj_" + suffix).weight.copy_(values["in_" + suffix][linear])
                     attention.out_proj.weight.copy_(values["out_linear"][linear])
                     attention.conv1d.weight.copy_(values["conv_weight"][linear][:, None])
-                    attention.A_log.copy_(values["A_log"][linear])
-                    attention.dt_bias.copy_(values["dt_bias"][linear])
+                    attention.A_log.data = values["A_log"][linear].clone()
+                    attention.dt_bias.data = values["dt_bias"][linear].clone()
                     attention.norm.weight.copy_(values["linear_norm"][linear])
                     linear += 1
                 else:
@@ -362,8 +378,8 @@ class NonP0ReferenceTests(unittest.TestCase):
                     cache.update_recurrent_state(values["recurrent_state"][linear][None].clone(), index)
                     linear += 1
                 else:
-                    cache.update(values["kcache"][full].float().permute(1, 0, 2)[None],
-                                 values["vcache"][full].float().permute(1, 0, 2)[None], index)
+                    cache.update(values["kcache"][full].permute(1, 0, 2)[None],
+                                 values["vcache"][full].permute(1, 0, 2)[None], index)
                     full += 1
             for step in range(3):
                 current = replace(case, params=p | {"context": p["context"] + step})
@@ -372,24 +388,24 @@ class NonP0ReferenceTests(unittest.TestCase):
                                position_ids=torch.tensor([[p["context"] + step]]),
                                attention_mask={"full_attention": None, "linear_attention": None},
                                use_cache=True)
-                torch.testing.assert_close(expected["logits"], actual.logits[0, 0], rtol=2e-5, atol=2e-5)
+                torch.testing.assert_close(expected["logits"], actual.logits[0, 0].float(), rtol=case.bf16_rtol, atol=case.atol)
                 linear, full = 0, 0
                 for index in range(p["layers"]):
                     layer_cache = cache.layers[index]
                     if (index + 1) % p["full_attention_interval"]:
                         torch.testing.assert_close(expected["recurrent_state"][linear],
-                                                   layer_cache.recurrent_states[0][0], rtol=1e-5, atol=1e-5)
+                                                   layer_cache.recurrent_states[0][0], rtol=case.bf16_rtol, atol=case.atol)
                         torch.testing.assert_close(expected["conv_state"][linear],
-                                                   layer_cache.conv_states[0][0], rtol=1e-5, atol=1e-5)
+                                                   layer_cache.conv_states[0][0], rtol=case.bf16_rtol, atol=case.atol)
                         linear += 1
                     else:
-                        torch.testing.assert_close(expected["k_write"][full].float(),
+                        torch.testing.assert_close(expected["k_write"][full],
                                                    layer_cache.keys[0, :, -1], rtol=case.bf16_rtol, atol=case.atol)
-                        torch.testing.assert_close(expected["v_write"][full].float(),
+                        torch.testing.assert_close(expected["v_write"][full],
                                                    layer_cache.values[0, :, -1], rtol=case.bf16_rtol, atol=case.atol)
                         # MegaBench retains BF16 KV between calls.
-                        layer_cache.keys = layer_cache.keys.to(torch.bfloat16).float()
-                        layer_cache.values = layer_cache.values.to(torch.bfloat16).float()
+                        layer_cache.keys = layer_cache.keys.to(torch.bfloat16)
+                        layer_cache.values = layer_cache.values.to(torch.bfloat16)
                         full += 1
                 values["kcache"] = torch.cat((values["kcache"], expected["k_write"][:, None]), 1)
                 values["vcache"] = torch.cat((values["vcache"], expected["v_write"][:, None]), 1)

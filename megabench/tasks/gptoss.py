@@ -3,7 +3,7 @@
     Synthetic BF16 attention/router/embedding weights and E2M1/E8M0 experts.
     Expert packing follows the checkpoint: [input, output/32, 16]. Every
     selected expert is unpacked inside the call. Inputs are never mutated.
-    Arithmetic accumulates in FP32, matching MegaBench's synthetic tier.
+    Model activations and expert outputs are BF16; normalization uses FP32.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ def yarn_rotate(x: torch.Tensor, position: int) -> torch.Tensor:
     cos, sin = phase.cos().float() * factor, phase.sin().float() * factor
     half = width // 2
     rotated = torch.cat((-x[..., half:], x[..., :half]), dim=-1)
-    return x * cos + rotated * sin
+    return x * cos.to(x.dtype) + rotated * sin.to(x.dtype)
 
 
 def make_inputs(case: Case, seed: int, device: str) -> dict[str, torch.Tensor]:
@@ -81,45 +81,49 @@ def reference(case: Case, values: dict[str, torch.Tensor]) -> dict[str, torch.Te
     p = case.params
     qh, kvh, d = p["q_heads"], p["kv_heads"], p["head_dim"]
     context = p["context"]
-    x = values["embed"][values["token"]].float()
+    x = values["embed"][values["token"]]
     k_writes, v_writes, routes = [], [], []
     for layer in range(p["layers"]):
-        normalized = rms(x, values["ln1"][layer], eps=1e-5)
-        project = lambda name: values["w" + name][layer].float() @ normalized + values["b" + name][layer].float()
+        normalized = rms(x, values["ln1"][layer], eps=1e-5, weight_in_fp32=True)
+        project = lambda name: torch.nn.functional.linear(normalized, values["w" + name][layer], values["b" + name][layer])
         q = yarn_rotate(project("q").view(qh, d), context)
         k = yarn_rotate(project("k").view(kvh, d), context)
         v = project("v").view(kvh, d)
         k_writes.append(k.to(torch.bfloat16))
         v_writes.append(v.to(torch.bfloat16))
         start = max(0, context + 1 - p["sliding_window"]) if layer % 2 == 0 else 0
-        keys = torch.cat((values["kcache"][layer, start:].float(), k[None]))
-        content = torch.cat((values["vcache"][layer, start:].float(), v[None]))
+        keys = torch.cat((values["kcache"][layer, start:], k[None]))
+        content = torch.cat((values["vcache"][layer, start:], v[None]))
         grouped = q.view(kvh, qh // kvh, d)
         scores = torch.einsum("gqd,tgd->gqt", grouped, keys) * d ** -0.5
-        sinks = values["sinks"][layer].float().view(kvh, qh // kvh, 1)
-        probabilities = torch.cat((scores, sinks), dim=-1).softmax(-1)[..., :-1]
-        attention = torch.einsum("gqt,tgd->gqd", probabilities, content).flatten()
-        x = x + values["wo"][layer].float() @ attention + values["bo"][layer].float()
-        normalized = rms(x, values["ln2"][layer], eps=1e-5)
-        scores = values["router"][layer].float() @ normalized + values["router_bias"][layer].float()
+        sinks = values["sinks"][layer].view(kvh, qh // kvh, 1)
+        combined = torch.cat((scores, sinks), dim=-1)
+        combined = combined - combined.amax(-1, keepdim=True)
+        probabilities = combined.softmax(-1)[..., :-1]
+        attention = torch.einsum("gqt,tgd->gqd", probabilities.to(x.dtype), content).flatten()
+        x = x + torch.nn.functional.linear(attention, values["wo"][layer], values["bo"][layer])
+        normalized = rms(x, values["ln2"][layer], eps=1e-5, weight_in_fp32=True)
+        scores = torch.nn.functional.linear(normalized, values["router"][layer], values["router_bias"][layer])
         # Stable sorting fixes expert-ID tie breaking as part of the contract.
         selected = torch.argsort(scores, descending=True, stable=True)[:p["topk"]]
         probabilities = scores[selected].softmax(-1)
         routes.append(selected)
         output = torch.zeros_like(x)
-        for slot, expert in enumerate(selected):
+        # Upstream accumulates experts in ID order, independent of router rank.
+        for slot in selected.argsort():
+            expert = selected[slot]
             weights = unpack_mxfp4(values["gate_up_blocks"][layer, expert],
-                                   values["gate_up_scales"][layer, expert])
-            gate_up = normalized @ weights + values["gate_up_bias"][layer, expert].float()
+                                   values["gate_up_scales"][layer, expert]).to(x.dtype)
+            gate_up = normalized @ weights + values["gate_up_bias"][layer, expert]
             gate = gate_up[::2].clamp(max=7.0)
             up = gate_up[1::2].clamp(-7.0, 7.0)
-            activated = (up + 1) * gate * (1.702 * gate).sigmoid()
+            activated = (up + 1) * (gate * (1.702 * gate).sigmoid())
             weights = unpack_mxfp4(values["down_blocks"][layer, expert],
-                                   values["down_scales"][layer, expert])
-            output = output + probabilities[slot] * (
-                activated @ weights + values["down_bias"][layer, expert].float())
-        x = x + output
-    logits = values["lm_head"].float() @ rms(x, values["fnorm"], eps=1e-5)
-    return {"logits": logits, "next_token": logits.argmax().to(torch.int64),
+                                   values["down_scales"][layer, expert]).to(x.dtype)
+            expert_output = activated @ weights + values["down_bias"][layer, expert]
+            output = output + probabilities[slot] * expert_output
+        x = x + output.to(x.dtype)
+    logits = values["lm_head"] @ rms(x, values["fnorm"], eps=1e-5, weight_in_fp32=True)
+    return {"logits": logits.float(), "next_token": logits.argmax().to(torch.int64),
             "k_write": torch.stack(k_writes), "v_write": torch.stack(v_writes),
             "expert_ids": torch.stack(routes)}

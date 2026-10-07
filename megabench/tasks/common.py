@@ -1,14 +1,47 @@
-"""Small PyTorch primitives shared by the synthetic whole-model P0 oracles."""
+"""Serving precision primitives shared by the synthetic model oracles.
+
+Model activations are BF16. Normalization and attention reductions use FP32,
+and their results return to the activation dtype at operator boundaries.
+"""
 
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 
 def rms(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6,
-        *, gemma: bool = False) -> torch.Tensor:
+        *, gemma: bool = False, weight_in_fp32: bool = False) -> torch.Tensor:
     scale = 1.0 + weight.float() if gemma else weight.float()
-    return x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps) * scale
+    normalized = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps)
+    # Gemma applies its offset weight before the activation cast; ordinary
+    # Llama/Qwen RMSNorm casts the normalized activation before weighting.
+    if gemma or weight_in_fp32:
+        return (normalized * scale).to(x.dtype)
+    return normalized.to(x.dtype) * weight.to(x.dtype)
+
+
+def attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+              *, scale: float | None = None,
+              allowed: torch.Tensor | None = None) -> torch.Tensor:
+    """GQA over [tokens, heads, dim], or one [heads, dim] decode query.
+
+    The eager serving path publishes BF16 scores/probabilities, with FP32
+    softmax reduction. A boolean mask uses True for visible positions.
+"""
+    single = query.ndim == 2
+    if single:
+        query = query.unsqueeze(0)
+    groups = query.shape[-2] // key.shape[-2]
+    key = key.repeat_interleave(groups, dim=-2)
+    value = value.repeat_interleave(groups, dim=-2)
+    q, k, v = (tensor.transpose(0, 1) for tensor in (query, key, value))
+    scores = (q @ k.transpose(-1, -2)) * (scale if scale is not None else query.shape[-1] ** -0.5)
+    if allowed is not None:
+        scores = scores.masked_fill(~allowed, -torch.inf)
+    probabilities = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+    result = (probabilities @ v).transpose(0, 1)
+    return result.squeeze(0) if single else result
 
 
 def rope(x: torch.Tensor, positions: torch.Tensor, theta: float,
@@ -24,7 +57,7 @@ def rope(x: torch.Tensor, positions: torch.Tensor, theta: float,
         cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
     half = width // 2
     rotated = torch.cat((-x[..., half:], x[..., :half]), dim=-1)
-    return x * cos + rotated * sin
+    return x * cos.to(x.dtype) + rotated * sin.to(x.dtype)
 
 
 def llama31_rope(x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -43,7 +76,8 @@ def llama31_rope(x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
     while cos.ndim < x.ndim:
         cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
     half = width // 2
-    return x * cos + torch.cat((-x[..., half:], x[..., :half]), -1) * sin
+    rotated = torch.cat((-x[..., half:], x[..., :half]), -1)
+    return x * cos.to(x.dtype) + rotated * sin.to(x.dtype)
 
 
 def random_weight(generator: torch.Generator, device: str, shape: tuple[int, ...],

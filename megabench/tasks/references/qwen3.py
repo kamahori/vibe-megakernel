@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import torch
 
+from ..common import attention, rms
+
 
 @dataclass
 class Config:
@@ -32,7 +34,7 @@ def rope_tables(cfg: Config, device="cuda") -> tuple[torch.Tensor, torch.Tensor]
 
 
 def _rms(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
-    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w
+    return rms(x, w, eps)
 
 
 def _rot_half(x: torch.Tensor) -> torch.Tensor:
@@ -41,20 +43,21 @@ def _rot_half(x: torch.Tensor) -> torch.Tensor:
 
 
 class RefDecoder:
-    """Eager fp32 decoder over BF16 task weights, with an fp32 KV cache."""
+    """BF16 decoder and KV cache, with FP32 normalization/attention reductions."""
 
     def __init__(self, cfg: Config, w: dict[str, torch.Tensor], device="cuda"):
         self.cfg = cfg
         self.w_bf16 = w
         self.cos, self.sin = rope_tables(cfg, device)
         L, S = cfg.layers, cfg.max_seq
-        self.k_cache = torch.zeros(L, S, cfg.kv_heads, cfg.head_dim, device=device)
-        self.v_cache = torch.zeros(L, S, cfg.kv_heads, cfg.head_dim, device=device)
+        self.k_cache = torch.zeros(L, S, cfg.kv_heads, cfg.head_dim,
+                                  device=device, dtype=torch.bfloat16)
+        self.v_cache = torch.zeros_like(self.k_cache)
         self.pos = 0
 
     def _get(self, name, idx=None):
         t = self.w_bf16[name] if idx is None else self.w_bf16[name][idx]
-        return t.float()
+        return t
 
     def step(self, token: int) -> torch.Tensor:
         """One decode step: returns logits[vocab] fp32; advances the KV cache."""
@@ -72,17 +75,14 @@ class RefDecoder:
             q = _rms(q, g("qn", l), cfg.eps)
             k = _rms(k, g("kn", l), cfg.eps)
             cos, sin = self.cos[pos], self.sin[pos]
-            q = q * cos + _rot_half(q) * sin
-            k = k * cos + _rot_half(k) * sin
+            q = q * cos.to(q.dtype) + _rot_half(q) * sin.to(q.dtype)
+            k = k * cos.to(k.dtype) + _rot_half(k) * sin.to(k.dtype)
             self.k_cache[l, pos] = k
             self.v_cache[l, pos] = v
 
             ks = self.k_cache[l, : pos + 1]  # [t, KVH, D]
             vs = self.v_cache[l, : pos + 1]
-            qh = q.view(KVH, QH // KVH, D)  # group query heads per kv head
-            scores = torch.einsum("gqd,tgd->gqt", qh, ks) * D**-0.5
-            p = torch.softmax(scores, dim=-1)
-            o = torch.einsum("gqt,tgd->gqd", p, vs).reshape(QH * D)
+            o = attention(q, ks, vs).reshape(QH * D)
             x = x + g("wo", l) @ o
 
             # --- MLP block ---
@@ -93,4 +93,4 @@ class RefDecoder:
 
         logits = g("embed") @ _rms(x, g("fnorm"), cfg.eps)
         self.pos += 1
-        return logits
+        return logits.float()

@@ -120,7 +120,7 @@ def make_inputs(case: Case, seed: int, device: str, *, rank: int | None = None) 
 
 def linear(value: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, power: bool) -> torch.Tensor:
     quant, act_scale = pack_fp8_activation(value.to(torch.bfloat16), power_of_two=power)
-    return unpack_fp8_weight(weight, scale) @ unpack_fp8_activation(quant, act_scale)
+    return (unpack_fp8_weight(weight, scale) @ unpack_fp8_activation(quant, act_scale)).to(value.dtype)
 
 
 def rotate(value: torch.Tensor, position: int, *, deepseek: bool, interleaved: bool) -> torch.Tensor:
@@ -136,8 +136,10 @@ def rotate(value: torch.Tensor, position: int, *, deepseek: bool, interleaved: b
         inv = (1.0/(40*frequencies))*(1-extrapolation) + inv*extrapolation
     angle = position*inv
     a, b = (value[..., 0::2], value[..., 1::2]) if interleaved else value.chunk(2, -1)
-    a, b = a*angle.cos()-b*angle.sin(), b*angle.cos()+a*angle.sin()
-    return torch.stack((a,b), -1).flatten(-2) if interleaved else torch.cat((a,b), -1)
+    cos, sin = angle.cos().to(value.dtype), angle.sin().to(value.dtype)
+    a, b = a*cos-b*sin, b*cos+a*sin
+    result = torch.stack((a,b), -1).flatten(-2) if interleaved else torch.cat((a,b), -1)
+    return result.to(value.dtype)
 
 
 def hadamard(value: torch.Tensor) -> torch.Tensor:
@@ -181,7 +183,7 @@ def reference(case: Case, values: dict[str, torch.Tensor], *, serial: bool = Fal
     nr, rd, vd, kr = p['qk_nope_dim'], p['qk_rope_dim'], p['v_head_dim'], p['kv_lora_rank']
     chunk, offset = p['vocab']//tp, ctx.tp_rank*(p['vocab']//tp)
     token = int(values['token'])
-    x = values['embed'][token-offset].float() if offset <= token < offset+chunk else torch.zeros(h, device=values['token'].device)
+    x = values['embed'][token-offset] if offset <= token < offset+chunk else torch.zeros(h, device=values['token'].device, dtype=torch.bfloat16)
     x = sum_value(x)
     latent_out, latent_scales, pe_out, index_keys, index_scales, indices_out, expert_ids = [], [], [], [], [], [], []
     selected = None
@@ -198,18 +200,18 @@ def reference(case: Case, values: dict[str, torch.Tensor], *, serial: bool = Fal
         raw = project('ka', normalized)
         latent = rms(raw[:kr], values[prefix+'kn'], eps=1e-6)
         latent_payload, latent_scale = pack_fp8_activation(latent.to(torch.bfloat16), power_of_two=power)
-        latent = unpack_fp8_activation(latent_payload, latent_scale).to(torch.bfloat16).float()
+        latent = unpack_fp8_activation(latent_payload, latent_scale).to(torch.bfloat16)
         pe = rotate(raw[kr:], p['context'], deepseek=deepseek, interleaved=True)
         query_pe = rotate(query[:, nr:], p['context'], deepseek=deepseek, interleaved=True)
         latent_out.append(latent_payload)
         latent_scales.append(latent_scale)
         pe_out.append(pe.to(torch.bfloat16))
-        all_latent = torch.cat((unpack_fp8_activation(values[prefix+'kv_cache'], values[prefix+'kv_cache_scale']).to(torch.bfloat16).float(), latent[None]))
-        all_pe = torch.cat((values[prefix+'pe_cache'].float(), pe[None]))
+        all_latent = torch.cat((unpack_fp8_activation(values[prefix+'kv_cache'], values[prefix+'kv_cache_scale']).to(torch.bfloat16), latent[None]))
+        all_pe = torch.cat((values[prefix+'pe_cache'], pe[None]))
         if indexer_layer(case, layer):
             ih, idim = p['index_heads'], p['index_dim']
             iq = project('iq', qr).view(ih, idim)
-            ik = F.layer_norm(project('ik', normalized), (idim,), values[prefix+'inorm'].float(), values[prefix+'ibias'].float(), eps=1e-6)
+            ik = F.layer_norm(project('ik', normalized), (idim,), values[prefix+'inorm'], values[prefix+'ibias'], eps=1e-6)
             iq = torch.cat((rotate(iq[:, :rd], p['context'], deepseek=deepseek, interleaved=not deepseek), iq[:, rd:]), -1)
             ik = torch.cat((rotate(ik[:rd], p['context'], deepseek=deepseek, interleaved=not deepseek), ik[rd:]), -1)
             # GLM's published eager indexer works directly in BF16/FP32;
@@ -222,21 +224,22 @@ def reference(case: Case, values: dict[str, torch.Tensor], *, serial: bool = Fal
             iq = unpack_fp8_activation(iq_payload, iq_scale)
             index_cache = torch.cat((unpack_fp8_activation(values[prefix+'index_cache'], values[prefix+'index_cache_scale']),
                                      unpack_fp8_activation(ik_payload, ik_scale)[None]))
-            iw = values[prefix+'iw'].float() @ normalized / ih**0.5
+            # Upstream keeps the sparse-index weighting projection in FP32.
+            iw = (values[prefix+'iw'].float() @ normalized.float()) / ih**0.5
             scores = (F.relu(iq @ index_cache.T / idim**0.5)*iw[:, None]).sum(0)
             selected = scores.argsort(descending=True, stable=True)[:min(p['index_topk'], p['context']+1)].to(torch.int32)
             index_keys.append(ik_payload)
             index_scales.append(ik_scale)
         indices_out.append(selected)
-        weight = unpack_fp8_weight(values[prefix+'kb'], values[prefix+'kb_scale']).view(heads, nr+vd, kr)
+        weight = unpack_fp8_weight(values[prefix+'kb'], values[prefix+'kb_scale']).to(x.dtype).view(heads, nr+vd, kr)
         absorbed = torch.einsum('hd,hdc->hc', query[:, :nr], weight[:, :nr])
-        scores = (absorbed @ all_latent.T + query_pe @ all_pe.T)/(nr+rd)**0.5
+        scores = (absorbed.float() @ all_latent.float().T + query_pe.float() @ all_pe.float().T)/(nr+rd)**0.5
         if deepseek:
             scores = scores*(1+0.1*math.log(40))**2
         mask = torch.ones(p['context']+1, device=x.device, dtype=torch.bool)
         mask[selected.long()] = False
         probability = scores.masked_fill(mask[None], -torch.inf).softmax(-1)
-        attention_latent = probability @ all_latent
+        attention_latent = probability.to(x.dtype) @ all_latent
         attention = torch.einsum('hc,hdc->hd', attention_latent, weight[:, nr:]).flatten()
         x = x+sum_value(project('o', attention))
         normalized = rms(x, values['ln2'][layer], eps=1e-6 if deepseek else 1e-5)
@@ -244,18 +247,18 @@ def reference(case: Case, values: dict[str, torch.Tensor], *, serial: bool = Fal
             output = project('down', F.silu(project('gate', normalized))*project('up', normalized))
             expert_ids.append(torch.full((p['topk'],), -1, device=x.device, dtype=torch.int64))
         else:
-            ids, weights = route(values[prefix+'router'].float() @ normalized, values[prefix+'router_bias'],
+            ids, weights = route(values[prefix+'router'].float() @ normalized.float(), values[prefix+'router_bias'],
                                  p['topk'], p['router_groups'], p['router_top_groups'])
             expert_ids.append(ids)
-            output = torch.zeros_like(x)
+            output = torch.zeros_like(x, dtype=torch.float32)
             for slot, expert in enumerate(ids.tolist()):
                 hidden = F.silu(project('gate', normalized, expert))*project('up', normalized, expert)
-                output = output+project('down', hidden, expert)*weights[slot]
-            output = output+project('shared_down', F.silu(project('shared_gate', normalized))*project('shared_up', normalized))
-        x = x+sum_value(output)
-    logits = values['lm_head'].float() @ rms(x, values['fnorm'], eps=1e-6 if deepseek else 1e-5)
+                output = output+project('down', hidden, expert).float()*weights[slot]
+            output = output+project('shared_down', F.silu(project('shared_gate', normalized))*project('shared_up', normalized)).float()
+        x = x+sum_value(output).to(x.dtype)
+    logits = values['lm_head'] @ rms(x, values['fnorm'], eps=1e-6 if deepseek else 1e-5)
     # Native FP8 cache payloads and their scales must travel together.
-    return {'logits': logits, 'next_token': logits.argmax() if serial else greedy_token(logits, offset, ctx.tp_group),
+    return {'logits': logits.float(), 'next_token': logits.argmax() if serial else greedy_token(logits, offset, ctx.tp_group),
             'kv_write': torch.stack(latent_out), 'kv_scale_write': torch.stack(latent_scales), 'pe_write': torch.stack(pe_out),
             'index_k_write': torch.stack(index_keys), 'index_scale_write': torch.stack(index_scales),
             'sparse_indices': torch.stack(indices_out), 'expert_ids': torch.stack(expert_ids)}

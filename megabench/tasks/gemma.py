@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from ..cases import Case
-from .common import fill_layer_weights, random_norm, random_weight, rms, rope
+from .common import attention, fill_layer_weights, random_norm, random_weight, rms, rope
 
 
 LINEAR_NAMES = ("wq", "wk", "wv", "wo", "wg", "wu", "wd")
@@ -98,13 +98,16 @@ def reference(case: Case, values: dict[str, torch.Tensor]) -> dict[str, torch.Te
     p = case.params
     h, d, context, bits = (p["hidden"], p["head_dim"], p["context"], p["bits"])
     qh, kvh = p["q_heads"], p["kv_heads"]
-    x = values["embed"][values["token"]].float() * math.sqrt(h)
+    x = values["embed"][values["token"]] * torch.tensor(
+        math.sqrt(h), device=values["token"].device, dtype=torch.bfloat16)
     positions = torch.tensor([context], device=x.device)
     k_writes, v_writes = [], []
 
     def linear(name: str, layer: int, vec: torch.Tensor) -> torch.Tensor:
-        matrix = (values[name][layer].float() if bits == 16 else
-                  dequant(values[name][layer], values[f"{name}_scale"][layer], bits))
+        # Packed input weights and FP32 scales retain their native formats.
+        # W8A16/W4A16 projections consume BF16 decoded weights/activations.
+        matrix = (values[name][layer] if bits == 16 else
+                  dequant(values[name][layer], values[f"{name}_scale"][layer], bits).to(vec.dtype))
         return matrix @ vec
 
     for layer in range(p["layers"]):
@@ -122,12 +125,9 @@ def reference(case: Case, values: dict[str, torch.Tensor]) -> dict[str, torch.Te
         k_writes.append(k.to(torch.bfloat16))
         v_writes.append(v.to(torch.bfloat16))
         start = max(0, context + 1 - p["local_window"]) if local else 0
-        ks = torch.cat((values["kcache"][layer, start:].float(), k[None]), dim=0)
-        vs = torch.cat((values["vcache"][layer, start:].float(), v[None]), dim=0)
-        grouped_q = q.view(kvh, qh // kvh, d)
-        scores = torch.einsum("gqd,tgd->gqt", grouped_q, ks) * p.get("query_pre_attn_scalar", d) ** -0.5
-        probs = scores.softmax(dim=-1)
-        attn = torch.einsum("gqt,tgd->gqd", probs, vs).reshape(qh * d)
+        ks = torch.cat((values["kcache"][layer, start:], k[None]), dim=0)
+        vs = torch.cat((values["vcache"][layer, start:], v[None]), dim=0)
+        attn = attention(q, ks, vs, scale=p.get("query_pre_attn_scalar", d) ** -0.5).reshape(qh * d)
         x = x + rms(linear("wo", layer, attn), values["ln2"][layer], gemma=True)
 
         xn = rms(x, values["ln3"][layer], gemma=True)
@@ -136,7 +136,7 @@ def reference(case: Case, values: dict[str, torch.Tensor]) -> dict[str, torch.Te
         mlp = linear("wd", layer, F.gelu(gate, approximate="tanh") * up)
         x = x + rms(mlp, values["ln4"][layer], gemma=True)
 
-    logits = values["embed"].float() @ rms(x, values["fnorm"], gemma=True)
+    logits = values["embed"] @ rms(x, values["fnorm"], gemma=True)
     return {
         "logits": logits.float(),
         "next_token": logits.argmax().to(torch.int64),

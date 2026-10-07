@@ -16,7 +16,7 @@ from .make_vibesys_case_task import make_task
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[2]
 REFERENCE_FILES = {
-    "dense_step": ("dense.py", "references/qwen3.py"),
+    "dense_step": ("dense.py", "common.py", "references/qwen3.py"),
     "moe_step": ("moe.py", "common.py", "references/qwen3.py",
                  "references/moe.py"),
     "quant_step": ("gemma.py", "common.py"),
