@@ -2,8 +2,8 @@
 
 This is the active whole-model benchmark deck. The exact case IDs and readiness
 states are in [`cases.py`](../cases.py). All five P0 cells are runnable in a
-synthetic-weight tier. All P1 tasks and full speculative iteration are also enabled.
-Distributed and frontier references are implemented and awaiting GPU validation.
+synthetic-weight tier. All P1 and P2 tasks are also enabled after full GPU validation.
+DeepSeek and GLM frontier references await eight-GPU validation; Kimi is deferred.
 `--suite core` selects every enabled cell. A model-step case exercises every layer in its stated model
 phase, from token or modality input through final logits and state updates.
 The timed boundary and launch policy must be fixed *per phase*: decode and

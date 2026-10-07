@@ -40,7 +40,7 @@ boundary; [`cases.py`](cases.py) is the active machine-readable catalog.
 | P1 | Qwen3.5-0.8B DeltaNet/attention hybrid decode | Ready with synthetic reset/continuing state |
 | P1 | Gemma 3 4B image-conditioned text decode | Ready with synthetic SigLIP/projector/prefill fixtures |
 | P2 | Llama 3.1 8B plus EAGLE3 full speculative iteration | Ready with synthetic draft, verify and both KV commits |
-| P2 | Gemma 3 27B TP decode; Qwen3-30B-A3B TP/EP decode | Implemented; full GPU verification pending |
+| P2 | Gemma 3 27B TP decode; Qwen3-30B-A3B TP/EP decode | Ready with synthetic weights; verified on two/four B200 GPUs |
 | P3 | DeepSeek-V3.2 and GLM-5.2-FP8 full decode | Native synthetic references implemented; full GPU verification pending |
 | P3 | Kimi-K3 full decode | Native synthetic reference implemented; deferred by request |
 

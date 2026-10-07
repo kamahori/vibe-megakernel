@@ -13,17 +13,16 @@ Kimi-K3 is deferred at the user's request; it remains visible and disabled.
 | Qwen3.5-0.8B | All 24 layers, 18 GatedDeltaNet and six GQA layers, convolution/recurrent/KV state | Independent upstream recurrence and three-step decoder rollout; full B200 geometry passed three seeds; enabled |
 | Gemma 3 4B vision-conditioned decode | Synthetic full SigLIP encoder, projector and multimodal prefill build the fixture; all 34 text layers are timed | Upstream vision/projector/prefill checks and image dependence; full B200 geometry passed three seeds; enabled |
 | Llama 3.1 8B + EAGLE3 full iteration | Actual draft head, proposal tree, full target verification, greedy acceptance, both KV commits/rollback and next-draft features | Upstream target ancestor-mask/features tests, K=2/4/8 and partial/full/reject acceptance; full B200 K=4 run passed; enabled |
-| Gemma 3 27B TP2 | All 62 layers with vocabulary/head/intermediate shards and live TP reductions | Two-rank CPU outputs match the independent serial decoder; full two-GPU rerun queued; disabled pending that check |
-| Qwen3-30B-A3B TP2/EP2 | All 48 layers, contiguous EP expert ownership, TP attention/FFN and distributed greedy token | Four-rank CPU logits, KV and global expert IDs match the independent serial decoder; full four-GPU rerun queued; disabled pending that check |
+| Gemma 3 27B TP2 | All 62 layers with vocabulary/head/intermediate shards and live TP reductions | CPU and full two-B200 outputs match the independent serial decoder for both seeds; enabled |
+| Qwen3-30B-A3B TP2/EP2 | All 48 layers, contiguous EP expert ownership, TP attention/FFN and distributed greedy token | CPU and full four-B200 logits, KV and global expert IDs match the independent serial decoder for both seeds; enabled |
 | DeepSeek-V3.2 TP8 | All 61 layers, block FP8 weights/activation quantization, MLA, Hadamard FP8 indexer, grouped routing and shared expert | Independent expanded MLA, YaRN, routing and quantization tests; CPU TP and candidate harness pass; full eight-GPU check queued; disabled |
 | GLM-5.2-FP8 TP8 | All 78 layers, block FP8 weights, MLA, scheduled full/shared indexers and MoE | Independent expanded MLA, FP8 and routing tests; CPU TP and candidate harness pass; full eight-GPU check queued; disabled |
 | Kimi-K3 TP16 | All 93 layers, 69 KDA/24 gated MLA, attention residuals, BF16 latent/shared paths and native MXFP4 routed experts | Official pinned decoder/FLA oracle, eight-step independent KDA recurrence and 16-rank CPU protocol pass; deferred by request; disabled |
 
 The full EAGLE iteration consumes target features entering layers 2, 16 and
-29, matching the pinned EAGLE implementation. Its earlier full-GPU report
-predates the correction to those feature tap locations; the corrected taps
-are checked against upstream hidden states on CPU. A fresh full-GPU report
-is still required before using the old timings for the corrected contract.
+29, matching the pinned EAGLE implementation. The corrected taps agree with
+upstream hidden states on CPU. A fresh full-B200 run also passed all three
+seeded/full/one-token acceptance scenarios with these feature taps.
 
 ## Reference contracts
 
@@ -139,14 +138,26 @@ The local campaign is
 B200 jobs 4141/4144 completed successfully on PyTorch 2.13/CUDA 13.0.
 Three-seed eager CUDA-event medians were 84.949–85.555 ms for GPT-OSS,
 13.299–13.326 ms for Qwen3.5 and 27.218–27.351 ms for conditioned Gemma.
-The earlier EAGLE run measured 61.135–61.333 ms with raw/full/one acceptance;
-see the feature-tap caveat above. These are synthetic eager reference timings,
+The earlier EAGLE run measured 61.135–61.333 ms before correcting feature taps.
+Fresh job 4168 passed the corrected contract and measured 60.987–61.440 ms
+across the seeded/full/one-token acceptance scenarios.
+These are synthetic eager reference timings,
 not optimized serving baselines or megakernel speedups.
 
 Initial full P2 jobs 4153/4154 rejected only FP32 accumulation roundoff
 (maximum logit errors 2.15e-5/5.79e-5) because the new cases inherited zero
 tolerances. Their explicit tolerances now match the MoE/Gemma P0 tier
-(atol=rtol=0.003; BF16 rtol=0.008). Corrected reruns 4157/4158 and frontier
-jobs 4160/4161 are queued; these pending runs are not passing evidence.
+(atol=rtol=0.003; BF16 rtol=0.008). Corrected full B200 jobs 4157/4158 passed
+both seeds on every rank against the independent serial decoder, including
+global expert IDs for Qwen. Worst-rank CUDA-event medians were
+78.633–78.943 ms for Gemma TP2 and 61.536–75.282 ms for Qwen TP2/EP2.
+Maximum logit errors were 2.15173e-5 and 5.93066e-5 respectively.
+Non-oracle ranks peaked at 29.903 GB allocated for Gemma and 16.714 GB for
+Qwen; rank zero also held the full serial oracle and peaked at 86.810 GB and
+78.439 GB respectively. Profiler traces include collectives and 7,350
+device events per Gemma rank and 6,766–6,926 per Qwen rank. These eager
+references fail the one-launch budget, as expected; correctness readiness
+does not certify a fused candidate.
+
+Eight-GPU frontier jobs 4160/4161 remain queued and are not passing evidence.
 Kimi shard job 4163 was canceled after the user deferred that task.
-Job 4168 queues a fresh full EAGLE run with the corrected feature taps.
