@@ -73,13 +73,13 @@ def reference(case: Case, t: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]
     weights = {name: t[name] for name in QWEN3_WEIGHT_NAMES}
     ref = RefDecoder(cfg, weights, device=str(t["token"].device))
     context = case.params["context"]
-    ref.k_cache[:, :context] = t["kcache"].float()
-    ref.v_cache[:, :context] = t["vcache"].float()
+    ref.k_cache[:, :context] = t["kcache"]
+    ref.v_cache[:, :context] = t["vcache"]
     ref.pos = context
     logits = ref.step(int(t["token"].item()))
     return {
         "logits": logits.float(),
         "next_token": logits.argmax().to(torch.int64),
-        "k_write": ref.k_cache[:, context].to(torch.bfloat16),
-        "v_write": ref.v_cache[:, context].to(torch.bfloat16),
+        "k_write": ref.k_cache[:, context].contiguous(),
+        "v_write": ref.v_cache[:, context].contiguous(),
     }

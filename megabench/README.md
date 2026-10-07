@@ -49,6 +49,11 @@ boundary; [`cases.py`](cases.py) is the active machine-readable catalog.
 unimplemented case returns `not_implemented` and cannot contribute to a score.
 The [non-P0 validation record](docs/NON_P0_VALIDATION.md) describes native
 formats, timed boundaries, verification commands, and full GPU results.
+References now execute model weights, activations, residuals and ordinary KV
+caches in BF16, with FP32 sensitive reductions and native quantized weights.
+The [precision contract](docs/REFERENCE_PRECISION.md) specifies model-specific
+exceptions and rounding boundaries. Historical FP32 experiment scores require
+fresh grading against this contract.
 All P0 cells use full model layer counts and seeded synthetic weights. They
 are a **shape/semantics tier**, not checkpoint accuracy. The Qwen3 MoE case
 uses all 128 experts with top-8 routing and a separate LM head. Gemma W8 and
@@ -199,7 +204,8 @@ every output key, shape, dtype, device, and value against its PyTorch oracle.
 Integer tokens must match exactly; floating outputs use the case tolerance.
 BF16 state outputs use the separate `bf16_rtol` (0.008 by default) so a
 rounding step from a different reduction order does not reject an otherwise
-matching full-model computation. FP32 logits retain the tighter `rtol`.
+matching full-model computation. Logits are widened BF16 head outputs in FP32
+tensors and retain the tighter `rtol` for submission grading.
 Input mutation is rejected. Cold first-call time is reported separately.
 Warm timing records synchronized host and CUDA-event latency for the candidate
 and eager reference. Where capture succeeds, it also times a CUDA Graph

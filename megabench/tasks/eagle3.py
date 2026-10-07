@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from ..cases import Case
-from .common import fill_layer_weights, random_norm, random_weight, rms, rope
+from .common import attention, fill_layer_weights, random_norm, random_weight, rms, rope
 
 
 def _eagle3_proposals(case: Case, seed: int, token: torch.Tensor,
@@ -22,8 +22,8 @@ def _eagle3_proposals(case: Case, seed: int, token: torch.Tensor,
     h, d, qh, kvh = p["hidden"], p["head_dim"], p["q_heads"], p["kv_heads"]
     inter, depth, draft_vocab = p["intermediate"], p["draft_depth"], p["draft_vocab"]
     g = torch.Generator(device=device).manual_seed(seed ^ 0xEA613)
-    features = random_weight(g, device, (3 * h,), h).float()
-    fused = random_weight(g, device, (h, 3 * h), 3 * h).float() @ features
+    features = random_weight(g, device, (3 * h,), h)
+    fused = random_weight(g, device, (h, 3 * h), 3 * h) @ features
     embedding = random_weight(g, device, (draft_vocab, h), h)
     head = random_weight(g, device, (draft_vocab, h), h)
     wq = random_weight(g, device, (qh * d, h), h)
@@ -40,24 +40,22 @@ def _eagle3_proposals(case: Case, seed: int, token: torch.Tensor,
     current = int(token.item()) % draft_vocab
     state = fused
     for step in range(depth):
-        x = state + embedding[current].float()
+        x = state + embedding[current]
         xn = rms(x, n1, eps=1e-5)
-        q = (wq.float() @ xn).view(qh, d)
-        k = (wk.float() @ xn).view(kvh, d)
-        v = (wv.float() @ xn).view(kvh, d)
+        q = (wq @ xn).view(qh, d)
+        k = (wk @ xn).view(kvh, d)
+        v = (wv @ xn).view(kvh, d)
         pos = torch.tensor([p["context"] + step], device=device)
         q = rope(q, pos, 500_000.0)
         k = rope(k, pos, 500_000.0)
         keys.append(k)
         values.append(v)
         ks, vs = torch.stack(keys), torch.stack(values)
-        grouped = q.view(kvh, qh // kvh, d)
-        prob = (torch.einsum("gqd,tgd->gqt", grouped, ks) * d ** -0.5).softmax(-1)
-        attn = torch.einsum("gqt,tgd->gqd", prob, vs).reshape(qh * d)
-        x = x + wo.float() @ attn
+        attn = attention(q, ks, vs).reshape(qh * d)
+        x = x + wo @ attn
         xn = rms(x, n2, eps=1e-5)
-        state = x + wd.float() @ (F.silu(wg.float() @ xn) * (wu.float() @ xn))
-        current = int((head.float() @ rms(state, nf, eps=1e-5)).argmax().item())
+        state = x + wd @ (F.silu(wg @ xn) * (wu @ xn))
+        current = int((head @ rms(state, nf, eps=1e-5)).argmax().item())
         proposals.append(current)
     return torch.tensor(proposals, dtype=torch.int64, device=device)
 
@@ -101,7 +99,7 @@ def reference(case: Case, values: dict[str, torch.Tensor]) -> dict[str, torch.Te
     qh, kvh = p["q_heads"], p["kv_heads"]
     token_ids = torch.cat((values["token"].reshape(1), values["draft_tokens"]))
     steps = depth + 1
-    x = values["embed"][token_ids].float()
+    x = values["embed"][token_ids]
     positions = torch.arange(context, context + steps, device=x.device)
     future_mask = (torch.arange(context + steps, device=x.device)[None, :] >
                    positions[:, None])
@@ -110,28 +108,24 @@ def reference(case: Case, values: dict[str, torch.Tensor]) -> dict[str, torch.Te
 
     for layer in range(p["layers"]):
         xn = rms(x, values["ln1"][layer], eps=1e-5)
-        q = (xn @ values["wq"][layer].float().T).view(steps, qh, d)
-        k = (xn @ values["wk"][layer].float().T).view(steps, kvh, d)
-        v = (xn @ values["wv"][layer].float().T).view(steps, kvh, d)
+        q = (xn @ values["wq"][layer].T).view(steps, qh, d)
+        k = (xn @ values["wk"][layer].T).view(steps, kvh, d)
+        v = (xn @ values["wv"][layer].T).view(steps, kvh, d)
         q = rope(q, positions, 500_000.0)
         k = rope(k, positions, 500_000.0)
         k_writes.append(k.to(torch.bfloat16))
         v_writes.append(v.to(torch.bfloat16))
-        ks = torch.cat((values["kcache"][layer].float(), k), dim=0)
-        vs = torch.cat((values["vcache"][layer].float(), v), dim=0)
-        grouped = q.view(steps, kvh, qh // kvh, d)
-        scores = torch.einsum("tgqd,sgd->tgqs", grouped, ks) * d ** -0.5
-        scores = scores.masked_fill(future_mask[:, None, None, :], -torch.inf)
-        probs = scores.softmax(dim=-1)
-        attn = torch.einsum("tgqs,sgd->tgqd", probs, vs).reshape(steps, qh * d)
-        x = x + attn @ values["wo"][layer].float().T
+        ks = torch.cat((values["kcache"][layer], k), dim=0)
+        vs = torch.cat((values["vcache"][layer], v), dim=0)
+        attn = attention(q, ks, vs, allowed=~future_mask).reshape(steps, qh * d)
+        x = x + attn @ values["wo"][layer].T
         xn = rms(x, values["ln2"][layer], eps=1e-5)
-        gate = xn @ values["wg"][layer].float().T
-        up = xn @ values["wu"][layer].float().T
-        x = x + (F.silu(gate) * up) @ values["wd"][layer].float().T
+        gate = xn @ values["wg"][layer].T
+        up = xn @ values["wu"][layer].T
+        x = x + (F.silu(gate) * up) @ values["wd"][layer].T
         layer_hidden.append(x)
 
-    logits = rms(x, values["fnorm"], eps=1e-5) @ values["lm_head"].float().T
+    logits = rms(x, values["fnorm"], eps=1e-5) @ values["lm_head"].T
     greedy = logits.argmax(-1)
     accepted = (greedy[:depth] == values["draft_tokens"]).to(torch.int64).cumprod(0).sum()
     count = int(accepted.item())

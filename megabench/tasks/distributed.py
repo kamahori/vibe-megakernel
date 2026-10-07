@@ -15,7 +15,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from ..cases import Case
-from .common import rms, rope
+from .common import attention, rms, rope
 from .parallel import initialize
 
 
@@ -118,9 +118,11 @@ def make_inputs(case: Case, seed: int, device: str, *, rank: int | None = None) 
 
 
 def reduce_sum(value: torch.Tensor, group=None) -> torch.Tensor:
-    value = value.clone()
-    dist.all_reduce(value, group=group)
-    return value
+    # Keep collective accumulation stable; publish BF16 model activations.
+    dtype = value.dtype
+    accumulated = value.float().clone() if dtype == torch.bfloat16 else value.clone()
+    dist.all_reduce(accumulated, group=group)
+    return accumulated.to(dtype)
 
 
 def greedy_token(logits: torch.Tensor, offset: int, group) -> torch.Tensor:
@@ -139,17 +141,17 @@ def reference(case: Case, values: dict[str, torch.Tensor]) -> dict[str, torch.Te
     qh, kvh, d = p["q_heads"] // case.tp, p["kv_heads"] // case.tp, p["head_dim"]
     vocab_size = p["vocab"] // case.tp
     offset, token = ctx.tp_rank * vocab_size, int(values["token"].item())
-    x = values["embed"][token - offset].float() if offset <= token < offset + vocab_size else torch.zeros(p["hidden"], device=values["token"].device)
+    x = values["embed"][token - offset] if offset <= token < offset + vocab_size else torch.zeros(p["hidden"], device=values["token"].device, dtype=torch.bfloat16)
     x = reduce_sum(x, ctx.tp_group)
     if gemma:
-        x = x * p["hidden"] ** 0.5
+        x = x * torch.tensor(p["hidden"] ** 0.5, device=x.device, dtype=x.dtype)
     position = torch.tensor([p["context"]], device=x.device)
     keys_out, content_out, routes = [], [], []
     for layer in range(p["layers"]):
         normalized = rms(x, values["ln1"][layer], gemma=gemma)
-        query = rms((values["wq"][layer].float() @ normalized).view(qh, d), values["qn"][layer], gemma=gemma)
-        key = rms((values["wk"][layer].float() @ normalized).view(kvh, d), values["kn"][layer], gemma=gemma)
-        content = (values["wv"][layer].float() @ normalized).view(kvh, d)
+        query = rms((values["wq"][layer] @ normalized).view(qh, d), values["qn"][layer], gemma=gemma)
+        key = rms((values["wk"][layer] @ normalized).view(kvh, d), values["kn"][layer], gemma=gemma)
+        content = (values["wv"][layer] @ normalized).view(kvh, d)
         local = gemma and (layer + 1) % 6 != 0
         theta = (10_000.0 if local else 1_000_000.0) if gemma else 1_000_000.0
         factor = 8.0 if gemma and not local else 1.0
@@ -157,35 +159,34 @@ def reference(case: Case, values: dict[str, torch.Tensor]) -> dict[str, torch.Te
         keys_out.append(key.to(torch.bfloat16))
         content_out.append(content.to(torch.bfloat16))
         start = max(0, p["context"] + 1 - p["local_window"]) if local else 0
-        keys = torch.cat((values["kcache"][layer, start:].float(), key[None]))
-        content_cache = torch.cat((values["vcache"][layer, start:].float(), content[None]))
+        keys = torch.cat((values["kcache"][layer, start:], key[None]))
+        content_cache = torch.cat((values["vcache"][layer, start:], content[None]))
         scalar = p.get("query_pre_attn_scalar", d)
-        probability = (torch.einsum("gqd,tgd->gqt", query.view(kvh, qh // kvh, d), keys) * scalar ** -0.5).softmax(-1)
-        attention = torch.einsum("gqt,tgd->gqd", probability, content_cache).flatten()
-        output = reduce_sum(values["wo"][layer].float() @ attention, ctx.tp_group)
+        attn = attention(query, keys, content_cache, scale=scalar ** -0.5).flatten()
+        output = reduce_sum(values["wo"][layer] @ attn, ctx.tp_group)
         x = x + (rms(output, values["ln2"][layer], gemma=True) if gemma else output)
         normalized = rms(x, values["ln3" if gemma else "ln2"][layer], gemma=gemma)
         if gemma:
-            hidden = F.gelu(values["wg"][layer].float() @ normalized, approximate="tanh") * (values["wu"][layer].float() @ normalized)
-            output = reduce_sum(values["wd"][layer].float() @ hidden, ctx.tp_group)
+            hidden = F.gelu(values["wg"][layer] @ normalized, approximate="tanh") * (values["wu"][layer] @ normalized)
+            output = reduce_sum(values["wd"][layer] @ hidden, ctx.tp_group)
             x = x + rms(output, values["ln4"][layer], gemma=True)
         else:
-            scores = values["router"][layer].float() @ normalized
+            scores = values["router"][layer].float() @ normalized.float()
             selected = torch.argsort(scores, descending=True, stable=True)[:p["topk"]]
             probability = scores[selected].softmax(-1)
             routes.append(selected)
-            output = torch.zeros_like(x)
+            output = torch.zeros_like(x, dtype=torch.float32)
             local_experts = p["experts"] // case.ep
             for slot, expert in enumerate(selected.tolist()):
                 if expert // local_experts != ctx.ep_rank:
                     continue
                 local_expert = expert % local_experts
-                hidden = F.silu(values["wg"][layer, local_expert].float() @ normalized) * (values["wu"][layer, local_expert].float() @ normalized)
-                output = output + values["wd"][layer, local_expert].float() @ (hidden * probability[slot])
-            x = x + reduce_sum(output)
+                hidden = F.silu(values["wg"][layer, local_expert] @ normalized) * (values["wu"][layer, local_expert] @ normalized)
+                output = output + (values["wd"][layer, local_expert] @ hidden).float() * probability[slot]
+            x = x + reduce_sum(output).to(x.dtype)
     head = values["embed" if gemma else "lm_head"]
-    logits = head.float() @ rms(x, values["fnorm"], gemma=gemma)
-    outputs = {"logits": logits, "next_token": greedy_token(logits, offset, ctx.tp_group),
+    logits = head @ rms(x, values["fnorm"], gemma=gemma)
+    outputs = {"logits": logits.float(), "next_token": greedy_token(logits, offset, ctx.tp_group),
                "k_write": torch.stack(keys_out), "v_write": torch.stack(content_out)}
     if not gemma:
         outputs["expert_ids"] = torch.stack(routes)
