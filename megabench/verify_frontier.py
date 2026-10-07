@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import os
+import time
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -122,7 +123,15 @@ def verify(case, device, trials, full, steps=3):
         for index in range(trials):
             seed = 104729+index
             current = case
+            trial_start = time.perf_counter()
+            print(json.dumps({'case':case.id,'rank':rank,'seed':seed,
+                              'phase':'building_inputs','full_geometry':full}),flush=True)
             values = module.make_inputs(current,seed,device)
+            if device.startswith('cuda'):
+                torch.cuda.synchronize(device)
+            input_generation_seconds = time.perf_counter()-trial_start
+            print(json.dumps({'case':case.id,'rank':rank,'seed':seed,
+                              'phase':'inputs_ready','input_generation_seconds':input_generation_seconds}),flush=True)
             perf_inputs = values
             serial_case, serial_values = None, None
             if not full and rank == 0:
@@ -158,6 +167,9 @@ def verify(case, device, trials, full, steps=3):
                                    'reset':bool(values['reset']) if module is kimi else False,
                                    'next_token':int(actual['next_token']),'replicated_state_sha256':state_hash,
                                    'serial_comparison':details})
+                print(json.dumps({'case':case.id,'rank':rank,'seed':seed,
+                                  'phase':'step_verified','step':step,
+                                  'elapsed_seconds':time.perf_counter()-trial_start}),flush=True)
                 if step+1 < steps:
                     current,values = advance_state(current,values,actual)
             if not full:
@@ -169,6 +181,8 @@ def verify(case, device, trials, full, steps=3):
             timing = _measure(lambda t:module.reference(case,t),perf_inputs,device,1,3)
             audit = _audit_launches(lambda t:module.reference(case,t),perf_inputs,device,case.max_gpu_launches)
             report['trials'].append({'seed':seed,'input_bytes':sum(v.numel()*v.element_size() for v in perf_inputs.values()),
+                                     'input_generation_seconds':input_generation_seconds,
+                                     'elapsed_seconds':time.perf_counter()-trial_start,
                                      'trajectory':trajectory,'timing_context':case.params['context'],
                                      'verification_final_context':current.params['context'],
                                      'outputs':{k:{'shape':list(v.shape),'dtype':str(v.dtype)} for k,v in actual.items()},
