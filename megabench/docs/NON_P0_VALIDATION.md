@@ -15,8 +15,8 @@ Kimi-K3 is deferred at the user's request; it remains visible and disabled.
 | Llama 3.1 8B + EAGLE3 full iteration | Actual draft head, proposal tree, full target verification, greedy acceptance, both KV commits/rollback and next-draft features | Upstream target ancestor-mask/features tests, K=2/4/8 and partial/full/reject acceptance; full B200 K=4 run passed; enabled |
 | Gemma 3 27B TP2 | All 62 layers with vocabulary/head/intermediate shards and live TP reductions | CPU and full two-B200 outputs match the independent serial decoder for both seeds; enabled |
 | Qwen3-30B-A3B TP2/EP2 | All 48 layers, contiguous EP expert ownership, TP attention/FFN and distributed greedy token | CPU and full four-B200 logits, KV and global expert IDs match the independent serial decoder for both seeds; enabled |
-| DeepSeek-V3.2 TP8 | All 61 layers, block FP8 weights/activation quantization, MLA, Hadamard FP8 indexer, grouped routing and shared expert | Independent expanded MLA, YaRN, routing and quantization tests; CPU TP and candidate harness pass; full eight-GPU check queued; disabled |
-| GLM-5.2-FP8 TP8 | All 78 layers, block FP8 weights, MLA, scheduled full/shared indexers and MoE | Independent expanded MLA, FP8 and routing tests; CPU TP and candidate harness pass; full eight-GPU check queued; disabled |
+| DeepSeek-V3.2 TP8 | All 61 layers, block FP8 weights/activation quantization, MLA, Hadamard FP8 indexer, grouped routing and shared expert | Independent expanded MLA, YaRN, routing and quantization tests; CPU TP and candidate harness pass; full eight-B200 three-step rollouts pass both seeds with exact replicated-state agreement; enabled |
+| GLM-5.2-FP8 TP8 | All 78 layers, block FP8 weights, MLA, scheduled full/shared indexers and MoE | Independent expanded MLA, FP8 and routing tests; CPU TP and candidate harness pass; full eight-B200 three-step rollouts pass both seeds with exact replicated-state agreement; enabled |
 | Kimi-K3 TP16 | All 93 layers, 69 KDA/24 gated MLA, attention residuals, BF16 latent/shared paths and native MXFP4 routed experts | Official pinned decoder/FLA oracle, eight-step independent KDA recurrence and 16-rank CPU protocol pass; deferred by request; disabled |
 
 The full EAGLE iteration consumes target features entering layers 2, 16 and
@@ -159,5 +159,23 @@ device events per Gemma rank and 6,766–6,926 per Qwen rank. These eager
 references fail the one-launch budget, as expected; correctness readiness
 does not certify a fused candidate.
 
-Eight-GPU frontier jobs 4160/4161 remain queued and are not passing evidence.
+Eight-B200 frontier jobs 4160/4161 completed successfully in 17:25 and 18:31.
+Each rank passed both seeds and all three committed steps at contexts 128,
+129 and 130, including deterministic outputs, finite values, input preservation,
+runtime-token dependence and exact raw-byte agreement on replicated native
+KV/index payloads and scales. The full reports retain the catalog geometry
+and the timing context of 128. Independent mathematical/source oracles and
+serial comparisons run at development geometry; the full GPU runs validate
+execution and protocol rather than comparing against a full unsharded model.
+
+Worst-rank eager CUDA-event medians were 490.730–663.316 ms for DeepSeek
+and 435.918–572.605 ms for GLM. Native inputs occupied 86.026 GB and
+94.926 GB per rank; measured allocated peaks were 86.579 GB and 95.526 GB,
+with reserved peaks of 87.294 GB and 95.798 GB. Reference launch audits
+recorded 63,541 and 57,579 device events per rank respectively, including
+communication, so these eager baselines fail the one-launch candidate budget.
+Input construction took 99.5–155.2 seconds per rank/seed and remains outside
+the timed decoder step. All eight requested non-P0 tasks are now enabled;
+Kimi remains deferred.
+
 Kimi shard job 4163 was canceled after the user deferred that task.

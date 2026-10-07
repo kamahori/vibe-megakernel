@@ -41,14 +41,14 @@ boundary; [`cases.py`](cases.py) is the active machine-readable catalog.
 | P1 | Gemma 3 4B image-conditioned text decode | Ready with synthetic SigLIP/projector/prefill fixtures |
 | P2 | Llama 3.1 8B plus EAGLE3 full speculative iteration | Ready with synthetic draft, verify and both KV commits |
 | P2 | Gemma 3 27B TP decode; Qwen3-30B-A3B TP/EP decode | Ready with synthetic weights; verified on two/four B200 GPUs |
-| P3 | DeepSeek-V3.2 and GLM-5.2-FP8 full decode | Native synthetic references implemented; full GPU verification pending |
+| P3 | DeepSeek-V3.2 and GLM-5.2-FP8 full decode | Ready with native synthetic FP8 weights; verified on eight B200 GPUs |
 | P3 | Kimi-K3 full decode | Native synthetic reference implemented; deferred by request |
 
 `list --suite core` selects every enabled case; `--suite p0` selects the original five.
 `--suite p1` through `p3`, `planned`, and `all` expose their catalog subsets; an
 unimplemented case returns `not_implemented` and cannot contribute to a score.
 The [non-P0 validation record](docs/NON_P0_VALIDATION.md) describes native
-formats, timed boundaries, verification commands, and pending GPU checks.
+formats, timed boundaries, verification commands, and full GPU results.
 All P0 cells use full model layer counts and seeded synthetic weights. They
 are a **shape/semantics tier**, not checkpoint accuracy. The Qwen3 MoE case
 uses all 128 experts with top-8 routing and a separate LM head. Gemma W8 and
