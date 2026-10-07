@@ -19,6 +19,26 @@ from .test_kimi import development as kimi_development
 
 
 class DistributedReferenceTests(unittest.TestCase):
+    def test_frontier_state_rollouts_match_serial_oracles(self):
+        for case in select_cases('p3'):
+            with self.subTest(case=case.id), tempfile.TemporaryDirectory() as directory:
+                result = subprocess.run(
+                    [sys.executable, '-m', 'torch.distributed.run', '--standalone',
+                     '--nproc-per-node=2', '-m', 'megabench.verify_frontier',
+                     '--case', case.id, '--device', 'cpu', '--trials', '2',
+                     '--steps', '3', '--output', directory],
+                    env=os.environ | {'CUDA_VISIBLE_DEVICES':'', 'OMP_NUM_THREADS':'1'},
+                    capture_output=True, text=True, timeout=120)
+                self.assertEqual(result.returncode, 0, (result.stdout+result.stderr)[-12000:])
+                for rank in range(2):
+                    report = json.loads((Path(directory)/f'rank-{rank}.json').read_text())
+                    self.assertEqual(report['status'], 'pass')
+                    self.assertEqual(report['steps'], 3)
+                    for trial in report['trials']:
+                        self.assertEqual(len(trial['trajectory']), 3)
+                        self.assertTrue(all(step['serial_comparison'] is not None
+                                            for step in trial['trajectory']))
+
     def test_frontier_native_outputs_pass_the_submission_harness(self):
         submission = Path(__file__).parents[1] / 'examples/reference_submission.py'
         for original in select_cases('p3'):

@@ -41,7 +41,8 @@ boundary; [`cases.py`](cases.py) is the active machine-readable catalog.
 | P1 | Gemma 3 4B image-conditioned text decode | Ready with synthetic SigLIP/projector/prefill fixtures |
 | P2 | Llama 3.1 8B plus EAGLE3 full speculative iteration | Ready with synthetic draft, verify and both KV commits |
 | P2 | Gemma 3 27B TP decode; Qwen3-30B-A3B TP/EP decode | Implemented; full GPU verification pending |
-| P3 | DeepSeek-V3.2, GLM-5.2-FP8, and Kimi-K3 full decode | Native synthetic references implemented; full GPU verification pending |
+| P3 | DeepSeek-V3.2 and GLM-5.2-FP8 full decode | Native synthetic references implemented; full GPU verification pending |
+| P3 | Kimi-K3 full decode | Native synthetic reference implemented; deferred by request |
 
 `list --suite core` selects every enabled case; `--suite p0` selects the original five.
 `--suite p1` through `p3`, `planned`, and `all` expose their catalog subsets; an

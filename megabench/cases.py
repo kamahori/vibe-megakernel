@@ -166,7 +166,7 @@ CASES: tuple[Case, ...] = (
                     "v_head_dim": 128, "vocab": 163840,
                     "conv_kernel": 4, "attn_res_block_size": 12},
          "frontier_hybrid", "p3", gpus=16, tp=16, atol=0.003, rtol=0.003,
-         note="Native synthetic KDA/MLA TP16 decode; full 16-GPU verification pending."),
+         note="Deferred by request; native synthetic KDA/MLA TP16 decode needs 16-GPU validation."),
 )
 
 

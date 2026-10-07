@@ -5,6 +5,7 @@ matching the P0 tier. They do not claim checkpoint accuracy. Immutable model
 revisions, configuration hashes, source hashes, and sampled native checkpoint
 tensor layouts are recorded in [`model_specs.json`](../tasks/model_specs.json).
 The current scoring gate is `Case.ready` in [`cases.py`](../cases.py).
+Kimi-K3 is deferred at the user's request; it remains visible and disabled.
 
 | Case | Implementation and timed boundary | Validation and current gate |
 | --- | --- | --- |
@@ -16,7 +17,7 @@ The current scoring gate is `Case.ready` in [`cases.py`](../cases.py).
 | Qwen3-30B-A3B TP2/EP2 | All 48 layers, contiguous EP expert ownership, TP attention/FFN and distributed greedy token | Four-rank CPU outputs match the independent serial decoder; full four-GPU rerun queued; disabled pending that check |
 | DeepSeek-V3.2 TP8 | All 61 layers, block FP8 weights/activation quantization, MLA, Hadamard FP8 indexer, grouped routing and shared expert | Independent expanded MLA, YaRN, routing and quantization tests; CPU TP and candidate harness pass; full eight-GPU check queued; disabled |
 | GLM-5.2-FP8 TP8 | All 78 layers, block FP8 weights, MLA, scheduled full/shared indexers and MoE | Independent expanded MLA, FP8 and routing tests; CPU TP and candidate harness pass; full eight-GPU check queued; disabled |
-| Kimi-K3 TP16 | All 93 layers, 69 KDA/24 gated MLA, attention residuals, BF16 latent/shared paths and native MXFP4 routed experts | Official pinned decoder/FLA oracle, eight-step independent KDA recurrence and 16-rank CPU protocol pass; full one-rank GPU storage/component check queued; full 16-GPU decode unavailable on this eight-GPU host; disabled |
+| Kimi-K3 TP16 | All 93 layers, 69 KDA/24 gated MLA, attention residuals, BF16 latent/shared paths and native MXFP4 routed experts | Official pinned decoder/FLA oracle, eight-step independent KDA recurrence and 16-rank CPU protocol pass; deferred by request; disabled |
 
 The full EAGLE iteration consumes target features entering layers 2, 16 and
 29, matching the pinned EAGLE implementation. Its earlier full-GPU report
@@ -66,6 +67,10 @@ GPU allocation or transient execution peaks. Current native input storage
 per rank is 86,026,008,968 bytes for DeepSeek TP8, 94,925,899,592 for GLM TP8,
 and 108,308,019,073 for Kimi TP16. Kimi TP8 needs 205,114,366,457 bytes before
 temporary allocations, exceeding a 192 GB B200's capacity.
+The full unsharded native inputs also total 1,560,403,229,833 bytes, exceeding
+the eight GPUs' aggregate 1,538,126,774,272 bytes before runtime buffers.
+Reducing replicated storage alone therefore cannot fit this model entirely
+in GPU memory here.
 
 Download the three official files at the exact URLs recorded under Kimi's
 `source_files` in `model_specs.json`, then run:
@@ -82,7 +87,17 @@ math. CPU adapters replace GPU convolution and dispatch with PyTorch and
 FLA's pinned naive KDA recurrence. The original MLA, router, latent MoE,
 SiTU and attention residual blocks execute unchanged at development geometry.
 Seeds 17/18 cover continuing/reset state; maximum logit errors are
-3.0398369e-6 and 1.2069941e-6 in the current report.
+3.0398369e-6 and 1.2069941e-6 in the single-step report. The newer three-step
+rollouts validate greedy IDs, routing sets, native MLA writes, both KDA state
+types and cache lengths after each commit; the maximum logit error across
+both trajectories is 6.3478947e-6. Frontier protocol checks also default to
+three committed steps. Development-geometry TP2 rollouts pass for DeepSeek,
+GLM and Kimi, and Kimi's 16-rank CPU rollout passes both seeded histories.
+DeepSeek and GLM also match their upstream DSA indexer implementations with
+native activation quantization and partial-context selection; selected IDs
+and emitted FP8 key/scale payloads agree exactly. This checks actual sparse
+selection rather than relying on the short full-model context, where every
+cached token fits inside the default indexer top-k budget.
 
 Run full CUDA work inside a scheduler allocation with the required cards.
 These are commands for the batch script, not direct interactive GPU runs:
@@ -128,5 +143,6 @@ Initial full P2 jobs 4153/4154 rejected only FP32 accumulation roundoff
 (maximum logit errors 2.15e-5/5.79e-5) because the new cases inherited zero
 tolerances. Their explicit tolerances now match the MoE/Gemma P0 tier
 (atol=rtol=0.003; BF16 rtol=0.008). Corrected reruns 4157/4158 and frontier
-jobs 4160/4161/4163 are queued; these pending runs are not passing evidence.
+jobs 4160/4161 are queued; these pending runs are not passing evidence.
+Kimi shard job 4163 was canceled after the user deferred that task.
 Job 4168 queues a fresh full EAGLE run with the corrected feature taps.

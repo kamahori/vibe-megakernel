@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import replace
+from unittest.mock import patch
 
 import torch
 
@@ -26,6 +27,79 @@ def development(case):
 
 
 class FrontierMathTests(unittest.TestCase):
+    def test_native_sparse_selection_matches_upstream_indexers(self):
+        from transformers.models.deepseek_v32.configuration_deepseek_v32 import DeepseekV32Config
+        from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32Indexer, DeepseekV32RotaryEmbedding, DeepseekV32RMSNorm
+        from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
+        from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaIndexer, GlmMoeDsaRotaryEmbedding, GlmMoeDsaRMSNorm
+        for original in select_cases('p3')[:2]:
+            case = development(original)
+            case = replace(case,gpus=1,tp=1,params=case.params | {'layers':1,'first_dense':1})
+            p = case.params
+            deepseek = case.family == 'deepseek_v32_step'
+            config_class,indexer_class,rotary_class,norm_class = (
+                (DeepseekV32Config,DeepseekV32Indexer,DeepseekV32RotaryEmbedding,DeepseekV32RMSNorm)
+                if deepseek else (GlmMoeDsaConfig,GlmMoeDsaIndexer,GlmMoeDsaRotaryEmbedding,GlmMoeDsaRMSNorm))
+            rope = {'rope_type':'yarn','rope_theta':10000.,'factor':40.,'original_max_position_embeddings':4096,
+                    'beta_fast':32,'beta_slow':1,'mscale':1.,'mscale_all_dim':1.} if deepseek else {'rope_type':'default','rope_theta':8_000_000.}
+            config = config_class(hidden_size=p['hidden'],q_lora_rank=p['q_lora_rank'],qk_rope_head_dim=p['qk_rope_dim'],
+                                  index_n_heads=p['index_heads'],index_head_dim=p['index_dim'],index_topk=p['index_topk'],rope_parameters=rope)
+            # This independently constructs the normalized Hadamard matrix.
+            hadamard = torch.ones(1,1)
+            while hadamard.shape[0] < p['index_dim']:
+                hadamard = torch.cat((torch.cat((hadamard,hadamard),1),torch.cat((hadamard,-hadamard),1)),0)
+            for seed in (17,19):
+                with self.subTest(case=case.id,seed=seed), torch.no_grad():
+                    values = frontier.make_inputs(case,seed,'cpu',rank=0)
+                    values['l0_iw'].abs_()  # Positive scores avoid source-specific zero-score topk ties.
+                    indexer = indexer_class(config,0).float().eval()
+                    def quantize(value):
+                        payload,scale = pack_fp8_activation(value.to(torch.bfloat16),power_of_two=deepseek)
+                        return unpack_fp8_activation(payload,scale)
+                    for short,long in (('iq','wq_b'),('ik','wk')):
+                        module = getattr(indexer,long)
+                        module.weight.copy_(unpack_fp8_weight(values['l0_'+short],values['l0_'+short+'_scale']))
+                        module.register_forward_pre_hook(lambda module,args:(quantize(args[0]),))
+                    indexer.k_norm.weight.copy_(values['l0_inorm'])
+                    indexer.k_norm.bias.copy_(values['l0_ibias'])
+                    indexer.weights_proj.weight.copy_(values['l0_iw'])
+                    norm = norm_class(p['hidden'],eps=1e-6 if deepseek else 1e-5)
+                    norm.weight.copy_(values['ln1'][0])
+                    hidden = norm(values['embed'][values['token']].float())[None,None]
+                    qnorm = norm_class(p['q_lora_rank'],eps=1e-6)
+                    qnorm.weight.copy_(values['l0_qn'])
+                    qa = torch.nn.Linear(p['hidden'],p['q_lora_rank'],bias=False)
+                    qa.weight.copy_(unpack_fp8_weight(values['l0_qa'],values['l0_qa_scale']))
+                    q_resid = qnorm(qa(quantize(hidden)))
+                    def native_coordinates(value):
+                        if not deepseek:
+                            # HF emits half-split rotated pairs; native MLA/index cache uses interleaved pairs.
+                            rotated,passed = value.split((p['qk_rope_dim'],p['index_dim']-p['qk_rope_dim']),-1)
+                            left,right = rotated.chunk(2,-1)
+                            value = torch.cat((torch.stack((left,right),-1).flatten(-2),passed),-1)
+                        value = value.to(torch.bfloat16)
+                        return (value.float()@hadamard/p['index_dim']**0.5).to(torch.bfloat16) if deepseek else value
+                    written = {}
+                    class NativeCache:
+                        def update_indexer(self,key,layer):
+                            payload,scale = pack_fp8_activation(native_coordinates(key),power_of_two=deepseek)
+                            written.update(payload=payload[0,0],scale=scale[0,0])
+                            old = unpack_fp8_activation(values['l0_index_cache'],values['l0_index_cache_scale'])[None]
+                            return torch.cat((old,unpack_fp8_activation(payload,scale)),1)
+                    matmul = torch.matmul
+                    def native_matmul(left,right,*args,**kwargs):
+                        if left.shape[-1] == p['index_dim'] and right.shape[-2] == p['index_dim']:
+                            left = quantize(native_coordinates(left))
+                        return matmul(left,right,*args,**kwargs)
+                    position = torch.tensor([[p['context']]])
+                    with patch('torch.matmul',native_matmul):
+                        selected = indexer(hidden,q_resid,rotary_class(config)(hidden,position),
+                                           torch.zeros(1,1,p['context']+1),position,NativeCache())[0,0]
+                    actual = frontier.reference(case,values,serial=True)
+                    torch.testing.assert_close(actual['sparse_indices'][0],selected,rtol=0,atol=0)
+                    torch.testing.assert_close(actual['index_k_write'][0].float(),written['payload'].float(),rtol=0,atol=0)
+                    torch.testing.assert_close(actual['index_scale_write'][0],written['scale'],rtol=0,atol=0)
+
     def test_absorbed_mla_matches_independent_expanded_attention(self):
         from transformers import DynamicCache
         from transformers.models.deepseek_v32.configuration_deepseek_v32 import DeepseekV32Config

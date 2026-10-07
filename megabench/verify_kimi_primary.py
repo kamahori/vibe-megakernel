@@ -27,6 +27,7 @@ from transformers.activations import ACT2FN
 from .tasks import kimi
 from .tasks.quantization import unpack_mxfp4
 from .tests.test_kimi import development
+from .verify_frontier import advance_state, input_digest
 
 
 def load_nodes(path, names, namespace, pin):
@@ -82,9 +83,14 @@ def primary_oracle(case,values,namespace):
     config._attn_implementation = 'eager'
     cache = namespace['KimiDynamicCache'](config)
     layers = [namespace['KimiDecoderLayer'](config,i).float().eval() for i in range(p['layers'])]
+    captured = {}
     reset = bool(values['reset'])
     def copy(parameter,value):
         parameter.copy_(value)
+    def record(key, transform):
+        def hook(module, inputs, output):
+            captured[key] = transform(output).detach().clone()
+        return hook
     with torch.no_grad():
         for index,layer in enumerate(layers):
             name = f'l{index}_'
@@ -100,6 +106,8 @@ def primary_oracle(case,values,namespace):
                     copy(getattr(attention,long).weight,values[name+short])
                 copy(attention.q_a_layernorm.weight,values[name+'qn'])
                 copy(attention.kv_a_layernorm.weight,values[name+'kn'])
+                attention.kv_a_layernorm.register_forward_hook(record(name+'latent',lambda out:out[0,0].to(torch.bfloat16)))
+                attention.kv_a_proj_with_mqa.register_forward_hook(record(name+'pe',lambda out:out[0,0,p['kv_lora_rank']:].to(torch.bfloat16)))
                 if not reset:
                     nr,rd,vd = p['qk_nope_dim'],p['qk_rope_dim'],p['v_head_dim']
                     expanded = (values[name+'kv_cache'].float()@attention.kv_b_proj.weight.T).view(p['context'],p['q_heads'],nr+vd)
@@ -124,6 +132,7 @@ def primary_oracle(case,values,namespace):
                 moe = layer.block_sparse_moe
                 copy(moe.gate.weight,values[name+'router'])
                 copy(moe.gate.e_score_correction_bias,values[name+'router_bias'])
+                moe.gate.register_forward_hook(record(name+'experts',lambda out:out[0][0]))
                 for short,long in (('latent_down','routed_expert_down_proj'),('latent_up','routed_expert_up_proj')):
                     copy(getattr(moe,long).weight,values[name+short])
                 copy(moe.routed_expert_norm.weight,values[name+'latent_norm'])
@@ -143,7 +152,33 @@ def primary_oracle(case,values,namespace):
         hidden = namespace['_apply_attn_res'](prefix[0],residual,projection,norm)
         copy(norm.weight,values['fnorm'])
         logits = (norm(hidden)@values['lm_head'].float().T)[0]
-    return logits,cache
+    return logits,cache,captured
+
+
+def compare_step(case, actual, expected, cache, captured):
+    torch.testing.assert_close(actual['logits'],expected,rtol=2e-5,atol=2e-5)
+    torch.testing.assert_close(actual['next_token'],expected.argmax(),rtol=0,atol=0)
+    full_slot, recurrent_slot = 0, 0
+    first_full = None
+    for layer in range(case.params['layers']):
+        if kimi.full_layer(case,layer):
+            first_full = layer if first_full is None else first_full
+            for short,key in (('kv_write','latent'),('pe_write','pe')):
+                torch.testing.assert_close(actual[short][full_slot],captured[f'l{layer}_{key}'],
+                                           rtol=case.bf16_rtol,atol=case.atol)
+            full_slot += 1
+        else:
+            torch.testing.assert_close(actual['recurrent_state'][recurrent_slot],cache.recurrent_states[layer][0],rtol=2e-5,atol=2e-5)
+            for component in range(3):
+                torch.testing.assert_close(actual['conv_state'][recurrent_slot,component],cache.conv_states[layer][component][0],
+                                           rtol=case.bf16_rtol,atol=case.atol)
+            recurrent_slot += 1
+        if layer >= case.params['first_dense']:
+            # The official router's topk is unsorted; the public contract
+            # orders the same selected IDs by corrected score with stable ties.
+            torch.testing.assert_close(actual['expert_ids'][layer].sort().values,captured[f'l{layer}_experts'].sort().values,rtol=0,atol=0)
+    if int(actual['cache_length']) != cache.get_seq_length(first_full):
+        raise AssertionError('compressed/expanded MLA cache lengths disagree')
 
 
 def main():
@@ -152,7 +187,10 @@ def main():
     parser.add_argument('--config-source',required=True,type=Path)
     parser.add_argument('--fla-source',required=True,type=Path)
     parser.add_argument('--output',required=True,type=Path)
+    parser.add_argument('--steps',type=int,default=3)
     args = parser.parse_args()
+    if args.steps < 1:
+        parser.error('steps must be positive')
     pin = json.loads((Path(__file__).parent/'tasks/model_specs.json').read_text())['moonshotai/Kimi-K3']['source_files']
     namespace = {'torch':torch,'nn':nn,'F':F,'math':math,'rearrange':rearrange,'ACT2FN':ACT2FN,'PretrainedConfig':PretrainedConfig,
                  'ShortConvolution':CpuConvolution,'FusedRMSNormGated':CpuGatedNorm}
@@ -171,21 +209,25 @@ def main():
              'KimiMoEGate','KimiSparseMoeBlock','KimiDecoderLayer','_apply_attn_res']
     load_nodes(args.model_source,names,namespace,pin['modeling_kimi_linear.py'])
     case = replace(development(),gpus=1,tp=1)
-    report = {'case':case.to_dict(),'tier':'development_geometry','primary_sources':pin,'trials':[]}
+    report = {'case':case.to_dict(),'tier':'development_geometry','steps':args.steps,'primary_sources':pin,'trials':[]}
     with torch.inference_mode():
         for seed in (17,18):
-            values = kimi.make_inputs(case,seed,'cpu',rank=0)
-            expected,cache = primary_oracle(case,values,namespace)
-            actual = kimi.reference(case,values,serial=True)
-            torch.testing.assert_close(actual['logits'],expected,rtol=2e-5,atol=2e-5)
-            slot = 0
-            for layer in range(case.params['layers']):
-                if not kimi.full_layer(case,layer):
-                    torch.testing.assert_close(actual['recurrent_state'][slot],cache.recurrent_states[layer][0],rtol=2e-5,atol=2e-5)
-                    for component in range(3):
-                        torch.testing.assert_close(actual['conv_state'][slot,component],cache.conv_states[layer][component][0],rtol=case.bf16_rtol,atol=case.atol)
-                    slot += 1
-            report['trials'].append({'seed':seed,'reset':bool(values['reset']),'max_logit_error':float((actual['logits']-expected).abs().max())})
+            current = case
+            values = kimi.make_inputs(current,seed,'cpu',rank=0)
+            trajectory = []
+            for step in range(args.steps):
+                before = input_digest(values)
+                expected,cache,captured = primary_oracle(current,values,namespace)
+                actual = kimi.reference(current,values,serial=True)
+                compare_step(current,actual,expected,cache,captured)
+                if before != input_digest(values):
+                    raise AssertionError('reference or primary oracle mutated runtime inputs')
+                trajectory.append({'step':step,'input_context':current.params['context'],'reset':bool(values['reset']),
+                                   'next_token':int(actual['next_token']),'cache_length':int(actual['cache_length']),
+                                   'max_logit_error':float((actual['logits']-expected).abs().max())})
+                if step+1 < args.steps:
+                    current,values = advance_state(current,values,actual)
+            report['trials'].append({'seed':seed,'trajectory':trajectory})
     report['status'] = 'pass'
     with args.output.open('x') as file:
         json.dump(report,file,indent=2)
