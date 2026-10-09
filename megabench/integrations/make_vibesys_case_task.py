@@ -37,7 +37,10 @@ def make_task(case_id: str, root: Path,
         f"{checks}\n"
         "sys.path.insert(0, str(ROOT))\n"
         "from megabench.integrations.vibesys_case_evaluator import main\n"
-        f"raise SystemExit(main({case_id!r}, sys.argv[1:]))\n")
+        # Multi-GPU cases evaluate through torch.multiprocessing.spawn, whose
+        # children re-run this file as __mp_main__; only the parent evaluates.
+        "if __name__ == '__main__':\n"
+        f"    raise SystemExit(main({case_id!r}, sys.argv[1:]))\n")
     python = trusted_root / ".venv/bin/python"
     if not python.is_file():
         python = Path(sys.executable)
