@@ -29,6 +29,8 @@ REFERENCE_FILES = {
     "deepseek_v32_step": ("frontier.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
     "glm52_step": ("frontier.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
     "kimi_k3_step": ("kimi.py", "frontier.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
+    "kimi_k3_layer": ("kimi_layer.py", "kimi.py", "frontier.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
+    "glm53_flash_step": ("glm53.py", "frontier.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
 }
 OUTPUT_KEYS = {
     "dense_step": ("logits", "next_token", "k_write", "v_write"),
@@ -45,6 +47,9 @@ OUTPUT_KEYS = {
     "deepseek_v32_step": ("logits", "next_token", "kv_write", "kv_scale_write", "pe_write", "index_k_write", "index_scale_write", "sparse_indices", "expert_ids"),
     "glm52_step": ("logits", "next_token", "kv_write", "kv_scale_write", "pe_write", "index_k_write", "index_scale_write", "sparse_indices", "expert_ids"),
     "kimi_k3_step": ("logits", "next_token", "kv_write", "pe_write", "recurrent_state", "conv_state", "expert_ids", "cache_length"),
+    "kimi_k3_layer": ("prefix", "expert_ids"),
+    "glm53_flash_step": ("logits", "next_token", "kv_write", "index_k_write", "index_gate_write", "index_scores",
+                         "sparse_mask", "recurrent_state", "conv_state", "expert_ids"),
     "spec_full_iteration": ("logits", "proposed_tokens", "tree_parents", "accepted_count",
                             "proposed_count", "committed_count", "committed_tokens",
                             "cache_length", "draft_cache_length", "target_features",
@@ -205,7 +210,21 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
     outputs = OUTPUT_KEYS[case.family]
     if case.family == "distributed_step" and "qwen" in case.model.lower():
         outputs += ("expert_ids",)
+    if case.family == "kimi_k3_layer":
+        from ..tasks.kimi_layer import attention_kind
+        writes = ("kv_write", "pe_write") if attention_kind(case) == "mla" else ("recurrent_state", "conv_state")
+        outputs = outputs[:1] + writes + outputs[1:]
     topology = (
+        f"The evaluator starts {case.gpus} rank processes with data-parallel attention and EP={case.ep}. "
+        "`build(case)` receives `case['execution']`: rank, world_size, tp_rank, ep_rank, "
+        "device, backend, and live tp_group/ep_group handles. Each rank decodes its own "
+        f"{case.params['batch']} sequences with replicated attention weights and owns "
+        f"{case.params['experts'] // case.ep} contiguous experts. Routed latent rows must reach "
+        "the ranks that own their experts and return to their source rank (the reference uses "
+        "all-to-all). Complete all communication inside run. "
+        "The budget includes NCCL kernels and is one GPU launch per rank. "
+        "Use an allocation with all required GPUs visible. Nsight capture of spawned "
+        "ranks requires `--target-processes all`.\n\n" if case.family == "kimi_k3_layer" else
         f"The evaluator starts {case.gpus} rank processes, with TP={case.tp}, EP={case.ep}. "
         "`build(case)` receives `case['execution']`: rank, world_size, tp_rank, ep_rank, "
         "device, backend, and live tp_group/ep_group handles. "
@@ -216,8 +235,10 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "Use an allocation with all required GPUs visible. Nsight capture of spawned "
         "ranks requires `--target-processes all`.\n\n" if case.gpus > 1 else "")
     (project / "TASK.md").write_text(
-        f"# {case.id}\n\n"
-        f"Implement one complete {case.model} {case.phase} step with the "
+        f"# {case.id}\n\n" +
+        (f"Implement one {case.model} decoder layer (layer {case.params['layer']}) {case.phase} step with the "
+         if case.family == "kimi_k3_layer" else
+         f"Implement one complete {case.model} {case.phase} step with the ") +
         f"public geometry in `case.json`. Read `reference/megabench/tasks/{module}.py` "
         "and its included helpers for input layouts and exact PyTorch math.\n\n"
         + interface +

@@ -43,6 +43,8 @@ CONTRACT_FILES = (
     "megabench/tasks/parallel.py",
     "megabench/tasks/frontier.py",
     "megabench/tasks/kimi.py",
+    "megabench/tasks/glm53.py",
+    "megabench/tasks/kimi_layer.py",
     "megabench/tasks/references/qwen3.py",
     "megabench/tasks/references/moe.py",
 )
@@ -99,7 +101,7 @@ def evaluate_case(case: Case, submission: Path, *, device: str,
              "megabench.tasks.gptoss", "megabench.tasks.hybrid",
              "megabench.tasks.vision", "megabench.tasks.speculative",
              "megabench.tasks.distributed", "megabench.tasks.frontier",
-             "megabench.tasks.kimi",
+             "megabench.tasks.kimi", "megabench.tasks.glm53", "megabench.tasks.kimi_layer",
              "megabench.tasks.references")),
     }
     if not case.ready:
