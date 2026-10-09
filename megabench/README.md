@@ -45,9 +45,9 @@ boundary; [`cases.py`](cases.py) is the active machine-readable catalog.
 | P3 | GLM-5.3-Flash full decode (TP4) | Ready with native synthetic FP8 weights; verified on four B200 GPUs |
 | P3 | Kimi-K3 single KDA and gated-MLA layers (DP attention, EP8 all-to-all) | Ready with native synthetic MXFP4 experts; verified on eight B200 GPUs |
 | P3 | Kimi-K3 full decode | Native synthetic reference implemented; deferred by request |
-| P1 | Sesame CSM-1B TTS audio frame (backbone step plus 31 depth-decoder codebooks) | Planned: synthetic reference and CPU checks pass; GPU validation pending |
-| P2 | π0.5 VLA 10-step flow-matching action chunk over a cached PaliGemma prefix | Planned: synthetic reference and CPU checks pass; GPU validation pending |
-| P2 | Waypoint-1.5-1B world-model latent frame (4 denoise passes plus cache commit) | Planned: synthetic reference and CPU checks pass; GPU validation pending |
+| P1 | Sesame CSM-1B TTS audio frame (backbone step plus 31 depth-decoder codebooks) | Ready with synthetic BF16 weights; verified on B200 |
+| P2 | π0.5 VLA 10-step flow-matching action chunk over a cached PaliGemma prefix | Ready with a synthetic PaliGemma prefix fixture; verified on B200 |
+| P2 | Waypoint-1.5-1B world-model latent frame (4 denoise passes plus cache commit) | Ready with synthetic rolling-cache fixtures; verified on B200 |
 | P3 | DeepSeek-V4-Pro MegaMoE routed-expert layer, EP8 at 512 and 4,096 tokens per rank | Ready with native synthetic FP8 activations and MXFP4 experts; verified on eight B200 GPUs |
 
 `list --suite core` selects every enabled case; `--suite p0` selects the original five.

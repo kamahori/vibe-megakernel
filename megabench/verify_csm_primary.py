@@ -160,6 +160,12 @@ def hf_frame(model, case: Case, values: dict) -> dict:
             "v_write": torch.stack([cache.layers[i].values[0, :, -1] for i in layers])}
 
 
+def _errors(actual: torch.Tensor, expected: torch.Tensor) -> dict:
+    difference = actual.double() - expected.double()
+    return {"relative_l2": float(difference.norm() / expected.double().norm()),
+            "max_abs": float(difference.abs().max())}
+
+
 def compare(case: Case, values: dict, model) -> dict:
     """Raise on disagreement; return error statistics."""
     upstream = hf_frame(model, case, values)
@@ -171,8 +177,17 @@ def compare(case: Case, values: dict, model) -> dict:
         # upstream codes, which is what the harness does for submissions.
         report["first_code_mismatch"] = int((ours["codes"] != upstream["codes"]).nonzero()[0])
     forced = csm.reference(case, values, forced_codes=upstream["codes"])
-    torch.testing.assert_close(forced["logits"], upstream["forced_logits"], rtol=rtol, atol=atol)
-    torch.testing.assert_close(forced["logits"], upstream["logits"], rtol=rtol, atol=atol)
+    # Upstream's incremental generate and its parallel teacher-forced pass use
+    # different GEMM shapes, so on GPU their BF16 logits can differ by a few
+    # ULPs. That self-disagreement scales the band, as in the harness grader.
+    noise = _errors(upstream["forced_logits"], upstream["logits"])
+    report["upstream_schedule_error"] = noise
+    for name in ("forced_logits", "logits"):
+        error = _errors(forced["logits"], upstream[name])
+        peak = float(upstream[name].abs().max())
+        if (error["relative_l2"] > 2 * noise["relative_l2"] + rtol
+                or error["max_abs"] > 2 * noise["max_abs"] + atol + rtol * peak):
+            raise AssertionError(f"logits differ from upstream {name}: {error}, upstream noise {noise}")
     for name in ("k_write", "v_write"):
         torch.testing.assert_close(ours[name], upstream[name], rtol=rtol, atol=atol)
     if not report["codes_equal"]:

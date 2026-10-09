@@ -22,9 +22,9 @@ two MegaMoE EP8 layer cases.
 | GLM-5.3-Flash TP4 | All 45 layers: mHC (4 streams, 20 Sinkhorn iterations), 34 KDA and 11 NoPE MLA/DSA layers, block FP8 weights, 288-expert MoE | Pinned transformers 5.17.0 `Glm5NextTextModel` decode matches every output for three seeds; CPU TP2/TP4 rollouts and candidate harness pass; full four-B200 three-step rollout passes with exact replicated-state agreement; enabled |
 | Kimi-K3 layer EP8 (KDA layer 61, MLA layer 63) | One mid-block layer per attention variant: attention residuals, DP attention over 8 sequences per rank, EP8 MXFP4 experts with all-to-all dispatch/combine, latent norm/up and shared experts | Matches the whole-model Kimi reference's layer slice; CPU 2/8-rank all-to-all equals the serial 64-sequence batch; candidate harness passes; full eight-B200 EP8 outputs equal the serial run bit for bit for both seeds; enabled |
 | Kimi-K3 TP16 | All 93 layers, 69 KDA/24 gated MLA, attention residuals, BF16 latent/shared paths and native MXFP4 routed experts | Official pinned decoder/FLA oracle, eight-step independent KDA recurrence and 16-rank CPU protocol pass; deferred by request; disabled |
-| CSM-1B audio frame | Previous-frame code embedding, all 16 backbone layers with KV append, codebook 0, then 31 sequential depth-decoder steps with per-codebook heads | Pinned transformers `CsmForConditionalGeneration` matches greedy codes and teacher-forced logits on CPU; teacher-forced grading accepts at most four near-greedy departures; full B200 validation pending; disabled |
-| π0.5 action chunk | Untimed SigLIP/PaliGemma prefix fixture; ten timed Euler steps of the 18-layer action expert with adaRMS time conditioning | Pinned LeRobot `PI05Pytorch` matches end to end on CPU (relative L2 0.0013 at reduced geometry); full B200 validation pending; disabled |
-| Waypoint-1.5-1B latent frame | Four denoise passes and the σ=0 cache-commit pass over 512 tokens, local and dilated global rolling KV, controller fusion layers | Clean-room reference; pinned upstream `model.py`/`modular_blocks.py` match in FP32 (relative K/V write error 2.5e-7) and BF16 on CPU; full B200 validation pending; disabled |
+| CSM-1B audio frame | Previous-frame code embedding, all 16 backbone layers with KV append, codebook 0, then 31 sequential depth-decoder steps with per-codebook heads | Pinned transformers `CsmForConditionalGeneration` matches greedy codes and teacher-forced logits on CPU; teacher-forced grading accepts at most four near-greedy departures; full B200 upstream comparison and candidate harness pass; enabled |
+| π0.5 action chunk | Untimed SigLIP/PaliGemma prefix fixture; ten timed Euler steps of the 18-layer action expert with adaRMS time conditioning | Pinned LeRobot `PI05Pytorch` matches end to end on CPU (relative L2 0.0013 at reduced geometry); full B200 candidate harness passes; enabled |
+| Waypoint-1.5-1B latent frame | Four denoise passes and the σ=0 cache-commit pass over 512 tokens, local and dilated global rolling KV, controller fusion layers | Clean-room reference; pinned upstream `model.py`/`modular_blocks.py` match in FP32 (relative K/V write error 2.5e-7) and BF16 on CPU; full B200 candidate harness passes; enabled |
 | MegaMoE DeepSeek-V4-Pro EP8 (512, 4,096 tokens per rank) | Routed experts only: FP8 dispatch, FP8×MXFP4 gate/up, clamped SwiGLU, weighted per-32 FP8 requantization, down projection, combine | Pinned DeepGEMM quantizers and Transformers `DeepseekV4Experts` agree with the unquantized path to 7e-5; CPU and full eight-B200 EP8 outputs equal the serial run bit for bit for both seeds and both sizes; candidate harness passes; enabled |
 
 The full EAGLE iteration consumes target features entering layers 2, 16 and
@@ -304,3 +304,25 @@ seeds. The slowest rank's eager CUDA-event median was 67.8 ms (t512) and
 75.2 ms (t4096), with 3,293–3,307 kernels per rank, so the
 reference is `non_megakernel`, as expected. Each verify step took about a
 minute and each harness run about 45 s; the job took 3 min 35 s.
+
+### CSM-1B, π0.5 and Waypoint-1.5
+
+Same campaign. One-B200 job 4888 (commit 125d175 with the cases set ready) ran
+the harness with the reference submission on each case. Correctness passed for
+two seeds, and each BF16 reference was within the FP32 oracle band. Relative L2
+against the oracle was 2.7–2.9% for CSM logits (1.7–1.9% for its KV writes),
+0.29–0.31% for π0.5 actions, and 0.56–0.58% for the Waypoint latent
+(0.9–1.1% for its KV writes). Eager CUDA-event medians were 100.7 ms (CSM),
+118.1 ms (π0.5) and 242.0 ms (Waypoint), with 10,280, 14,246 and 11,652
+kernels respectively, so each reference is `non_megakernel`.
+
+The same job's full-geometry CSM upstream comparison failed seed 17. Its only
+code difference was codebook 31, where upstream's top two logits are an exact
+tie. Our logits differed from upstream's by at most 0.039, a few BF16 ULPs.
+Upstream's own incremental and teacher-forced passes differ from each other
+by the same amount (0.047 max, 0.9% relative L2). Diagnostic jobs 4906/4907
+confirmed this and showed that both implementations are deterministic; KV
+writes match exactly. `verify_csm_primary` now scales its logit band by that
+upstream self-disagreement instead of an elementwise tolerance. With that
+change, job 4908 passed both seeds at full geometry; seed 18 matches upstream
+bit for bit.
