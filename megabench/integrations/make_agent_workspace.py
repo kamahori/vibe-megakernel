@@ -33,7 +33,7 @@ REFERENCE_FILES = {
     "kimi_k3_layer": ("kimi_layer.py", "kimi.py", "frontier.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
     "glm53_flash_step": ("glm53.py", "frontier.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
     "tts_frame_step": ("csm.py", "common.py"),
-    "vla_action_step": ("pi05.py", "vision.py", "common.py"),
+    "vla_action_step": ("pi05.py", "vision.py", "gemma.py", "common.py"),
     "world_frame_step": ("waypoint.py", "common.py"),
     "megamoe_layer": ("megamoe.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
 }
