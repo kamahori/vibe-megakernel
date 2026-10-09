@@ -45,6 +45,10 @@ boundary; [`cases.py`](cases.py) is the active machine-readable catalog.
 | P3 | GLM-5.3-Flash full decode (TP4) | Ready with native synthetic FP8 weights; verified on four B200 GPUs |
 | P3 | Kimi-K3 single KDA and gated-MLA layers (DP attention, EP8 all-to-all) | Ready with native synthetic MXFP4 experts; verified on eight B200 GPUs |
 | P3 | Kimi-K3 full decode | Native synthetic reference implemented; deferred by request |
+| P1 | Sesame CSM-1B TTS audio frame (backbone step plus 31 depth-decoder codebooks) | Planned: synthetic reference and CPU checks pass; GPU validation pending |
+| P2 | π0.5 VLA 10-step flow-matching action chunk over a cached PaliGemma prefix | Planned: synthetic reference and CPU checks pass; GPU validation pending |
+| P2 | Waypoint-1.5-1B world-model latent frame (4 denoise passes plus cache commit) | Planned: synthetic reference and CPU checks pass; GPU validation pending |
+| P3 | DeepSeek-V4-Pro MegaMoE routed-expert layer, EP8 at 512 and 4,096 tokens per rank | Planned: native FP8/MXFP4 synthetic reference and CPU EP8 checks pass; GPU validation pending |
 
 `list --suite core` selects every enabled case; `--suite p0` selects the original five.
 `--suite p1` through `p3`, `planned`, and `all` expose their catalog subsets; an
@@ -156,7 +160,10 @@ The floor counts used weights once, needed old KV cache, and required outputs.
 For MoE it counts selected experts; for EAGLE3 it assumes target weights are
 reused across the five verification positions. It excludes scratch traffic,
 compute time, and synchronization, so it is a lower bound rather than an
-achievable latency target. Families without a traffic model return `unavailable`. `--suite all` marks planned cases unavailable until
+achievable latency target. The TTS, VLA, world-model and MegaMoE cases have
+compute-heavy steps, so their floor is the largest of that HBM bound, dense
+tensor-core time (B200 BF16 2.25 PFLOP/s, FP8 4.5 PFLOP/s) and NVLink time
+(900 GB/s per GPU); `bound` names the binding resource. Families without a traffic model return `unavailable`. `--suite all` marks planned cases unavailable until
 their oracle and tensor geometry are defined.
 
 Repeat in four other fresh agent sessions, each with its own `--case`,
@@ -211,6 +218,9 @@ error against that oracle, plus the case `rtol`/`bf16_rtol` and `atol` floors.
 Each integer element must match the BF16 reference or the oracle; a greedy
 token may also be any token whose FP32 logit lies within the band of the top
 logit. See `docs/REFERENCE_PRECISION.md` for the calibration.
+CSM codes are sequentially dependent, so they are graded teacher-forced: the
+references are rerun on the submitted codes, and at most four codes may be
+such near-greedy departures.
 Input mutation is rejected. Cold first-call time is reported separately.
 Warm timing records synchronized host and CUDA-event latency for the candidate
 and eager reference. Where capture succeeds, it also times a CUDA Graph

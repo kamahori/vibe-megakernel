@@ -43,6 +43,33 @@ Fused serving kernels can have different internal rounding boundaries; the
 eager reference defines output formats and the BF16 noise scale, not a
 bitwise target.
 
+## Multimodal and MegaMoE tasks
+
+These tasks follow their upstream serving paths:
+
+- **CSM-1B** uses the Llama text pattern. Llama-3 RoPE frequencies (scaling
+  factor 32) are computed in FP32 on the host, as Transformers initializes
+  them. Codebook logits are widened BF16 head results.
+- **π0.5** follows LeRobot's `PI05Pytorch` with `dtype=bfloat16`. Expert
+  projections and activations are BF16. The time MLP, adaRMSNorm modulation
+  layers and action in/out projections keep FP32 weights and activations, as
+  do the noise, velocity and returned actions. LeRobot's BF16 cast also rounds
+  the rotary `inv_freq` buffers to BF16. The reference keeps FP32 frequencies,
+  as openpi's JAX model and the other MegaBench tasks do;
+  `verify_pi05_primary` reports the difference between the two variants.
+- **Waypoint-1.5** keeps the noise-level MLP in FP32 (upstream
+  `_keep_in_fp32_modules`), as well as its RoPE frequencies and attention
+  scores/softmax. Projections, residuals, caches and the Euler update are BF16.
+  The weightless RMSNorm uses FP32 epsilon.
+- **MegaMoE** keeps FP8 E4M3 activations with UE8M0 (`uint8` exponent)
+  per-32 scales and MXFP4 experts native. Gate/up and down GEMMs accumulate in
+  FP32 and publish BF16. The routing weight is applied in FP32 before the
+  per-32 FP8 requantization, and combine sums the top-k BF16 rows in FP32 in
+  slot order with one BF16 rounding. The requantization is part of the oracle
+  too. A small perturbation of the linear-1 output can therefore move an
+  element to a neighboring FP8 value or flip a block's power-of-two scale, so
+  the band is wider than for unquantized cases.
+
 ## Grading band
 
 BF16 rounding differences compound through the model. On the full synthetic
