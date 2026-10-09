@@ -58,10 +58,14 @@ def advance_state(case, values, outputs):
             result[prefix+'kv_cache'] = append(prefix+'kv_cache', outputs['kv_write'][full_slot])
             result[prefix+'pe_cache'] = append(prefix+'pe_cache', outputs['pe_write'][full_slot])
             if not is_kimi:
-                result[prefix+'kv_cache_scale'] = append(prefix+'kv_cache_scale', outputs['kv_scale_write'][full_slot])
+                # DeepSeek caches are BF16 (TileRT numerics); GLM's carry FP8 scales.
+                scaled = 'kv_scale_write' in outputs
+                if scaled:
+                    result[prefix+'kv_cache_scale'] = append(prefix+'kv_cache_scale', outputs['kv_scale_write'][full_slot])
                 if frontier.indexer_layer(case, layer):
                     result[prefix+'index_cache'] = append(prefix+'index_cache', outputs['index_k_write'][index_slot])
-                    result[prefix+'index_cache_scale'] = append(prefix+'index_cache_scale', outputs['index_scale_write'][index_slot])
+                    if scaled:
+                        result[prefix+'index_cache_scale'] = append(prefix+'index_cache_scale', outputs['index_scale_write'][index_slot])
                     index_slot += 1
             full_slot += 1
         else:

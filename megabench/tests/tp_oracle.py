@@ -55,13 +55,16 @@ def tp_rounding(case, values, module):
                         is_routed = layer >= case.params['first_dense'] and name != 'o'
                         row_weights[storage(values[key])] = is_routed
 
-            def fp8_linear(vector, weight, scale, power):
+            def fp8_linear(vector, weight, scale, power, *, quantize=True):
                 pointer = storage(weight)
                 if pointer not in row_weights:
-                    return native_linear(vector, weight, scale, power)
-                payload, act_scale = pack_fp8_activation(vector.bfloat16(), power_of_two=power)
+                    return native_linear(vector, weight, scale, power, quantize=quantize)
                 decoded = unpack_fp8_weight(weight, scale)
-                activation = unpack_fp8_activation(payload, act_scale)
+                if quantize:
+                    payload, act_scale = pack_fp8_activation(vector.bfloat16(), power_of_two=power)
+                    activation = unpack_fp8_activation(payload, act_scale)
+                else:
+                    activation = vector.float()
                 parts = [matmul(w, x).bfloat16().float() for w, x in
                          zip(decoded.chunk(tp, dim=1), activation.chunk(tp))]
                 result = torch.stack(parts).sum(0)

@@ -60,7 +60,8 @@ def main():
     parser.add_argument('--output', required=True, type=Path)
     args = parser.parse_args()
     cases = select_cases('p3')
-    cases.append(replace(cases[-1], gpus=8, tp=8))
+    kimi = next(case for case in cases if case.family == 'kimi_k3_step')
+    cases.append(replace(kimi, gpus=8, tp=8))
     results = [audit(case) for case in cases]
     with args.output.open('x') as file:
         json.dump(results, file, indent=2)

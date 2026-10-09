@@ -42,7 +42,7 @@ OUTPUT_KEYS = {
                     "recurrent_state", "conv_state", "cache_length"),
     "vl_decode_step": ("logits", "next_token", "k_write", "v_write"),
     "distributed_step": ("logits", "next_token", "k_write", "v_write"),
-    "deepseek_v32_step": ("logits", "next_token", "kv_write", "kv_scale_write", "pe_write", "index_k_write", "index_scale_write", "sparse_indices", "expert_ids"),
+    "deepseek_v32_step": ("logits", "next_token", "kv_write", "pe_write", "index_k_write", "sparse_indices", "expert_ids"),
     "glm52_step": ("logits", "next_token", "kv_write", "kv_scale_write", "pe_write", "index_k_write", "index_scale_write", "sparse_indices", "expert_ids"),
     "kimi_k3_step": ("logits", "next_token", "kv_write", "pe_write", "recurrent_state", "conv_state", "expert_ids", "cache_length"),
     "spec_full_iteration": ("logits", "proposed_tokens", "tree_parents", "accepted_count",

@@ -29,7 +29,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         # Import-only checks miss fixtures that replace the Case dataclass.
         frontier_cases = [replace(frontier_development(case), gpus=1, tp=1, ready=True)
                           for case in select_cases('p3')
-                          if case.family in ('deepseek_v32_step', 'glm52_step')]
+                          if case.id in ('deepseek-v32-step', 'glm52-step')]
         for case in (tiny_hybrid(), tiny_vision(), tiny_speculative(), *frontier_cases):
             with self.subTest(case=case.id), tempfile.TemporaryDirectory() as directory:
                 with patch('megabench.integrations.make_agent_workspace.select_cases',

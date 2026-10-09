@@ -48,6 +48,16 @@ class Case:
         return asdict(self)
 
 
+DEEPSEEK_V32 = {"batch": 1, "context": 128, "layers": 61,
+                "experts": 256, "topk": 8, "hidden": 7168, "q_heads": 128,
+                "q_lora_rank": 1536, "kv_lora_rank": 512, "qk_nope_dim": 128,
+                "qk_rope_dim": 64, "v_head_dim": 128, "intermediate": 2048,
+                "dense_intermediate": 18432, "first_dense": 3, "shared_experts": 1,
+                "vocab": 129280, "index_heads": 64, "index_dim": 128,
+                "index_topk": 2048, "router_groups": 8, "router_top_groups": 4}
+DEEPSEEK_NOTE = ("Synthetic FP8-weight MLA/DSA TP8 decode with TileRT 0.1.6 numerics "
+                 "(BF16 caches and indexer); eight-B200 verification pending.")
+
 CASES: tuple[Case, ...] = (
     Case("dense-step-qwen3-06b-b1-s128", "dense_step", "Qwen/Qwen3-0.6B",
          "decode", {"batch": 1, "context": 128, "layers": 28,
@@ -138,16 +148,9 @@ CASES: tuple[Case, ...] = (
          "expert_parallel", "p2", ready=True, gpus=4, tp=2, ep=2, atol=0.003, rtol=0.003,
          note="Full synthetic TP/EP decode; verified on four B200 GPUs."),
     Case("deepseek-v32-step", "deepseek_v32_step",
-         "deepseek-ai/DeepSeek-V3.2", "decode",
-         {"batch": 1, "context": 128, "layers": 61,
-          "experts": 256, "topk": 8, "hidden": 7168, "q_heads": 128,
-          "q_lora_rank": 1536, "kv_lora_rank": 512, "qk_nope_dim": 128,
-          "qk_rope_dim": 64, "v_head_dim": 128, "intermediate": 2048,
-          "dense_intermediate": 18432, "first_dense": 3, "shared_experts": 1,
-          "vocab": 129280, "index_heads": 64, "index_dim": 128,
-          "index_topk": 2048, "router_groups": 8, "router_top_groups": 4},
+         "deepseek-ai/DeepSeek-V3.2", "decode", DEEPSEEK_V32,
          "frontier_moe", "p3", ready=True, gpus=8, tp=8, atol=0.003, rtol=0.003,
-         note="Native synthetic FP8 MLA/DSA TP8 decode; verified on eight B200 GPUs."),
+         note=DEEPSEEK_NOTE),
     Case("glm52-step", "glm52_step", "zai-org/GLM-5.2-FP8", "decode",
          {"batch": 1, "context": 128, "layers": 78,
           "experts": 256, "topk": 8, "hidden": 6144, "q_heads": 64,
@@ -170,6 +173,12 @@ CASES: tuple[Case, ...] = (
                     "conv_kernel": 4, "attn_res_block_size": 12},
          "frontier_hybrid", "p3", gpus=16, tp=16, atol=0.003, rtol=0.003,
          note="Deferred by request; native synthetic KDA/MLA TP16 decode needs 16-GPU validation."),
+    # Past index_topk=2048 cached tokens, DSA selection is sparse; these
+    # contexts match TileRT's long-context decode regime.
+    *(Case(f"deepseek-v32-step-ctx{context // 1024}k", "deepseek_v32_step",
+           "deepseek-ai/DeepSeek-V3.2", "decode", DEEPSEEK_V32 | {"context": context},
+           "frontier_moe", "p3", ready=True, gpus=8, tp=8, atol=0.003, rtol=0.003,
+           note=DEEPSEEK_NOTE) for context in (4096, 32768)),
 )
 
 

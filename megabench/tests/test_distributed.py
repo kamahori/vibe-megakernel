@@ -18,9 +18,17 @@ from .test_frontier import development as frontier_development
 from .test_kimi import development as kimi_development
 
 
+def one_per_family(cases):
+    """Context variants share one development geometry; check each family once."""
+    first = {}
+    for case in cases:
+        first.setdefault(case.family, case)
+    return list(first.values())
+
+
 class DistributedReferenceTests(unittest.TestCase):
     def test_frontier_state_rollouts_match_serial_oracles(self):
-        cases = select_cases('p3')
+        cases = one_per_family(select_cases('p3'))
         checks = [(case,2) for case in cases] + [(case,8) for case in cases[:2]]
         for case,ranks in checks:
             with self.subTest(case=case.id,ranks=ranks), tempfile.TemporaryDirectory() as directory:
@@ -43,7 +51,7 @@ class DistributedReferenceTests(unittest.TestCase):
 
     def test_frontier_native_outputs_pass_the_submission_harness(self):
         submission = Path(__file__).parents[1] / 'examples/reference_submission.py'
-        for original in select_cases('p3'):
+        for original in one_per_family(select_cases('p3')):
             with self.subTest(case=original.id):
                 tiny = (kimi_development(original) if original.family == 'kimi_k3_step'
                         else frontier_development(original))

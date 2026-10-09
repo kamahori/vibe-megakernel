@@ -5,6 +5,12 @@ indexer state are replicated; logits are vocabulary shards. FP8 payloads,
 block scales, dynamic activation quantization, sparse selection, and all
 collectives are consumed inside reference(), with no cached dequantization.
 The pinned model geometries and primary-source revisions are in model_specs.
+
+DeepSeek follows TileRT's B=1 decode numerics (tile-ai/TileRT 0.1.6), so the
+TileRT engine can be graded and timed on the same task: BF16 latent, rope and
+index-key caches; a BF16 indexer without FP8 Q/K; FP8 activations only for the
+input-norm projections (q_a, kv_a, indexer wk); BF16 activations against FP8
+weights elsewhere; and FP32 logits. GLM keeps its native FP8 caches.
 """
 
 from __future__ import annotations
@@ -48,79 +54,118 @@ def fp8_matrix(seed: int, name: str, rows: int, cols: int, device: str,
     return payload, scales
 
 
-def make_inputs(case: Case, seed: int, device: str, *, rank: int | None = None) -> dict[str, torch.Tensor]:
-    rank = dist.get_rank() if rank is None else rank
+def _check_topology(case: Case, rank: int) -> None:
     if case.ep != 1 or case.gpus != case.tp or not 0 <= rank < case.gpus:
         raise ValueError('frontier reference requires one TP group covering all ranks')
+    p = case.params
+    for dimension in (p['q_heads'], p['vocab'], p['intermediate'], p['dense_intermediate']):
+        if dimension % case.tp:
+            raise ValueError('heads, FFN intermediates and vocabulary must divide TP')
+
+
+def global_inputs(case: Case, seed: int, device: str, *, rank: int) -> dict[str, torch.Tensor]:
+    """Token, embedding/head shards and the per-layer norm stacks."""
+    _check_topology(case, rank)
+    p, tp, h = case.params, case.tp, case.params['hidden']
+    rows = (rank * (p['vocab'] // tp), (rank + 1) * (p['vocab'] // tp))
+    values = {'token': torch.tensor(seed_for(seed, 'token') % p['vocab'], device=device)}
+    for name in ('embed', 'lm_head'):
+        values[name] = matrix(seed, name, p['vocab'], h, h, device, row_range=rows)
+    values['fnorm'] = (matrix(seed, 'fnorm', 1, h, 100, device)[0].float() + 1).to(torch.bfloat16)
+    values['ln1'] = (matrix(seed, 'ln1', p['layers'], h, 100, device).float() + 1).to(torch.bfloat16)
+    values['ln2'] = (matrix(seed, 'ln2', p['layers'], h, 100, device).float() + 1).to(torch.bfloat16)
+    return values
+
+
+def make_inputs(case: Case, seed: int, device: str, *, rank: int | None = None) -> dict[str, torch.Tensor]:
+    rank = dist.get_rank() if rank is None else rank
+    values = global_inputs(case, seed, device, rank=rank)
+    for layer in range(case.params['layers']):
+        values |= layer_inputs(case, seed, layer, device, rank=rank)
+    return values
+
+
+def layer_inputs(case: Case, seed: int, layer: int, device: str, *, rank: int) -> dict[str, torch.Tensor]:
+    """One layer's rank-local weights and cache prefix, keyed ``l{layer}_*``.
+
+    With ``gpus=tp=1`` this is the unsharded layer: shards are slices of the
+    same canonical blocks, so external engines can consume global tensors.
+    """
+    _check_topology(case, rank)
     p, tp = case.params, case.tp
     h, heads, qrank, krank = p['hidden'], p['q_heads'], p['q_lora_rank'], p['kv_lora_rank']
     nope, rotary, vd = p['qk_nope_dim'], p['qk_rope_dim'], p['v_head_dim']
     power = case.family == 'deepseek_v32_step'
-    for dimension in (heads, p['vocab'], p['intermediate'], p['dense_intermediate']):
-        if dimension % tp:
-            raise ValueError('heads, FFN intermediates and vocabulary must divide TP')
     split = lambda n: (rank * (n // tp), (rank + 1) * (n // tp))
-    values = {'token': torch.tensor(seed_for(seed, 'token') % p['vocab'], device=device)}
-    for name in ('embed', 'lm_head'):
-        values[name] = matrix(seed, name, p['vocab'], h, h, device, row_range=split(p['vocab']))
-    values['fnorm'] = (matrix(seed, 'fnorm', 1, h, 100, device)[0].float() + 1).to(torch.bfloat16)
-    values['ln1'] = (matrix(seed, 'ln1', p['layers'], h, 100, device).float() + 1).to(torch.bfloat16)
-    values['ln2'] = (matrix(seed, 'ln2', p['layers'], h, 100, device).float() + 1).to(torch.bfloat16)
-    for layer in range(p['layers']):
-        prefix = f'l{layer}_'
-        def weight(name, rows, cols, rr=None, cr=None):
-            quant, scale = fp8_matrix(seed, prefix+name, rows, cols, device, power, row_range=rr, col_range=cr)
-            values[prefix+name], values[prefix+name+'_scale'] = quant, scale
-        for name, width in (('qn', qrank), ('kn', krank)):
-            values[prefix+name] = (matrix(seed, prefix+name, 1, width, 100, device)[0].float()+1).to(torch.bfloat16)
-        weight('qa', qrank, h)
-        weight('qb', heads*(nope+rotary), qrank, rr=split(heads*(nope+rotary)))
-        weight('ka', krank+rotary, h)
-        weight('kb', heads*(nope+vd), krank, rr=split(heads*(nope+vd)))
-        weight('o', h, heads*vd, cr=split(heads*vd))
-        latent = matrix(seed, prefix+'latent_cache', p['context'], krank, krank, device)
+    values = {}
+    prefix = f'l{layer}_'
+    def weight(name, rows, cols, rr=None, cr=None):
+        quant, scale = fp8_matrix(seed, prefix+name, rows, cols, device, power, row_range=rr, col_range=cr)
+        values[prefix+name], values[prefix+name+'_scale'] = quant, scale
+    for name, width in (('qn', qrank), ('kn', krank)):
+        values[prefix+name] = (matrix(seed, prefix+name, 1, width, 100, device)[0].float()+1).to(torch.bfloat16)
+    weight('qa', qrank, h)
+    weight('qb', heads*(nope+rotary), qrank, rr=split(heads*(nope+rotary)))
+    weight('ka', krank+rotary, h)
+    weight('kb', heads*(nope+vd), krank, rr=split(heads*(nope+vd)))
+    weight('o', h, heads*vd, cr=split(heads*vd))
+    latent = matrix(seed, prefix+'latent_cache', p['context'], krank, krank, device)
+    if power:
+        values[prefix+'kv_cache'] = latent
+    else:
         values[prefix+'kv_cache'], values[prefix+'kv_cache_scale'] = pack_fp8_activation(latent, power_of_two=power)
-        values[prefix+'pe_cache'] = matrix(seed, prefix+'pe_cache', p['context'], rotary, rotary, device)
-        if indexer_layer(case, layer):
-            ih, idim = p['index_heads'], p['index_dim']
-            weight('iq', ih*idim, qrank)
-            weight('ik', idim, h)
-            values[prefix+'inorm'] = (matrix(seed, prefix+'inorm', 1, idim, 100, device)[0].float()+1).to(torch.bfloat16)
-            values[prefix+'ibias'] = matrix(seed, prefix+'ibias', 1, idim, 100, device)[0]
-            values[prefix+'iw'] = matrix(seed, prefix+'iw', ih, h, h, device)
-            old = matrix(seed, prefix+'index_cache', p['context'], idim, idim, device)
-            values[prefix+'index_cache'], values[prefix+'index_cache_scale'] = pack_fp8_activation(old, power_of_two=power)
-        if layer < p['first_dense']:
-            inter = p['dense_intermediate']
-            weight('gate', inter, h, rr=split(inter))
-            weight('up', inter, h, rr=split(inter))
-            weight('down', h, inter, cr=split(inter))
+    values[prefix+'pe_cache'] = matrix(seed, prefix+'pe_cache', p['context'], rotary, rotary, device)
+    if indexer_layer(case, layer):
+        ih, idim = p['index_heads'], p['index_dim']
+        weight('iq', ih*idim, qrank)
+        weight('ik', idim, h)
+        values[prefix+'inorm'] = (matrix(seed, prefix+'inorm', 1, idim, 100, device)[0].float()+1).to(torch.bfloat16)
+        values[prefix+'ibias'] = matrix(seed, prefix+'ibias', 1, idim, 100, device)[0]
+        values[prefix+'iw'] = matrix(seed, prefix+'iw', ih, h, h, device)
+        old = matrix(seed, prefix+'index_cache', p['context'], idim, idim, device)
+        if power:
+            values[prefix+'index_cache'] = old
         else:
-            inter, experts = p['intermediate'], p['experts']
-            router = matrix(seed, prefix+'router', experts, h, h, device)
-            values[prefix+'router'] = router if power else router.float()
-            values[prefix+'router_bias'] = matrix(seed, prefix+'router_bias', 1, experts, 100, device)[0].float()
-            for name, rows, cols, rr, cr in (('gate', inter, h, split(inter), None),
-                                          ('up', inter, h, split(inter), None),
-                                          ('down', h, inter, None, split(inter))):
-                r, c = (rr[1]-rr[0] if rr else rows), (cr[1]-cr[0] if cr else cols)
-                weights = torch.empty((experts, r, c), device=device, dtype=torch.float8_e4m3fn)
-                scales = torch.empty((experts, math.ceil(r/128), math.ceil(c/128)), device=device)
-                for expert in range(experts):
-                    quant, scale = fp8_matrix(seed, prefix+name+f':{expert}', rows, cols, device, power, row_range=rr, col_range=cr)
-                    weights[expert].copy_(quant)
-                    scales[expert].copy_(scale)
-                values[prefix+name], values[prefix+name+'_scale'] = weights, scales
-            shared = inter*p['shared_experts']
-            weight('shared_gate', shared, h, rr=split(shared))
-            weight('shared_up', shared, h, rr=split(shared))
-            weight('shared_down', h, shared, cr=split(shared))
+            values[prefix+'index_cache'], values[prefix+'index_cache_scale'] = pack_fp8_activation(old, power_of_two=power)
+    if layer < p['first_dense']:
+        inter = p['dense_intermediate']
+        weight('gate', inter, h, rr=split(inter))
+        weight('up', inter, h, rr=split(inter))
+        weight('down', h, inter, cr=split(inter))
+    else:
+        inter, experts = p['intermediate'], p['experts']
+        router = matrix(seed, prefix+'router', experts, h, h, device)
+        values[prefix+'router'] = router if power else router.float()
+        values[prefix+'router_bias'] = matrix(seed, prefix+'router_bias', 1, experts, 100, device)[0].float()
+        for name, rows, cols, rr, cr in (('gate', inter, h, split(inter), None),
+                                      ('up', inter, h, split(inter), None),
+                                      ('down', h, inter, None, split(inter))):
+            r, c = (rr[1]-rr[0] if rr else rows), (cr[1]-cr[0] if cr else cols)
+            weights = torch.empty((experts, r, c), device=device, dtype=torch.float8_e4m3fn)
+            scales = torch.empty((experts, math.ceil(r/128), math.ceil(c/128)), device=device)
+            for expert in range(experts):
+                quant, scale = fp8_matrix(seed, prefix+name+f':{expert}', rows, cols, device, power, row_range=rr, col_range=cr)
+                weights[expert].copy_(quant)
+                scales[expert].copy_(scale)
+            values[prefix+name], values[prefix+name+'_scale'] = weights, scales
+        shared = inter*p['shared_experts']
+        weight('shared_gate', shared, h, rr=split(shared))
+        weight('shared_up', shared, h, rr=split(shared))
+        weight('shared_down', h, shared, cr=split(shared))
     return values
 
 
-def linear(value: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, power: bool) -> torch.Tensor:
+def linear(value: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, power: bool,
+           *, quantize: bool = True) -> torch.Tensor:
+    """FP8 weight GEMV; ``quantize=False`` keeps the BF16 activation (W8A16)."""
+    if not quantize:
+        return (unpack_fp8_weight(weight, scale) @ value.float()).to(value.dtype)
     quant, act_scale = pack_fp8_activation(value.to(torch.bfloat16), power_of_two=power)
     return (unpack_fp8_weight(weight, scale) @ unpack_fp8_activation(quant, act_scale)).to(value.dtype)
+
+
+# TileRT quantizes activations only where the input RMSNorm feeds FP8 GEMVs.
+DEEPSEEK_FP8_ACTIVATIONS = frozenset({'qa', 'ka', 'ik'})
 
 
 def rotate(value: torch.Tensor, position: int, *, deepseek: bool, interleaved: bool) -> torch.Tensor:
@@ -136,7 +181,10 @@ def rotate(value: torch.Tensor, position: int, *, deepseek: bool, interleaved: b
         inv = (1.0/(40*frequencies))*(1-extrapolation) + inv*extrapolation
     angle = position*inv
     a, b = (value[..., 0::2], value[..., 1::2]) if interleaved else value.chunk(2, -1)
-    cos, sin = angle.cos().to(value.dtype), angle.sin().to(value.dtype)
+    # DeepSeek rotates in FP32 with FP32 tables and rounds once, as TileRT does.
+    compute = torch.float32 if deepseek else value.dtype
+    a, b = a.to(compute), b.to(compute)
+    cos, sin = angle.cos().to(compute), angle.sin().to(compute)
     a, b = a*cos-b*sin, b*cos+a*sin
     result = torch.stack((a,b), -1).flatten(-2) if interleaved else torch.cat((a,b), -1)
     return result.to(value.dtype)
@@ -185,6 +233,9 @@ def reference(case: Case, values: dict[str, torch.Tensor], *, serial: bool = Fal
     token = int(values['token'])
     x = values['embed'][token-offset] if offset <= token < offset+chunk else torch.zeros(h, device=values['token'].device, dtype=torch.bfloat16)
     x = sum_value(x)
+    eps = 1e-6 if deepseek else 1e-5
+    # DeepSeek applies the FP32 gamma before its single BF16 rounding.
+    norm = lambda value, gamma, eps=eps: rms(value, gamma, eps=eps, weight_in_fp32=deepseek)
     latent_out, latent_scales, pe_out, index_keys, index_scales, indices_out, expert_ids = [], [], [], [], [], [], []
     selected = None
     for layer in range(p['layers']):
@@ -193,20 +244,26 @@ def reference(case: Case, values: dict[str, torch.Tensor], *, serial: bool = Fal
             weight, scale = values[prefix+name], values[prefix+name+'_scale']
             if expert is not None:
                 weight, scale = weight[expert], scale[expert]
-            return linear(value, weight, scale, power)
-        normalized = rms(x, values['ln1'][layer], eps=1e-6 if deepseek else 1e-5)
-        qr = rms(project('qa', normalized), values[prefix+'qn'], eps=1e-6)
+            return linear(value, weight, scale, power,
+                          quantize=not deepseek or name in DEEPSEEK_FP8_ACTIVATIONS)
+        normalized = norm(x, values['ln1'][layer])
+        qr = norm(project('qa', normalized), values[prefix+'qn'], eps=1e-6)
         query = project('qb', qr).view(heads, nr+rd)
         raw = project('ka', normalized)
-        latent = rms(raw[:kr], values[prefix+'kn'], eps=1e-6)
-        latent_payload, latent_scale = pack_fp8_activation(latent.to(torch.bfloat16), power_of_two=power)
-        latent = unpack_fp8_activation(latent_payload, latent_scale).to(torch.bfloat16)
+        latent = norm(raw[:kr], values[prefix+'kn'], eps=1e-6)
+        if deepseek:
+            latent_out.append(latent)
+            old_latent = values[prefix+'kv_cache']
+        else:
+            latent_payload, latent_scale = pack_fp8_activation(latent.to(torch.bfloat16), power_of_two=power)
+            latent = unpack_fp8_activation(latent_payload, latent_scale).to(torch.bfloat16)
+            latent_out.append(latent_payload)
+            latent_scales.append(latent_scale)
+            old_latent = unpack_fp8_activation(values[prefix+'kv_cache'], values[prefix+'kv_cache_scale']).to(torch.bfloat16)
         pe = rotate(raw[kr:], p['context'], deepseek=deepseek, interleaved=True)
         query_pe = rotate(query[:, nr:], p['context'], deepseek=deepseek, interleaved=True)
-        latent_out.append(latent_payload)
-        latent_scales.append(latent_scale)
         pe_out.append(pe.to(torch.bfloat16))
-        all_latent = torch.cat((unpack_fp8_activation(values[prefix+'kv_cache'], values[prefix+'kv_cache_scale']).to(torch.bfloat16), latent[None]))
+        all_latent = torch.cat((old_latent, latent[None]))
         all_pe = torch.cat((values[prefix+'pe_cache'], pe[None]))
         if indexer_layer(case, layer):
             ih, idim = p['index_heads'], p['index_dim']
@@ -214,22 +271,28 @@ def reference(case: Case, values: dict[str, torch.Tensor], *, serial: bool = Fal
             ik = F.layer_norm(project('ik', normalized), (idim,), values[prefix+'inorm'], values[prefix+'ibias'], eps=1e-6)
             iq = torch.cat((rotate(iq[:, :rd], p['context'], deepseek=deepseek, interleaved=not deepseek), iq[:, rd:]), -1)
             ik = torch.cat((rotate(ik[:rd], p['context'], deepseek=deepseek, interleaved=not deepseek), ik[rd:]), -1)
-            # GLM's published eager indexer works directly in BF16/FP32;
-            # DeepSeek's native indexer rotates and quantizes both Q and K.
             if deepseek:
+                # TileRT rotates both sides by a Hadamard transform and keeps
+                # BF16 query, key cache and head weights (no FP8 indexer).
                 iq = hadamard(iq.to(torch.bfloat16))
                 ik = hadamard(ik.to(torch.bfloat16))
-            iq_payload, iq_scale = pack_fp8_activation(iq.to(torch.bfloat16), power_of_two=power)
-            ik_payload, ik_scale = pack_fp8_activation(ik.to(torch.bfloat16), power_of_two=power)
-            iq = unpack_fp8_activation(iq_payload, iq_scale)
-            index_cache = torch.cat((unpack_fp8_activation(values[prefix+'index_cache'], values[prefix+'index_cache_scale']),
-                                     unpack_fp8_activation(ik_payload, ik_scale)[None]))
-            # Upstream keeps the sparse-index weighting projection in FP32.
-            iw = (values[prefix+'iw'].float() @ normalized.float()) / ih**0.5
+                index_cache = torch.cat((values[prefix+'index_cache'], ik[None])).float()
+                iw = (values[prefix+'iw'].float() @ normalized.float()).to(torch.bfloat16).float() / ih**0.5
+                index_keys.append(ik)
+                iq = iq.float()
+            else:
+                # GLM's published eager indexer works directly in BF16/FP32.
+                iq_payload, iq_scale = pack_fp8_activation(iq.to(torch.bfloat16), power_of_two=power)
+                ik_payload, ik_scale = pack_fp8_activation(ik.to(torch.bfloat16), power_of_two=power)
+                iq = unpack_fp8_activation(iq_payload, iq_scale)
+                index_cache = torch.cat((unpack_fp8_activation(values[prefix+'index_cache'], values[prefix+'index_cache_scale']),
+                                         unpack_fp8_activation(ik_payload, ik_scale)[None]))
+                # Upstream keeps the sparse-index weighting projection in FP32.
+                iw = (values[prefix+'iw'].float() @ normalized.float()) / ih**0.5
+                index_keys.append(ik_payload)
+                index_scales.append(ik_scale)
             scores = (F.relu(iq @ index_cache.T / idim**0.5)*iw[:, None]).sum(0)
             selected = scores.argsort(descending=True, stable=True)[:min(p['index_topk'], p['context']+1)].to(torch.int32)
-            index_keys.append(ik_payload)
-            index_scales.append(ik_scale)
         indices_out.append(selected)
         weight = unpack_fp8_weight(values[prefix+'kb'], values[prefix+'kb_scale']).to(x.dtype).view(heads, nr+vd, kr)
         absorbed = torch.einsum('hd,hdc->hc', query[:, :nr], weight[:, :nr])
@@ -242,23 +305,34 @@ def reference(case: Case, values: dict[str, torch.Tensor], *, serial: bool = Fal
         attention_latent = probability.to(x.dtype) @ all_latent
         attention = torch.einsum('hc,hdc->hd', attention_latent, weight[:, nr:]).flatten()
         x = x+sum_value(project('o', attention))
-        normalized = rms(x, values['ln2'][layer], eps=1e-6 if deepseek else 1e-5)
+        normalized = norm(x, values['ln2'][layer])
+        # TileRT forms silu(gate)*up in FP32 and rounds once.
+        swiglu = ((lambda gate, up: (F.silu(gate.float())*up.float()).to(gate.dtype)) if deepseek
+                  else (lambda gate, up: F.silu(gate)*up))
         if layer < p['first_dense']:
-            output = project('down', F.silu(project('gate', normalized))*project('up', normalized))
+            output = project('down', swiglu(project('gate', normalized), project('up', normalized)))
             expert_ids.append(torch.full((p['topk'],), -1, device=x.device, dtype=torch.int64))
         else:
             ids, weights = route(values[prefix+'router'].float() @ normalized.float(), values[prefix+'router_bias'],
                                  p['topk'], p['router_groups'], p['router_top_groups'])
             expert_ids.append(ids)
+            # Experts accumulate in FP32. TileRT rounds each weighted routed
+            # expert's TP partial to BF16; that rank-local rounding is not
+            # TP-invariant, so it is left to the tolerance band.
             output = torch.zeros_like(x, dtype=torch.float32)
             for slot, expert in enumerate(ids.tolist()):
-                hidden = F.silu(project('gate', normalized, expert))*project('up', normalized, expert)
+                hidden = swiglu(project('gate', normalized, expert), project('up', normalized, expert))
                 output = output+project('down', hidden, expert).float()*weights[slot]
-            output = output+project('shared_down', F.silu(project('shared_gate', normalized))*project('shared_up', normalized)).float()
+            output = output+project('shared_down', swiglu(project('shared_gate', normalized), project('shared_up', normalized))).float()
         x = x+sum_value(output).to(x.dtype)
-    logits = values['lm_head'] @ rms(x, values['fnorm'], eps=1e-6 if deepseek else 1e-5)
-    # Native FP8 cache payloads and their scales must travel together.
-    return {'logits': logits.float(), 'next_token': logits.argmax() if serial else greedy_token(logits, offset, ctx.tp_group),
-            'kv_write': torch.stack(latent_out), 'kv_scale_write': torch.stack(latent_scales), 'pe_write': torch.stack(pe_out),
-            'index_k_write': torch.stack(index_keys), 'index_scale_write': torch.stack(index_scales),
-            'sparse_indices': torch.stack(indices_out), 'expert_ids': torch.stack(expert_ids)}
+    final = norm(x, values['fnorm'])
+    # DeepSeek (TileRT) keeps FP32 logits from the BF16 head GEMV.
+    logits = values['lm_head'].float() @ final.float() if deepseek else values['lm_head'] @ final
+    outputs = {'logits': logits.float(), 'next_token': logits.argmax() if serial else greedy_token(logits, offset, ctx.tp_group),
+               'kv_write': torch.stack(latent_out), 'pe_write': torch.stack(pe_out),
+               'index_k_write': torch.stack(index_keys),
+               'sparse_indices': torch.stack(indices_out), 'expert_ids': torch.stack(expert_ids)}
+    if not deepseek:
+        # Native FP8 cache payloads and their scales must travel together.
+        outputs |= {'kv_scale_write': torch.stack(latent_scales), 'index_scale_write': torch.stack(index_scales)}
+    return outputs
