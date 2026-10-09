@@ -179,6 +179,7 @@ class HarnessTests(unittest.TestCase):
         case = select_cases("core")[0]
         args = Namespace(submission=str(REFERENCE_SUBMISSION), device="cuda:0",
                          trials=2, warmup=1, reps=3, graph_baseline=False,
+                         compiled_baselines=True,
                          docker_image="existing-image:tag", docker_gpus="device=6")
         with tempfile.TemporaryDirectory() as directory:
             result = Path(directory) / "result.json"
@@ -194,6 +195,7 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--gpus") + 1], "device=6")
         self.assertEqual(cmd[cmd.index("--pull") + 1], "never")
         self.assertIn("--no-graph-baseline", cmd)
+        self.assertIn("--compiled-baselines", cmd)
         self.assertIn("/workspace/megabench/examples/reference_submission.py", cmd)
         self.assertIn(f"org.megabench.run={run_id}", cmd)
         self.assertTrue(name.startswith("megabench-"))
@@ -246,7 +248,7 @@ class HarnessTests(unittest.TestCase):
             submission = root / "candidate" / "submission.py"
             args = Namespace(submission=str(submission), docker_image=None,
                              device="cpu", trials=1, warmup=0, reps=1,
-                             graph_baseline=False, timeout=1)
+                             graph_baseline=False, compiled_baselines=False, timeout=1)
             with patch("megabench.harness.runner._run_local_worker",
                        side_effect=subprocess.TimeoutExpired("worker", 1)):
                 result = _run_one(args, TINY_DENSE, root)

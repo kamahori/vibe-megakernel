@@ -45,6 +45,7 @@ CONTRACT_FILES = (
     "megabench/tasks/kimi.py",
     "megabench/tasks/references/qwen3.py",
     "megabench/tasks/references/moe.py",
+    "megabench/baselines.py",
 )
 
 
@@ -77,7 +78,8 @@ def _load_submission(path: Path, case: Case, *, execution: dict | None = None) -
 
 def evaluate_case(case: Case, submission: Path, *, device: str,
                   trials: int, warmup: int, reps: int,
-                  graph_baseline: bool = True) -> dict:
+                  graph_baseline: bool = True,
+                  compiled_baselines: bool = False) -> dict:
     import torch
 
     record = {"case": case.to_dict(), "submission": str(submission),
@@ -150,6 +152,16 @@ def evaluate_case(case: Case, submission: Path, *, device: str,
             except Exception as exc:
                 record["graph_baseline_unavailable"] = (
                     f"{type(exc).__name__}: {exc}")
+        if compiled_baselines and torch.device(device).type == "cuda":
+            from ..baselines import timing_baselines
+            from ..workloads import oracle
+
+            expected = reference(case, perf_inputs)
+            exact = oracle(case, perf_inputs)
+            record["compiled_baselines"] = timing_baselines(
+                case, perf_inputs, device, warmup, reps,
+                expected=expected, exact=exact)
+            del expected, exact
         record["launch_audit"] = _audit_launches(candidate, perf_inputs, device,
                                                  case.max_gpu_launches)
         cand = record["candidate_timing"]["host_p50_ms"]
@@ -164,6 +176,11 @@ def evaluate_case(case: Case, submission: Path, *, device: str,
                 graph_event = record["graph_baseline_timing"]["cuda_event_p50_ms"]
                 record["speedup_vs_graph_cuda_event"] = graph_event / cand_event
                 best = min(best, graph_event)
+            compiled_best = record.get("compiled_baselines", {}).get("best")
+            if compiled_best is not None:
+                compiled_event = compiled_best["cuda_event_p50_ms"]
+                record["speedup_vs_compiled_best_cuda_event"] = compiled_event / cand_event
+                best = min(best, compiled_event)
             record["speedup_vs_best_baseline_cuda_event"] = best / cand_event
     audit = record["launch_audit"]["status"]
     record["status"] = ("correctness_only" if torch.device(device).type == "cpu" else
@@ -179,7 +196,8 @@ def _worker(args: argparse.Namespace) -> int:
         result = evaluate_case(case, Path(args.submission).resolve(),
                                device=args.device, trials=args.trials,
                                warmup=args.warmup, reps=args.reps,
-                               graph_baseline=args.graph_baseline)
+                               graph_baseline=args.graph_baseline,
+                               compiled_baselines=args.compiled_baselines)
     except Exception as exc:
         result = {"case": case.to_dict(), "submission": args.submission,
                   "status": "incorrect" if isinstance(exc, AssertionError) else "error",
@@ -226,6 +244,8 @@ def _docker_worker_command(args: argparse.Namespace, case: Case,
                 "--result", f"/results/{result_path.name}"])
     if not args.graph_baseline:
         cmd.append("--no-graph-baseline")
+    if args.compiled_baselines:
+        cmd.append("--compiled-baselines")
     return cmd, name, run_id
 
 
@@ -279,6 +299,8 @@ def _run_one(args: argparse.Namespace, case: Case, tempdir: Path) -> dict:
                "--reps", str(args.reps), "--result", str(result_path)]
         if not args.graph_baseline:
             cmd.append("--no-graph-baseline")
+        if args.compiled_baselines:
+            cmd.append("--compiled-baselines")
     try:
         proc = (subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=args.timeout)
                 if container else _run_local_worker(cmd, args.timeout))
@@ -397,6 +419,11 @@ def main(argv: list[str] | None = None) -> int:
     evaluation.add_argument("--docker-gpus", help="Docker GPU selection, e.g. device=6")
     evaluation.add_argument("--no-graph-baseline", dest="graph_baseline",
                             action="store_false")
+    evaluation.add_argument(
+        "--compiled-baselines", action="store_true",
+        help="also time capture-safe eager, HIP/CUDA graph, torch.compile, and "
+             "torch.compile+graph baselines; the fastest correct one joins "
+             "speedup_vs_best_baseline")
     evaluation.add_argument("--output")
     aggregate = sub.add_parser("aggregate", help="combine independent case sessions")
     aggregate.add_argument("--suite", choices=("core", "p0", "p1", "p2", "p3"),
@@ -414,6 +441,7 @@ def main(argv: list[str] | None = None) -> int:
     worker.add_argument("--result", required=True)
     worker.add_argument("--no-graph-baseline", dest="graph_baseline",
                         action="store_false")
+    worker.add_argument("--compiled-baselines", action="store_true")
     args = parser.parse_args(argv)
     if args.command == "_worker":
         return _worker(args)
