@@ -24,7 +24,7 @@ from .common import rms
 from .distributed import matrix
 from .frontier import route
 from .kimi import attention_residual, full_layer, kda_step, mxfp4_matrix, situ
-from .parallel import initialize
+from .parallel import exchange, exchange_counts, initialize
 from .quantization import unpack_mxfp4
 
 
@@ -186,13 +186,6 @@ def experts(values, rows, ids, first):
     return output
 
 
-def exchange(value, send_counts, receive_counts, group):
-    """``all_to_all_single`` with host-side split sizes along dim 0."""
-    output = value.new_empty((sum(receive_counts), *value.shape[1:]))
-    dist.all_to_all_single(output, value.contiguous(), receive_counts, send_counts, group=group)
-    return output
-
-
 def moe(case: Case, values, normalized, *, serial, group):
     """Routed latent experts over EP plus shared experts; rows are sequences.
 
@@ -218,11 +211,7 @@ def moe(case: Case, values, normalized, *, serial, group):
     if serial:
         output = experts(values, rows, ids, 0)
     else:
-        world = dist.get_world_size(group)
-        send = torch.bincount(owner, minlength=world)
-        receive = torch.empty_like(send)
-        dist.all_to_all_single(receive, send, group=group)
-        send, receive = send.tolist(), receive.tolist()
+        send, receive = exchange_counts(owner, group)
         arrived = exchange(rows, send, receive, group)
         arrived_ids = exchange(ids, send, receive, group)
         computed = experts(values, arrived, arrived_ids, rank*local)

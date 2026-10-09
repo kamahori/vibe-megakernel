@@ -3451,5 +3451,726 @@
         ]
       }
     }
+  },
+  "sesame/csm-1b": {
+    "revision": "c92a71e1c419772e25be7dc14d952c2521a740ab",
+    "config_url": "https://huggingface.co/sesame/csm-1b/resolve/c92a71e1c419772e25be7dc14d952c2521a740ab/config.json",
+    "config_mirror_url": "https://huggingface.co/unsloth/csm-1b/resolve/39e8c756bec133ad7eb9ea1097c84a2bd891c949/config.json",
+    "config_provenance": "sesame/csm-1b is gated and no HF token was available; config.json was read from the ungated unsloth/csm-1b mirror (base_model sesame/csm-1b) at the pinned mirror revision. Its git blob oid 3ff0829aa89999ba0bea9d5fdfc8a917709af1f4 differs from the upstream blob eb34392016242d345cec269e1623413f9071d910 (3121 vs 3280 bytes); generation_config.json is byte-identical (blob e7beaf68e64dcd17fee50190107117d29c357ec0). Re-check the upstream config with an authorized token.",
+    "upstream_config_blob_oid": "eb34392016242d345cec269e1623413f9071d910",
+    "config": {
+      "architectures": [
+        "CsmForConditionalGeneration"
+      ],
+      "attention_bias": false,
+      "attention_dropout": 0.0,
+      "audio_eos_token_id": 128003,
+      "audio_token_id": 128002,
+      "bos_token_id": 128000,
+      "codebook_eos_token_id": 0,
+      "codebook_pad_token_id": 2050,
+      "codec_config": {
+        "_name_or_path": "kyutai/mimi",
+        "architectures": [
+          "MimiModel"
+        ],
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "audio_channels": 1,
+        "codebook_dim": 256,
+        "codebook_size": 2048,
+        "compress": 2,
+        "dilation_growth_rate": 2,
+        "frame_rate": 12.5,
+        "head_dim": 64,
+        "hidden_act": "gelu",
+        "hidden_size": 512,
+        "initializer_range": 0.02,
+        "intermediate_size": 2048,
+        "kernel_size": 7,
+        "last_kernel_size": 3,
+        "layer_scale_initial_scale": 0.01,
+        "max_position_embeddings": 8000,
+        "model_type": "mimi",
+        "norm_eps": 1e-05,
+        "normalize": false,
+        "num_attention_heads": 8,
+        "num_filters": 64,
+        "num_hidden_layers": 8,
+        "num_key_value_heads": 8,
+        "num_quantizers": 32,
+        "num_residual_layers": 1,
+        "num_semantic_quantizers": 1,
+        "pad_mode": "constant",
+        "residual_kernel_size": 3,
+        "rope_theta": 10000.0,
+        "sampling_rate": 24000,
+        "sliding_window": 250,
+        "torch_dtype": "float32",
+        "trim_right_ratio": 1.0,
+        "upsample_groups": 512,
+        "upsampling_ratios": [
+          8,
+          6,
+          5,
+          4
+        ],
+        "use_cache": false,
+        "use_causal_conv": true,
+        "use_conv_shortcut": false,
+        "vector_quantization_hidden_dimension": 256
+      },
+      "depth_decoder_config": {
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "backbone_hidden_size": 2048,
+        "head_dim": 128,
+        "hidden_act": "silu",
+        "hidden_size": 1024,
+        "initializer_range": 0.02,
+        "intermediate_size": 8192,
+        "max_position_embeddings": 33,
+        "mlp_bias": false,
+        "model_type": "csm_depth_decoder_model",
+        "num_attention_heads": 8,
+        "num_codebooks": 32,
+        "num_hidden_layers": 4,
+        "num_key_value_heads": 2,
+        "rms_norm_eps": 1e-05,
+        "rope_scaling": {
+          "factor": 32.0,
+          "high_freq_factor": 0.0078125,
+          "low_freq_factor": 0.001953125,
+          "original_max_position_embeddings": 16,
+          "rope_type": "llama3"
+        },
+        "rope_theta": 500000,
+        "torch_dtype": "float32",
+        "use_cache": true,
+        "vocab_size": 2051
+      },
+      "head_dim": 64,
+      "hidden_act": "silu",
+      "hidden_size": 2048,
+      "initializer_range": 0.02,
+      "intermediate_size": 8192,
+      "max_position_embeddings": 2048,
+      "mlp_bias": false,
+      "model_type": "csm",
+      "num_attention_heads": 32,
+      "num_codebooks": 32,
+      "num_hidden_layers": 16,
+      "num_key_value_heads": 8,
+      "pad_token_id": 128004,
+      "rms_norm_eps": 1e-05,
+      "rope_scaling": {
+        "factor": 32.0,
+        "high_freq_factor": 0.5,
+        "low_freq_factor": 0.125,
+        "original_max_position_embeddings": 1024,
+        "rope_type": "llama3"
+      },
+      "rope_theta": 500000,
+      "text_vocab_size": 128256,
+      "tie_codebooks_embeddings": true,
+      "tie_word_embeddings": false,
+      "torch_dtype": "float16",
+      "transformers_version": "4.52.0.dev0",
+      "use_cache": true,
+      "vocab_size": 2051
+    },
+    "config_snapshot_sha256": "497208badddb751a2e0c2b2ebf1e7fd6f96e7dba200f54347b3ec52e2e52b0f1",
+    "generation_config": {
+      "bos_token_id": 128000,
+      "depth_decoder_do_sample": true,
+      "depth_decoder_temperature": 0.9,
+      "depth_decoder_top_k": 50,
+      "do_sample": true,
+      "max_new_tokens": 125,
+      "pad_token_id": 128002,
+      "temperature": 0.9,
+      "transformers_version": "4.52.0.dev0"
+    },
+    "source_files": {
+      "transformers/models/csm/modeling_csm.py": {
+        "sha256": "dc24a19adb02a97ba4c471fa685d4add69185d17aecef2ad4dc573854999b148",
+        "url": "https://raw.githubusercontent.com/huggingface/transformers/v5.17.0/src/transformers/models/csm/modeling_csm.py",
+        "package": "transformers==5.17.0"
+      },
+      "transformers/models/csm/generation_csm.py": {
+        "sha256": "055f0d3c7017f5007cd31988bef673d079a76ca2486fa879ee8cf1c23b66586d",
+        "url": "https://raw.githubusercontent.com/huggingface/transformers/v5.17.0/src/transformers/models/csm/generation_csm.py",
+        "package": "transformers==5.17.0"
+      },
+      "transformers/models/csm/configuration_csm.py": {
+        "sha256": "f23d847ec5a72bfba475720448dd06474de502eade9be59966fe1aa0ee7c100e",
+        "url": "https://raw.githubusercontent.com/huggingface/transformers/v5.17.0/src/transformers/models/csm/configuration_csm.py",
+        "package": "transformers==5.17.0"
+      }
+    }
+  },
+  "lerobot/pi05_base": {
+    "revision": "22c30e5b34f9e7ab738b1b34fc2fc5ecfe2d28f0",
+    "config_url": "https://huggingface.co/lerobot/pi05_base/resolve/22c30e5b34f9e7ab738b1b34fc2fc5ecfe2d28f0/config.json",
+    "config": {
+      "type": "pi05",
+      "n_obs_steps": 1,
+      "input_features": {
+        "observation.images.base_0_rgb": {
+          "type": "VISUAL",
+          "shape": [
+            3,
+            224,
+            224
+          ]
+        },
+        "observation.images.left_wrist_0_rgb": {
+          "type": "VISUAL",
+          "shape": [
+            3,
+            224,
+            224
+          ]
+        },
+        "observation.images.right_wrist_0_rgb": {
+          "type": "VISUAL",
+          "shape": [
+            3,
+            224,
+            224
+          ]
+        },
+        "observation.state": {
+          "type": "STATE",
+          "shape": [
+            32
+          ]
+        }
+      },
+      "output_features": {
+        "action": {
+          "type": "ACTION",
+          "shape": [
+            32
+          ]
+        }
+      },
+      "device": "mps",
+      "use_amp": false,
+      "push_to_hub": true,
+      "repo_id": null,
+      "private": null,
+      "tags": null,
+      "license": null,
+      "paligemma_variant": "gemma_2b",
+      "action_expert_variant": "gemma_300m",
+      "dtype": "float32",
+      "chunk_size": 50,
+      "n_action_steps": 50,
+      "max_action_dim": 32,
+      "max_state_dim": 32,
+      "num_inference_steps": 10,
+      "time_sampling_beta_alpha": 1.5,
+      "time_sampling_beta_beta": 1.0,
+      "min_period": 0.004,
+      "max_period": 4.0,
+      "image_resolution": [
+        224,
+        224
+      ],
+      "gradient_checkpointing": false,
+      "compile_model": false,
+      "compile_mode": "max-autotune",
+      "optimizer_lr": 2.5e-05,
+      "optimizer_betas": [
+        0.9,
+        0.95
+      ],
+      "optimizer_eps": 1e-08,
+      "optimizer_weight_decay": 0.01,
+      "optimizer_grad_clip_norm": 1.0,
+      "scheduler_warmup_steps": 1000,
+      "scheduler_decay_steps": 30000,
+      "scheduler_decay_lr": 2.5e-06,
+      "tokenizer_max_length": 200
+    },
+    "config_snapshot_sha256": "367869712a2847c27e95c431ecb03f17bec4eee01a63995e2fb2d91940752b53",
+    "preprocessor_url": "https://huggingface.co/lerobot/pi05_base/resolve/22c30e5b34f9e7ab738b1b34fc2fc5ecfe2d28f0/policy_preprocessor.json",
+    "preprocessor_sha256": "be2cd1acc33229d42be0640cb55b5d5a4bb3e8d8e27ddfcdcf3f99f1fe3beaef",
+    "lerobot_revision": "b9cb121cb7d4e3e26ec5c906d08dda68d151ba52",
+    "openpi_revision": "215abfb217dbac7d5f1273282331b9b1866c0479",
+    "architecture": {
+      "note": "Gemma variants are hardcoded in modeling_pi05.get_gemma_config / openpi gemma.get_config; SigLIP So400m/14 from transformers PaliGemmaConfig defaults with intermediate_size 4304.",
+      "paligemma_gemma_2b": {
+        "width": 2048,
+        "depth": 18,
+        "mlp_dim": 16384,
+        "num_heads": 8,
+        "num_kv_heads": 1,
+        "head_dim": 256,
+        "vocab": 257152
+      },
+      "action_expert_gemma_300m": {
+        "width": 1024,
+        "depth": 18,
+        "mlp_dim": 4096,
+        "num_heads": 8,
+        "num_kv_heads": 1,
+        "head_dim": 256
+      },
+      "siglip_so400m_14": {
+        "hidden": 1152,
+        "layers": 27,
+        "intermediate": 4304,
+        "heads": 16,
+        "patch": 14,
+        "image_size": 224,
+        "tokens_per_image": 256,
+        "projector": "Linear(1152, 2048, bias)"
+      },
+      "cameras": [
+        "base_0_rgb",
+        "left_wrist_0_rgb",
+        "right_wrist_0_rgb"
+      ],
+      "tokenizer_max_length": 200,
+      "chunk_size": 50,
+      "max_action_dim": 32,
+      "max_state_dim": 32,
+      "num_inference_steps": 10,
+      "min_period": 0.004,
+      "max_period": 4.0,
+      "state_bins": 256
+    },
+    "source_files": {
+      "lerobot/src/lerobot/policies/pi05/modeling_pi05.py": {
+        "url": "https://raw.githubusercontent.com/huggingface/lerobot/b9cb121cb7d4e3e26ec5c906d08dda68d151ba52/src/lerobot/policies/pi05/modeling_pi05.py",
+        "sha256": "fd6621b3c3bd8aa4540b811e44ccfb39ff9cc81dab8e1ec04671f5603a8afbeb"
+      },
+      "lerobot/src/lerobot/policies/pi05/configuration_pi05.py": {
+        "url": "https://raw.githubusercontent.com/huggingface/lerobot/b9cb121cb7d4e3e26ec5c906d08dda68d151ba52/src/lerobot/policies/pi05/configuration_pi05.py",
+        "sha256": "70ae7b309be07ff4a26404f51c2a0e84ee3a6d94e19d1ae1f9f48205b65131b3"
+      },
+      "lerobot/src/lerobot/policies/pi05/processor_pi05.py": {
+        "url": "https://raw.githubusercontent.com/huggingface/lerobot/b9cb121cb7d4e3e26ec5c906d08dda68d151ba52/src/lerobot/policies/pi05/processor_pi05.py",
+        "sha256": "ec5eacaefbbd4194d4989960c84639cdad5f69fc35eafb989dd097e19c79c993"
+      },
+      "lerobot/src/lerobot/policies/pi_gemma.py": {
+        "url": "https://raw.githubusercontent.com/huggingface/lerobot/b9cb121cb7d4e3e26ec5c906d08dda68d151ba52/src/lerobot/policies/pi_gemma.py",
+        "sha256": "8bfa462e151b8c8b5445c46373a1dd8aefb10483a62b381f1ebf863f2e79c015"
+      },
+      "lerobot/src/lerobot/policies/common/vla_utils.py": {
+        "url": "https://raw.githubusercontent.com/huggingface/lerobot/b9cb121cb7d4e3e26ec5c906d08dda68d151ba52/src/lerobot/policies/common/vla_utils.py",
+        "sha256": "88efbc82314a0ffd826f4693ff42fc580a5385424370b271351e2674cf0e33cb"
+      },
+      "lerobot/src/lerobot/policies/common/flow_matching.py": {
+        "url": "https://raw.githubusercontent.com/huggingface/lerobot/b9cb121cb7d4e3e26ec5c906d08dda68d151ba52/src/lerobot/policies/common/flow_matching.py",
+        "sha256": "73f3e5525e492286729e42b68b0057167bef1ad4d5a4d76bd44073c3a50ac48a"
+      },
+      "lerobot/src/lerobot/utils/constants.py": {
+        "url": "https://raw.githubusercontent.com/huggingface/lerobot/b9cb121cb7d4e3e26ec5c906d08dda68d151ba52/src/lerobot/utils/constants.py",
+        "sha256": "f53937a19250cadb842ee3dc7196e65cee3a79b3dcd8791a061f1664d44b0722"
+      },
+      "lerobot/src/lerobot/utils/device_utils.py": {
+        "url": "https://raw.githubusercontent.com/huggingface/lerobot/b9cb121cb7d4e3e26ec5c906d08dda68d151ba52/src/lerobot/utils/device_utils.py",
+        "sha256": "b4612793643feb15794cd55c39ba4671d2a1fa9f649116c91d563316cf6ace0c"
+      },
+      "openpi/src/openpi/models/pi0.py": {
+        "url": "https://raw.githubusercontent.com/Physical-Intelligence/openpi/215abfb217dbac7d5f1273282331b9b1866c0479/src/openpi/models/pi0.py",
+        "sha256": "24b32d7c6ed5e409459afa8ca5af96a4dae09c2dcdf48e828907e411f4f12342"
+      },
+      "openpi/src/openpi/models/gemma.py": {
+        "url": "https://raw.githubusercontent.com/Physical-Intelligence/openpi/215abfb217dbac7d5f1273282331b9b1866c0479/src/openpi/models/gemma.py",
+        "sha256": "7e42ada4ae7e9995f0ef3e33a0c224758323c2015e2d9d72ec15726a8a001d2a"
+      },
+      "openpi/src/openpi/models/pi0_config.py": {
+        "url": "https://raw.githubusercontent.com/Physical-Intelligence/openpi/215abfb217dbac7d5f1273282331b9b1866c0479/src/openpi/models/pi0_config.py",
+        "sha256": "d321858c30b398126035ea2b6da09e1c422eeeebb5ebf8df631daf9dc77647fa"
+      },
+      "openpi/src/openpi/models/siglip.py": {
+        "url": "https://raw.githubusercontent.com/Physical-Intelligence/openpi/215abfb217dbac7d5f1273282331b9b1866c0479/src/openpi/models/siglip.py",
+        "sha256": "14b4df0be280d5769fb0dc31a40cde27525dbb1980cc998c28475d62fa3cad32"
+      },
+      "openpi/src/openpi/models/tokenizer.py": {
+        "url": "https://raw.githubusercontent.com/Physical-Intelligence/openpi/215abfb217dbac7d5f1273282331b9b1866c0479/src/openpi/models/tokenizer.py",
+        "sha256": "965be8b3c393a6811875bbc32da9e01a5d01cc2f87802de801cf7293e049748c"
+      },
+      "openpi/src/openpi/models_pytorch/pi0_pytorch.py": {
+        "url": "https://raw.githubusercontent.com/Physical-Intelligence/openpi/215abfb217dbac7d5f1273282331b9b1866c0479/src/openpi/models_pytorch/pi0_pytorch.py",
+        "sha256": "dcd7b6f508808ce4b7170a1720a4c62c6da04edae3652d16c94a469dca924e16"
+      },
+      "openpi/src/openpi/models_pytorch/gemma_pytorch.py": {
+        "url": "https://raw.githubusercontent.com/Physical-Intelligence/openpi/215abfb217dbac7d5f1273282331b9b1866c0479/src/openpi/models_pytorch/gemma_pytorch.py",
+        "sha256": "225092e06509da0ae37bb9dca55c00d2804255bb1496f7c8700304b4c52a95eb"
+      }
+    }
+  },
+  "Overworld/Waypoint-1.5-1B": {
+    "revision": "391f92827075edcf4a8b3c8a2ddae010698f8636",
+    "config_url": "https://huggingface.co/Overworld/Waypoint-1.5-1B/resolve/391f92827075edcf4a8b3c8a2ddae010698f8636/transformer/config.json",
+    "config_snapshot_sha256": "e8687236872c11124c0f8d0c24f45ff7cab577166f90ac7048df5df60ca3886b",
+    "config": {
+      "_class_name": "WorldModel",
+      "_diffusers_version": "0.36.0.dev0",
+      "auto_map": {
+        "AutoModel": "model.WorldModel"
+      },
+      "d_model": 2048,
+      "n_heads": 32,
+      "n_kv_heads": 16,
+      "n_layers": 24,
+      "mlp_ratio": 4,
+      "channels": 32,
+      "height": 16,
+      "width": 32,
+      "patch": [
+        2,
+        2
+      ],
+      "tokens_per_frame": 512,
+      "n_frames": 512,
+      "local_window": 16,
+      "global_window": 128,
+      "global_attn_period": 4,
+      "global_pinned_dilation": 8,
+      "global_attn_offset": -1,
+      "value_residual": true,
+      "gated_attn": false,
+      "n_buttons": 256,
+      "ctrl_conditioning": true,
+      "ctrl_conditioning_period": 3,
+      "ctrl_cond_dropout": 0.0,
+      "prompt_conditioning": null,
+      "prompt_conditioning_period": 3,
+      "prompt_embedding_dim": 2048,
+      "prompt_cond_dropout": 0.0,
+      "noise_conditioning": "wan",
+      "base_fps": 15,
+      "causal": true,
+      "mlp_gradient_checkpointing": true,
+      "block_gradient_checkpointing": true,
+      "rope_impl": "ortho",
+      "moe": false,
+      "moe_top_k": 2,
+      "moe_n_experts": 8,
+      "moe_mlp_ratio": null,
+      "gated_linear": false,
+      "temporal_compression": 4,
+      "inference_fps": 60,
+      "taehv_ae": true,
+      "rope_nyquist_frac": 0.8,
+      "rope_theta": 10000.0,
+      "scheduler_sigmas": [
+        1.0,
+        0.9,
+        0.75,
+        0.3,
+        0.0
+      ]
+    },
+    "pipeline_config": {
+      "url": "https://huggingface.co/Overworld/Waypoint-1.5-1B/resolve/391f92827075edcf4a8b3c8a2ddae010698f8636/config.yaml",
+      "sha256": "5f335e4a0e12aa0c99691214ff509fac69449087ae12c5d2073272de96815feb",
+      "note": "world_engine config.yaml; same transformer fields as transformer/config.json (ctrl_conditioning: true, no rope_* keys, so upstream defaults rope_nyquist_frac 0.8 / rope_theta 10000 apply)."
+    },
+    "model_card": {
+      "url": "https://huggingface.co/Overworld/Waypoint-1.5-1B/resolve/391f92827075edcf4a8b3c8a2ddae010698f8636/README.md",
+      "sha256": "e8294072853f5ad396350040d51eca257d8bb5c534d5e5cabfafedce018ee47b",
+      "license": "apache-2.0 (weights)",
+      "serving": "torch_dtype=bfloat16, apply_inference_patches(), transformer.compile(fullgraph=True); latent 32x64 from a 1024x512 image (vae_scale_factor 16)"
+    },
+    "source_files": {
+      "transformer/model.py": {
+        "url": "https://huggingface.co/Overworld/Waypoint-1.5-1B/resolve/391f92827075edcf4a8b3c8a2ddae010698f8636/transformer/model.py",
+        "sha256": "3f353fda78b9d50ed91b82983d6f57ec10e2692c75a03da79eab5921d4e59105",
+        "license": "GPL-3.0-or-later (file header: Copyright (C) 2025 Hugging Face Team and Overworld). Not vendored; MegaBench reference is clean-room. Model card declares apache-2.0 for the weights."
+      },
+      "modular_blocks.py": {
+        "url": "https://huggingface.co/Overworld/Waypoint-1.5-1B/resolve/391f92827075edcf4a8b3c8a2ddae010698f8636/modular_blocks.py",
+        "sha256": "5d6262006d6e54daa11fc5fa5fde427ee9aa735209b9dea6f9239be268f57ab0",
+        "license": "GPL-3.0-or-later (file header: Copyright (C) 2025 Hugging Face Team and Overworld). Not vendored; MegaBench reference is clean-room. Model card declares apache-2.0 for the weights."
+      },
+      "__init__.py": {
+        "url": "https://huggingface.co/Overworld/Waypoint-1.5-1B/resolve/391f92827075edcf4a8b3c8a2ddae010698f8636/__init__.py",
+        "sha256": "e19bb125ffa6da6a4165f7d24d5c310825b7ba6485d279fb41c2cb3d5e2b3b31",
+        "license": "GPL-3.0-or-later (file header: Copyright (C) 2025 Hugging Face Team and Overworld). Not vendored; MegaBench reference is clean-room. Model card declares apache-2.0 for the weights."
+      },
+      "transformer/__init__.py": {
+        "url": "https://huggingface.co/Overworld/Waypoint-1.5-1B/resolve/391f92827075edcf4a8b3c8a2ddae010698f8636/transformer/__init__.py",
+        "sha256": "d467e23008bfdaccae83318f16cf6e0e5b7edd267f54b4dbafaa632de99ed185",
+        "license": "GPL-3.0-or-later (file header: Copyright (C) 2025 Hugging Face Team and Overworld). Not vendored; MegaBench reference is clean-room. Model card declares apache-2.0 for the weights."
+      }
+    },
+    "checkpoint": {
+      "transformer/diffusion_pytorch_model.safetensors": {
+        "dtype": "F32",
+        "tensors": 393,
+        "parameters": 1860823096,
+        "lfs_sha256": "467ea80d76f63a82a2f5ba80d1170c27dc1060e60c3ede341105bff89b468700"
+      },
+      "model.safetensors": {
+        "dtype": "BF16",
+        "tensors": 393,
+        "bytes": 3721694304
+      }
+    },
+    "sample_native_tensors": {
+      "transformer.blocks.0.attn.q_proj.weight": {
+        "dtype": "F32",
+        "shape": [
+          2048,
+          2048
+        ]
+      },
+      "transformer.blocks.0.attn.k_proj.weight": {
+        "dtype": "F32",
+        "shape": [
+          1024,
+          2048
+        ]
+      },
+      "transformer.blocks.0.attn.v_lamb": {
+        "dtype": "F32",
+        "shape": []
+      },
+      "transformer.blocks.0.attn_cond_head.bias_in": {
+        "dtype": "F32",
+        "shape": [
+          2048
+        ]
+      },
+      "transformer.blocks.0.ctrl_mlpfusion.fc1_x.weight": {
+        "dtype": "F32",
+        "shape": [
+          2048,
+          2048
+        ]
+      },
+      "transformer.blocks.0.dit_mlp.fc1.weight": {
+        "dtype": "F32",
+        "shape": [
+          8192,
+          2048
+        ]
+      },
+      "denoise_step_emb.mlp.fc1.weight": {
+        "dtype": "F32",
+        "shape": [
+          8192,
+          512
+        ]
+      },
+      "ctrl_emb.mlp.fc1.weight": {
+        "dtype": "F32",
+        "shape": [
+          8192,
+          259
+        ]
+      },
+      "patchify.weight": {
+        "dtype": "F32",
+        "shape": [
+          2048,
+          32,
+          2,
+          2
+        ]
+      },
+      "unpatchify.weight": {
+        "dtype": "F32",
+        "shape": [
+          2048,
+          32,
+          2,
+          2
+        ]
+      },
+      "unpatchify.bias": {
+        "dtype": "F32",
+        "shape": [
+          32
+        ]
+      },
+      "out_norm.fc.weight": {
+        "dtype": "F32",
+        "shape": [
+          4096,
+          2048
+        ]
+      }
+    }
+  },
+  "deepseek-ai/DeepSeek-V4-Pro": {
+    "revision": "b5968e9190ef611bbf34a7229255be88a0e937c1",
+    "config_url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/resolve/b5968e9190ef611bbf34a7229255be88a0e937c1/config.json",
+    "config": {
+      "architectures": [
+        "DeepseekV4ForCausalLM"
+      ],
+      "attention_bias": false,
+      "attention_dropout": 0.0,
+      "bos_token_id": 0,
+      "eos_token_id": 1,
+      "expert_dtype": "fp4",
+      "hc_eps": 1e-06,
+      "hc_mult": 4,
+      "hc_sinkhorn_iters": 20,
+      "head_dim": 512,
+      "hidden_act": "silu",
+      "hidden_size": 7168,
+      "index_head_dim": 128,
+      "index_n_heads": 64,
+      "index_topk": 1024,
+      "initializer_range": 0.02,
+      "max_position_embeddings": 1048576,
+      "model_type": "deepseek_v4",
+      "moe_intermediate_size": 3072,
+      "n_routed_experts": 384,
+      "n_shared_experts": 1,
+      "norm_topk_prob": true,
+      "num_attention_heads": 128,
+      "num_experts_per_tok": 6,
+      "num_hidden_layers": 61,
+      "num_hash_layers": 3,
+      "num_key_value_heads": 1,
+      "num_nextn_predict_layers": 1,
+      "o_groups": 16,
+      "o_lora_rank": 1024,
+      "q_lora_rank": 1536,
+      "qk_rope_head_dim": 64,
+      "quantization_config": {
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "scale_fmt": "ue8m0",
+        "weight_block_size": [
+          128,
+          128
+        ]
+      },
+      "rms_norm_eps": 1e-06,
+      "rope_scaling": {
+        "beta_fast": 32,
+        "beta_slow": 1,
+        "factor": 16,
+        "original_max_position_embeddings": 65536,
+        "type": "yarn"
+      },
+      "rope_theta": 10000,
+      "routed_scaling_factor": 2.5,
+      "scoring_func": "sqrtsoftplus",
+      "sliding_window": 128,
+      "swiglu_limit": 10.0,
+      "tie_word_embeddings": false,
+      "topk_method": "noaux_tc",
+      "torch_dtype": "bfloat16",
+      "transformers_version": "4.57.1",
+      "use_cache": true,
+      "vocab_size": 129280,
+      "compress_rope_theta": 160000,
+      "compress_ratios": [
+        128,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        0
+      ]
+    },
+    "config_snapshot_sha256": "5fe4568daee51c208cb8a79538eaeda090ae011ade1dee2c386aa95f569c810e",
+    "source_files": {
+      "deepgemm/math.py": {
+        "sha256": "9cdecd0c0a0a8b3c64af87107464c91510876110eb80bdb485ff1f74eda8ea0e",
+        "url": "https://raw.githubusercontent.com/deepseek-ai/DeepGEMM/057ca5964aae0879ff2e0eb71ee05a3cb0ba3df7/deep_gemm/utils/math.py"
+      },
+      "deepgemm/test_mega_moe.py": {
+        "sha256": "4d6fce154af66db56c8bc8051755e596833acb332f82ca0479ed3f72410a9ff7",
+        "url": "https://raw.githubusercontent.com/deepseek-ai/DeepGEMM/057ca5964aae0879ff2e0eb71ee05a3cb0ba3df7/tests/test_mega_moe.py"
+      },
+      "deepgemm/swiglu_apply_weight_to_fp8.py": {
+        "sha256": "301783c3429005bc8bf8ba9f1773e6e88b23fbc7787b00131598d412518d83de",
+        "url": "https://raw.githubusercontent.com/deepseek-ai/DeepGEMM/057ca5964aae0879ff2e0eb71ee05a3cb0ba3df7/third-party/tilelang_ops/swiglu_apply_weight_to_fp8.py"
+      },
+      "deepgemm/tilelang_utils.py": {
+        "sha256": "aab1e23090a64f2dcf83f199dd300be82e61c857569760ff9ecf206c64ce66c9",
+        "url": "https://raw.githubusercontent.com/deepseek-ai/DeepGEMM/057ca5964aae0879ff2e0eb71ee05a3cb0ba3df7/third-party/tilelang_ops/utils.py"
+      },
+      "deepgemm/mega.py": {
+        "sha256": "76ca530af15eaace8f868e091cd8562c93a0266e8d6ae9febed1ef778c95b1ce",
+        "url": "https://raw.githubusercontent.com/deepseek-ai/DeepGEMM/057ca5964aae0879ff2e0eb71ee05a3cb0ba3df7/deep_gemm/mega/__init__.py"
+      },
+      "deepgemm/sm100_fp8_fp4_mega_moe.cuh": {
+        "sha256": "9d577f200e482fb2deed3e9d8a8b6ec0f71d15df2782d4b8f0a5321102ccc970",
+        "url": "https://raw.githubusercontent.com/deepseek-ai/DeepGEMM/057ca5964aae0879ff2e0eb71ee05a3cb0ba3df7/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh"
+      },
+      "deepgemm/math.cuh": {
+        "sha256": "576e9db1a1889087f77b3f74d74d011bf452f16c0e5c030bdd661e961c074ddc",
+        "url": "https://raw.githubusercontent.com/deepseek-ai/DeepGEMM/057ca5964aae0879ff2e0eb71ee05a3cb0ba3df7/deep_gemm/include/deep_gemm/common/math.cuh"
+      },
+      "inference/model.py": {
+        "sha256": "ce962f1face79d4f633d36436576214057a7e11443c9789935e1deb5c6cd1d71",
+        "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/resolve/b5968e9190ef611bbf34a7229255be88a0e937c1/inference/model.py"
+      },
+      "transformers/modeling_deepseek_v4.py": {
+        "sha256": "31ec07d1baacdfd7e2dc2414cbee7d7b346f84d100b8b219915d91545a9635fa",
+        "url": "https://raw.githubusercontent.com/huggingface/transformers/595ff117c8412ec01262084058276e6b27a857d9/src/transformers/models/deepseek_v4/modeling_deepseek_v4.py"
+      }
+    }
   }
 }

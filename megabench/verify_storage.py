@@ -61,7 +61,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', required=True, type=Path)
     args = parser.parse_args()
-    cases = select_cases('p3')
+    # MegaMoE inputs are generated directly at their storage dtypes; see verify_megamoe.
+    cases = [case for case in select_cases('p3') if case.family != 'megamoe_layer']
     kimi = next(case for case in cases if case.family == 'kimi_k3_step')
     cases.append(replace(kimi, gpus=8, tp=8))
     results = [audit(case) for case in cases]

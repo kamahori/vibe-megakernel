@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
 import torch.distributed as dist
 
 from ..cases import Case
@@ -46,3 +47,22 @@ def initialize(case: Case) -> ParallelContext:
     context = ParallelContext(rank, rank % case.tp, rank // case.tp, tp_group, ep_group)
     _CONTEXT = (world_group, case.tp, case.ep, rank, context)
     return context
+
+
+def exchange(value, send_counts, receive_counts, group):
+    """``all_to_all_single`` with host-side split sizes along dim 0."""
+    output = value.new_empty((sum(receive_counts), *value.shape[1:]))
+    dist.all_to_all_single(output, value.contiguous(), receive_counts, send_counts, group=group)
+    return output
+
+
+def exchange_counts(owner, group):
+    """Host-side send/receive row counts for rows destined to ``owner`` ranks.
+
+    Callers order rows stably by owner first, so every destination receives
+    the source's rows in their original order.
+    """
+    send = torch.bincount(owner, minlength=dist.get_world_size(group))
+    receive = torch.empty_like(send)
+    dist.all_to_all_single(receive, send, group=group)
+    return send.tolist(), receive.tolist()

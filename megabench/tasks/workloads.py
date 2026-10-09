@@ -21,6 +21,8 @@ TASK_MODULES = {
     "distributed_step": "distributed",
     "deepseek_v32_step": "frontier", "glm52_step": "frontier",
     "kimi_k3_step": "kimi", "glm53_flash_step": "glm53", "kimi_k3_layer": "kimi_layer",
+    "tts_frame_step": "csm", "vla_action_step": "pi05",
+    "world_frame_step": "waypoint", "megamoe_layer": "megamoe",
 }
 
 

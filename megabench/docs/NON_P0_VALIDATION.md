@@ -6,7 +6,8 @@ revisions, configuration hashes, source hashes, and sampled native checkpoint
 tensor layouts are recorded in [`model_specs.json`](../tasks/model_specs.json).
 The current scoring gate is `Case.ready` in [`cases.py`](../cases.py).
 Full Kimi-K3 decode is deferred at the user's request; it remains visible and
-disabled. Two single-layer Kimi-K3 EP8 cases are enabled instead.
+disabled. Two single-layer Kimi-K3 EP8 cases are enabled instead, as are the
+two MegaMoE EP8 layer cases.
 
 | Case | Implementation and timed boundary | Validation and current gate |
 | --- | --- | --- |
@@ -21,6 +22,10 @@ disabled. Two single-layer Kimi-K3 EP8 cases are enabled instead.
 | GLM-5.3-Flash TP4 | All 45 layers: mHC (4 streams, 20 Sinkhorn iterations), 34 KDA and 11 NoPE MLA/DSA layers, block FP8 weights, 288-expert MoE | Pinned transformers 5.17.0 `Glm5NextTextModel` decode matches every output for three seeds; CPU TP2/TP4 rollouts and candidate harness pass; full four-B200 three-step rollout passes with exact replicated-state agreement; enabled |
 | Kimi-K3 layer EP8 (KDA layer 61, MLA layer 63) | One mid-block layer per attention variant: attention residuals, DP attention over 8 sequences per rank, EP8 MXFP4 experts with all-to-all dispatch/combine, latent norm/up and shared experts | Matches the whole-model Kimi reference's layer slice; CPU 2/8-rank all-to-all equals the serial 64-sequence batch; candidate harness passes; full eight-B200 EP8 outputs equal the serial run bit for bit for both seeds; enabled |
 | Kimi-K3 TP16 | All 93 layers, 69 KDA/24 gated MLA, attention residuals, BF16 latent/shared paths and native MXFP4 routed experts | Official pinned decoder/FLA oracle, eight-step independent KDA recurrence and 16-rank CPU protocol pass; deferred by request; disabled |
+| CSM-1B audio frame | Previous-frame code embedding, all 16 backbone layers with KV append, codebook 0, then 31 sequential depth-decoder steps with per-codebook heads | Pinned transformers `CsmForConditionalGeneration` matches greedy codes and teacher-forced logits on CPU; teacher-forced grading accepts at most four near-greedy departures; full B200 validation pending; disabled |
+| π0.5 action chunk | Untimed SigLIP/PaliGemma prefix fixture; ten timed Euler steps of the 18-layer action expert with adaRMS time conditioning | Pinned LeRobot `PI05Pytorch` matches end to end on CPU (relative L2 0.0013 at reduced geometry); full B200 validation pending; disabled |
+| Waypoint-1.5-1B latent frame | Four denoise passes and the σ=0 cache-commit pass over 512 tokens, local and dilated global rolling KV, controller fusion layers | Clean-room reference; pinned upstream `model.py`/`modular_blocks.py` match in FP32 (relative K/V write error 2.5e-7) and BF16 on CPU; full B200 validation pending; disabled |
+| MegaMoE DeepSeek-V4-Pro EP8 (512, 4,096 tokens per rank) | Routed experts only: FP8 dispatch, FP8×MXFP4 gate/up, clamped SwiGLU, weighted per-32 FP8 requantization, down projection, combine | Pinned DeepGEMM quantizers and Transformers `DeepseekV4Experts` agree with the unquantized path to 7e-5; CPU and full eight-B200 EP8 outputs equal the serial run bit for bit for both seeds and both sizes; candidate harness passes; enabled |
 
 The full EAGLE iteration consumes target features entering layers 2, 16 and
 29, matching the pinned EAGLE implementation. The corrected taps agree with
@@ -177,6 +182,26 @@ result with a serial single-rank run of all 64 sequences, at full geometry too:
   -m megabench.verify_kimi_layer --case kimi-k3-kda-layer-ep8 \
   --device cuda --full --trials 2 --output /path/kimi-kda-layer
 ```
+
+MegaMoE uses the same pattern: every rank's EP8 output must equal its slice of
+a serial run holding all 8×`tokens` tokens and every expert. The single-GPU
+multimodal cases check their primary sources with their own probes and their
+full geometry through the harness:
+
+```bash
+.venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=8 \
+  -m megabench.verify_megamoe --case megamoe-layer-deepseek-v4-pro-ep8-t4096 \
+  --device cuda --full --trials 2 --output /path/megamoe-t4096
+.venv/bin/python -m megabench.verify_csm_primary --full --device cuda
+.venv/bin/python -m megabench.verify_pi05_primary --src /path/lerobot --output /path/pi05.json
+.venv/bin/python -m megabench.verify_waypoint_primary --src /path/Waypoint-1.5-1B
+.venv/bin/python -m megabench.verify_megamoe_primary --src /path/DeepGEMM \
+  --output /path/megamoe-primary.json
+```
+
+The π0.5, Waypoint and MegaMoE probes take local checkouts of the pinned
+upstream sources and check every file's sha256 against `model_specs.json`
+before using it.
  Omit `--full` and use `--device cpu`
 for development protocol checks. A one-GPU allocation can separately run
 `python -m megabench.verify_kimi_shard --output /path/kimi-shard.json`; its
@@ -263,3 +288,19 @@ An earlier job 4787 used batched projections. GPU BF16 GEMMs round
 differently for 8 and 64 rows, so the EP and serial results differed. The
 reference now computes dense projections one token at a time, as the whole-model
 Kimi reference does. Expert GEMMs see the same rows in both layouts.
+
+### MegaMoE EP8 layers
+
+Campaign `experiments/2026-10-08/22-30-00-multimodal-megamoe-gpu-validation/`.
+Eight-B200 job 4889 (commit 125d175 with the two cases set ready) ran
+`verify_megamoe --full` and the harness with the reference submission for
+both sizes. For both seeds, every rank's EP output equaled its slice of the
+serial run bit for bit, at 3,072 and 24,576 routed rows per rank. The BF16
+reference differed from the FP32 oracle by 1.32% relative L2 (max absolute
+error 0.98–1.11 against peaks of 62–66). Rank 0, which also holds the serial
+oracle, peaked at 16.5 GB (t512) and 25.5 GB (t4096) allocated; other ranks at
+3.1 GB and 4.7 GB. The harness passed correctness on all ranks for two
+seeds. The slowest rank's eager CUDA-event median was 67.8 ms (t512) and
+75.2 ms (t4096), with 3,293–3,307 kernels per rank, so the
+reference is `non_megakernel`, as expected. Each verify step took about a
+minute and each harness run about 45 s; the job took 3 min 35 s.

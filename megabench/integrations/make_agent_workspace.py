@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from ..cases import Case, select_cases
+from ..sol import WORK_MODELS
 from .make_vibesys_case_task import make_task
 
 
@@ -31,6 +32,10 @@ REFERENCE_FILES = {
     "kimi_k3_step": ("kimi.py", "frontier.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
     "kimi_k3_layer": ("kimi_layer.py", "kimi.py", "frontier.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
     "glm53_flash_step": ("glm53.py", "frontier.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
+    "tts_frame_step": ("csm.py", "common.py"),
+    "vla_action_step": ("pi05.py", "vision.py", "common.py"),
+    "world_frame_step": ("waypoint.py", "common.py"),
+    "megamoe_layer": ("megamoe.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
 }
 OUTPUT_KEYS = {
     "dense_step": ("logits", "next_token", "k_write", "v_write"),
@@ -50,6 +55,10 @@ OUTPUT_KEYS = {
     "kimi_k3_layer": ("prefix", "expert_ids"),
     "glm53_flash_step": ("logits", "next_token", "kv_write", "index_k_write", "index_gate_write", "index_scores",
                          "sparse_mask", "recurrent_state", "conv_state", "expert_ids"),
+    "tts_frame_step": ("codes", "logits", "k_write", "v_write"),
+    "vla_action_step": ("actions",),
+    "world_frame_step": ("latent", "k_write", "v_write"),
+    "megamoe_layer": ("y",),
     "spec_full_iteration": ("logits", "proposed_tokens", "tree_parents", "accepted_count",
                             "proposed_count", "committed_count", "committed_tokens",
                             "cache_length", "draft_cache_length", "target_features",
@@ -225,6 +234,15 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "The budget includes NCCL kernels and is one GPU launch per rank. "
         "Use an allocation with all required GPUs visible. Nsight capture of spawned "
         "ranks requires `--target-processes all`.\n\n" if case.family == "kimi_k3_layer" else
+        f"The evaluator starts {case.gpus} rank processes with EP={case.ep}. "
+        "`build(case)` receives `case['execution']`: rank, world_size, tp_rank, ep_rank, "
+        f"device, backend, and live tp_group/ep_group handles. Each rank holds {case.params['tokens']} "
+        f"tokens with their routing and owns {case.params['experts'] // case.ep} contiguous experts. "
+        "Token rows must reach the ranks that own their experts and the expert outputs must "
+        "return to their source rank (the reference uses all-to-all). Complete all "
+        "communication inside run. The budget includes NCCL kernels and is one GPU launch per rank. "
+        "Use an allocation with all required GPUs visible. Nsight capture of spawned "
+        "ranks requires `--target-processes all`.\n\n" if case.family == "megamoe_layer" else
         f"The evaluator starts {case.gpus} rank processes, with TP={case.tp}, EP={case.ep}. "
         "`build(case)` receives `case['execution']`: rank, world_size, tp_rank, ep_rank, "
         "device, backend, and live tp_group/ep_group handles. "
@@ -238,6 +256,8 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         f"# {case.id}\n\n" +
         (f"Implement one {case.model} decoder layer (layer {case.params['layer']}) {case.phase} step with the "
          if case.family == "kimi_k3_layer" else
+         f"Implement the routed experts of one {case.model} MoE layer, dispatch through combine, with the "
+         if case.family == "megamoe_layer" else
          f"Implement one complete {case.model} {case.phase} step with the ") +
         f"public geometry in `case.json`. Read `reference/megabench/tasks/{module}.py` "
         "and its included helpers for input layouts and exact PyTorch math.\n\n"
@@ -254,8 +274,11 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "kernel feedback. The capture command must set `TMPDIR=/tmp`, "
         "`TMP=/tmp`, and `TEMP=/tmp` inside the agent sandbox and pass "
         "`--profile-from-start off` to capture the warmed marker window. "
-        "Use `./sol_info --json` for an optimistic HBM "
-        "speed-of-light floor and byte breakdown; pass `--result PATH` for "
+        "Use `./sol_info --json` for an optimistic " +
+        ("speed-of-light floor (the largest of the HBM, tensor-core and NVLink "
+         "bounds) with byte and FLOP breakdowns" if case.family in WORK_MODELS
+         else "HBM speed-of-light floor and byte breakdown") +
+        "; pass `--result PATH` for "
         "the gap to a checked CUDA-event result where a traffic model is available. "
         "The default bandwidth is 8 TB/s per B200. These commands load the trusted benchmark outside "
         "this workspace; final grading is run separately.\n")

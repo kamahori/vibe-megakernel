@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from dataclasses import replace
 
-from ..cases import select_cases
+from ..cases import LAYER_FAMILIES, select_cases
 from ..harness.distributed import evaluate_distributed, worst_rank_timing
 from .distributed_probe import development
 from .test_frontier import development as frontier_development
@@ -29,7 +29,7 @@ def one_per_family(cases):
 
 class DistributedReferenceTests(unittest.TestCase):
     def test_frontier_state_rollouts_match_serial_oracles(self):
-        cases = one_per_family(case for case in select_cases('p3') if case.family != 'kimi_k3_layer')
+        cases = one_per_family(case for case in select_cases('p3') if case.family not in LAYER_FAMILIES)
         checks = [(case,2) for case in cases] + [(case,8) for case in cases[:2]]
         for case,ranks in checks:
             with self.subTest(case=case.id,ranks=ranks), tempfile.TemporaryDirectory() as directory:
@@ -53,8 +53,8 @@ class DistributedReferenceTests(unittest.TestCase):
     def test_frontier_native_outputs_pass_the_submission_harness(self):
         submission = Path(__file__).parents[1] / 'examples/reference_submission.py'
         for original in one_per_family(select_cases('p3')):
-            if original.family == 'kimi_k3_layer':
-                continue  # tests/test_kimi_layer.py runs these through the harness.
+            if original.family in LAYER_FAMILIES:
+                continue  # test_kimi_layer.py and test_megamoe.py run these through the harness.
             with self.subTest(case=original.id):
                 tiny = {'kimi_k3_step':kimi_development, 'glm53_flash_step':glm53_development}.get(
                     original.family, frontier_development)(original)

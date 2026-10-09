@@ -65,7 +65,9 @@ def make_task(case_id: str, root: Path,
               "vl_decode_step": "vision", "spec_full_iteration": "speculative",
               "distributed_step": "distributed", "deepseek_v32_step": "frontier",
               "glm52_step": "frontier", "kimi_k3_step": "kimi",
-              "glm53_flash_step": "glm53", "kimi_k3_layer": "kimi_layer"}[case.family]
+              "glm53_flash_step": "glm53", "kimi_k3_layer": "kimi_layer",
+              "tts_frame_step": "csm", "vla_action_step": "pi05",
+              "world_frame_step": "waypoint", "megamoe_layer": "megamoe"}[case.family]
     (task / "OBJECTIVE.md").write_text(
         f"# One MegaBench case: {case_id}\n\n"
         f"Implement only `{case_id}`: {case.model}, {case.phase}, geometry "
