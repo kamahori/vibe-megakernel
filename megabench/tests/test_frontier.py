@@ -59,20 +59,30 @@ class FrontierMathTests(unittest.TestCase):
                     for short,long in (('iq','wq_b'),('ik','wk')):
                         module = getattr(indexer,long)
                         module.weight.copy_(unpack_fp8_weight(values['l0_'+short],values['l0_'+short+'_scale']))
-                        module.register_forward_pre_hook(lambda module,args:(quantize(args[0]),))
+                        # TileRT's DeepSeek wq_b consumes the BF16 q residual (W8A16).
+                        activation = (lambda value: value.float()) if deepseek and short == 'iq' else quantize
+                        module.register_forward_pre_hook(lambda module,args,activation=activation:(activation(args[0]),))
                         module.register_forward_hook(lambda module,args,out:out.to(torch.bfloat16))
                     indexer.k_norm.to(torch.bfloat16)
                     indexer.k_norm.weight.copy_(values['l0_inorm'])
                     indexer.k_norm.bias.copy_(values['l0_ibias'])
                     indexer.weights_proj.weight.copy_(values['l0_iw'])
-                    norm = norm_class(p['hidden'],eps=1e-6 if deepseek else 1e-5).to(torch.bfloat16)
-                    norm.weight.copy_(values['ln1'][0])
-                    hidden = norm(values['embed'][values['token']])[None,None]
-                    qnorm = norm_class(p['q_lora_rank'],eps=1e-6).to(torch.bfloat16)
-                    qnorm.weight.copy_(values['l0_qn'])
+                    if deepseek:
+                        # TileRT publishes the head weights as BF16.
+                        indexer.weights_proj.register_forward_hook(lambda module,args,out:out.to(torch.bfloat16))
                     qa = torch.nn.Linear(p['hidden'],p['q_lora_rank'],bias=False)
                     qa.weight.copy_(unpack_fp8_weight(values['l0_qa'],values['l0_qa_scale']))
-                    q_resid = qnorm(qa(quantize(hidden)).to(torch.bfloat16))
+                    if deepseek:
+                        # TileRT multiplies the FP32 gamma before rounding once.
+                        hidden = rms(values['embed'][values['token']],values['ln1'][0],eps=1e-6,weight_in_fp32=True)[None,None]
+                        q_resid = rms(qa(quantize(hidden)).to(torch.bfloat16),values['l0_qn'],eps=1e-6,weight_in_fp32=True)
+                    else:
+                        norm = norm_class(p['hidden'],eps=1e-5).to(torch.bfloat16)
+                        norm.weight.copy_(values['ln1'][0])
+                        hidden = norm(values['embed'][values['token']])[None,None]
+                        qnorm = norm_class(p['q_lora_rank'],eps=1e-6).to(torch.bfloat16)
+                        qnorm.weight.copy_(values['l0_qn'])
+                        q_resid = qnorm(qa(quantize(hidden)).to(torch.bfloat16))
                     def native_coordinates(value):
                         if not deepseek:
                             # HF emits half-split rotated pairs; native MLA/index cache uses interleaved pairs.
@@ -84,6 +94,10 @@ class FrontierMathTests(unittest.TestCase):
                     written = {}
                     class NativeCache:
                         def update_indexer(self,key,layer):
+                            if deepseek:
+                                # TileRT keeps a BF16 Hadamard-domain key cache.
+                                written.update(key=native_coordinates(key)[0,0])
+                                return torch.cat((values['l0_index_cache'][None],native_coordinates(key)),1).float()
                             payload,scale = pack_fp8_activation(native_coordinates(key),power_of_two=deepseek)
                             written.update(payload=payload[0,0],scale=scale[0,0])
                             old = unpack_fp8_activation(values['l0_index_cache'],values['l0_index_cache_scale'])[None]
@@ -91,16 +105,21 @@ class FrontierMathTests(unittest.TestCase):
                     matmul = torch.matmul
                     def native_matmul(left,right,*args,**kwargs):
                         if left.shape[-1] == p['index_dim'] and right.shape[-2] == p['index_dim']:
-                            left = quantize(native_coordinates(left))
+                            left = native_coordinates(left).float() if deepseek else quantize(native_coordinates(left))
                         return matmul(left,right,*args,**kwargs)
                     position = torch.tensor([[p['context']]])
+                    # DeepSeek rotates with FP32 tables (TileRT); GLM with BF16 ones.
+                    rotary = rotary_class(config)(hidden.float() if deepseek else hidden,position)
                     with patch('torch.matmul',native_matmul):
-                        selected = indexer(hidden,q_resid,rotary_class(config)(hidden,position),
+                        selected = indexer(hidden,q_resid,rotary,
                                            torch.zeros(1,1,p['context']+1),position,NativeCache())[0,0]
                     actual = frontier.reference(case,values,serial=True)
                     torch.testing.assert_close(actual['sparse_indices'][0],selected,rtol=0,atol=0)
-                    torch.testing.assert_close(actual['index_k_write'][0].float(),written['payload'].float(),rtol=0,atol=0)
-                    torch.testing.assert_close(actual['index_scale_write'][0],written['scale'],rtol=0,atol=0)
+                    if deepseek:
+                        torch.testing.assert_close(actual['index_k_write'][0],written['key'],rtol=0,atol=0)
+                    else:
+                        torch.testing.assert_close(actual['index_k_write'][0].float(),written['payload'].float(),rtol=0,atol=0)
+                        torch.testing.assert_close(actual['index_scale_write'][0],written['scale'],rtol=0,atol=0)
 
     def test_absorbed_mla_matches_independent_expanded_attention(self):
         from transformers import DynamicCache
@@ -136,7 +155,9 @@ class FrontierMathTests(unittest.TestCase):
                         module.float()
                     module.weight.copy_(unpack_fp8_weight(values['l0_'+short],values['l0_'+short+'_scale']))
                     if short != 'kb':
-                        module.register_forward_pre_hook(lambda module,args: (quantized(args[0]),))
+                        # DeepSeek (TileRT) quantizes only the input-norm projections.
+                        activation = (lambda value: value.float()) if deepseek and short in ('qb','o') else quantized
+                        module.register_forward_pre_hook(lambda module,args,activation=activation: (activation(args[0]),))
                         module.register_forward_hook(lambda module,args,out:out.to(torch.bfloat16))
                     else:
                         module.to(torch.bfloat16)
@@ -146,9 +167,12 @@ class FrontierMathTests(unittest.TestCase):
                 attention.kv_a_layernorm.to(torch.bfloat16)
                 attention.q_a_layernorm.weight.copy_(values['l0_qn'])
                 attention.kv_a_layernorm.weight.copy_(values['l0_kn'])
-                attention.kv_a_layernorm.register_forward_hook(lambda module,args,out: quantized(out).to(torch.bfloat16))
+                if deepseek:
+                    latent = values['l0_kv_cache']
+                else:
+                    attention.kv_a_layernorm.register_forward_hook(lambda module,args,out: quantized(out).to(torch.bfloat16))
+                    latent = unpack_fp8_activation(values['l0_kv_cache'],values['l0_kv_cache_scale']).to(torch.bfloat16)
                 cache = DynamicCache(config=config)
-                latent = unpack_fp8_activation(values['l0_kv_cache'],values['l0_kv_cache_scale']).to(torch.bfloat16)
                 nr,rd,vd = p['qk_nope_dim'],p['qk_rope_dim'],p['v_head_dim']
                 expanded = (latent@attention.kv_b_proj.weight.T).view(p['context'],p['q_heads'],nr+vd)
                 # HF represents the result of interleaved rotation as half-split pairs.
@@ -166,10 +190,10 @@ class FrontierMathTests(unittest.TestCase):
                 values['l0_down'].zero_()
                 absorbed_output = {}
                 native_linear = frontier.linear
-                def observe_linear(value, weight, scale, power):
+                def observe_linear(value, weight, scale, power, **options):
                     if weight is values['l0_o']:
                         absorbed_output['attention'] = value.detach().clone()
-                    return native_linear(value, weight, scale, power)
+                    return native_linear(value, weight, scale, power, **options)
                 with patch.object(frontier, 'linear', observe_linear):
                     frontier.reference(case,values,serial=True)
                 # Compare before the next FP8 quantization: different BF16
@@ -183,6 +207,18 @@ class FrontierMathTests(unittest.TestCase):
                 # quantization. Bound RMS error rather than requiring the
                 # distinct schedules to produce bit-identical activations.
                 self.assertLess(float(relative_l2), 0.05)
+
+    def test_agent_workspace_output_contract_matches_reference(self):
+        from ..integrations.make_agent_workspace import OUTPUT_KEYS
+        for original in select_cases('p3')[:2]:
+            with self.subTest(case=original.id):
+                case = replace(development(original), gpus=1, tp=1)
+                outputs = frontier.reference(case, frontier.make_inputs(case, 5, 'cpu', rank=0), serial=True)
+                self.assertEqual(set(outputs), set(OUTPUT_KEYS[case.family]))
+                # DeepSeek follows TileRT's BF16 caches; GLM keeps native FP8 payloads.
+                cache_dtype = torch.bfloat16 if case.family == 'deepseek_v32_step' else torch.float8_e4m3fn
+                self.assertEqual(outputs['kv_write'].dtype, cache_dtype)
+                self.assertEqual(outputs['index_k_write'].dtype, cache_dtype)
 
     def test_fp8_native_block_and_dynamic_scales(self):
         torch.manual_seed(13)
