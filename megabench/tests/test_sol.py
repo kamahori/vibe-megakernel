@@ -79,6 +79,27 @@ class SolTests(unittest.TestCase):
             self.assertTrue(all(row["status"] == "unavailable"
                                 for row in json.loads(output.getvalue())["cases"]))
 
+    def test_work_floors_take_the_binding_resource(self) -> None:
+        expected = {"tts-frame-step-csm-1b-b1-s128": "hbm",
+                    "vla-action-step-pi05-b1": "tensor_core",
+                    "world-frame-step-waypoint15-1b-f128": "tensor_core",
+                    "megamoe-layer-deepseek-v4-pro-ep8-t512": "hbm",
+                    "megamoe-layer-deepseek-v4-pro-ep8-t4096": "tensor_core"}
+        for case in select_cases("all", list(expected)):
+            with self.subTest(case=case.id):
+                row = estimate_case(Case(**(case.to_dict() | {"ready": True})), measured_ms=10.0)
+                self.assertEqual(sum(x["bytes"] for x in row["components"]),
+                                 row["minimum_bytes"])
+                self.assertEqual(row["floor_ms"], max(row["hbm_floor_ms"], row["compute_floor_ms"],
+                                                      row["nvlink_floor_ms"]))
+                self.assertEqual(row["bound"], expected[case.id])
+                self.assertAlmostEqual(row["gap_to_floor_x"], 10.0 / row["floor_ms"])
+        megamoe = select_cases("all", ["megamoe-layer-deepseek-v4-pro-ep8-t4096"])[0]
+        row = estimate_case(Case(**(megamoe.to_dict() | {"ready": True})))
+        p = megamoe.params
+        self.assertEqual(row["tensor_flops"],
+                         2 * p["tokens"] * p["topk"] * 3 * p["intermediate"] * p["hidden"])
+
     def test_bandwidth_scales_floor_and_rejects_invalid_values(self) -> None:
         case = select_cases("p0")[0]
         base = estimate_case(case)

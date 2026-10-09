@@ -41,6 +41,47 @@ def _near_greedy(token, want_logits, exact_logits, case: Case) -> bool:
     return bool(exact_logits[token] >= exact_logits.max() - case.noise_factor * error)
 
 
+# Sequential codebook decoding conditions each code on the earlier ones, so a
+# BF16 near-tie early in a frame changes every later code. Grading follows the
+# submission's own codes, but only a few near-tie departures are accepted.
+MAX_CODEBOOK_DIVERGENCES = 4
+
+
+def _teacher_forced(case: Case, inputs: dict, expected: dict, exact: dict,
+                    actual: dict) -> tuple[dict, dict]:
+    """Grade codebook frames against references forced onto the submission's codes.
+
+    The unforced oracle may itself leave the BF16 reference's path at a
+    near-tie, so both references always condition on the submitted codes.
+    Each code must be the forced BF16 reference's or FP32 oracle's greedy
+    choice, or within the BF16 band of the forced oracle's top logit.
+    """
+    import torch
+
+    from ..tasks.oracle import fp32_reference
+    from ..tasks.workloads import _module
+
+    got, want = actual.get("codes"), expected["codes"]
+    if (not isinstance(got, torch.Tensor) or got.shape != want.shape or got.dtype != want.dtype
+            or got.device != want.device):
+        return expected, exact
+    module = _module(case)
+    forced = got.clone()
+    if not torch.equal(got, want):
+        expected = module.reference(case, inputs, forced_codes=forced)
+    exact = fp32_reference(module, case, inputs, forced_codes=forced)
+    departures = []
+    for index, code in enumerate(got.tolist()):
+        if code in (int(expected["logits"][index].argmax()), int(exact["logits"][index].argmax())):
+            continue
+        if not _near_greedy(code, expected["logits"][index], exact["logits"][index], case):
+            raise AssertionError(f"codes: codebook {index} chose {code}, outside the greedy band")
+        departures.append(index)
+    if len(departures) > MAX_CODEBOOK_DIVERGENCES:
+        raise AssertionError(f"codes: {len(departures)} near-tie departures at {departures}")
+    return expected, exact
+
+
 def _compare(expected: dict, actual: dict, case: Case, device: str,
              exact: dict | None = None) -> dict:
     """Check outputs against the reference, or within the BF16 band of ``exact``.
@@ -137,6 +178,11 @@ def check_trials(case: Case, candidate: Callable, device: str,
         for name in inputs:
             if not torch.equal(inputs[name].cpu(), originals[name]):
                 raise AssertionError(f"candidate mutated input {name}")
+        if case.family == "tts_frame_step":
+            forced = _teacher_forced(case, inputs, expected, exact, actual)
+            if forced[0] is not expected:
+                scenario = "teacher_forced"
+            expected, exact = forced
         details = _compare(expected, actual, case, device, exact)
         trial_record = {"seed": seed, "scenario": scenario, "outputs": details}
         if case.family in ("spec_target_step", "spec_full_iteration"):

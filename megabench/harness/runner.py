@@ -45,6 +45,10 @@ CONTRACT_FILES = (
     "megabench/tasks/kimi.py",
     "megabench/tasks/glm53.py",
     "megabench/tasks/kimi_layer.py",
+    "megabench/tasks/csm.py",
+    "megabench/tasks/pi05.py",
+    "megabench/tasks/waypoint.py",
+    "megabench/tasks/megamoe.py",
     "megabench/tasks/references/qwen3.py",
     "megabench/tasks/references/moe.py",
 )
@@ -102,6 +106,8 @@ def evaluate_case(case: Case, submission: Path, *, device: str,
              "megabench.tasks.vision", "megabench.tasks.speculative",
              "megabench.tasks.distributed", "megabench.tasks.frontier",
              "megabench.tasks.kimi", "megabench.tasks.glm53", "megabench.tasks.kimi_layer",
+             "megabench.tasks.csm", "megabench.tasks.pi05", "megabench.tasks.waypoint",
+             "megabench.tasks.megamoe",
              "megabench.tasks.references")),
     }
     if not case.ready:
@@ -461,6 +467,8 @@ def main(argv: list[str] | None = None) -> int:
                 "MoE counts only selected experts; speculative verification reuses weights across positions.",
                 "Peak bandwidth, perfect reuse, and no scratch, synchronization, or compute costs are assumed.",
                 "This is an HBM lower bound, not a prediction of achievable runtime.",
+                "TTS, VLA, world-model and MegaMoE rows also report dense B200 tensor-core and NVLink "
+                "bounds; their floor_ms is the largest of the three.",
             ],
             "cases": estimates,
         }
@@ -473,8 +481,10 @@ def main(argv: list[str] | None = None) -> int:
                 if item["status"] == "estimated":
                     suffix = (f"  gap {item['gap_to_hbm_floor_x']:.1f}x"
                               if "gap_to_hbm_floor_x" in item else "")
+                    bound = (f"  floor {item['floor_ms']:7.3f} ms ({item['bound']})"
+                             if "floor_ms" in item else "")
                     print(f"{item['case_id']:44} {item['minimum_gb']:7.3f} GB  "
-                          f"{item['hbm_floor_ms']:7.3f} ms{suffix}")
+                          f"{item['hbm_floor_ms']:7.3f} ms{bound}{suffix}")
                     if args.case:
                         for component in item["components"]:
                             print(f"  {component['name']:40} "

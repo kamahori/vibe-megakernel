@@ -48,6 +48,9 @@ class Case:
         return asdict(self)
 
 
+# Families whose cases time one layer rather than a whole model step.
+LAYER_FAMILIES = frozenset({"kimi_k3_layer", "megamoe_layer"})
+
 DEEPSEEK_V32 = {"batch": 1, "context": 128, "layers": 61,
                 "experts": 256, "topk": 8, "hidden": 7168, "q_heads": 128,
                 "q_lora_rank": 1536, "kv_lora_rank": 512, "qk_nope_dim": 128,
@@ -210,6 +213,41 @@ CASES: tuple[Case, ...] = (
            "deepseek-ai/DeepSeek-V3.2", "decode", DEEPSEEK_V32 | {"context": context},
            "frontier_moe", "p3", ready=True, gpus=8, tp=8, atol=0.003, rtol=0.003,
            note=DEEPSEEK_NOTE) for context in (4096, 32768)),
+    Case("tts-frame-step-csm-1b-b1-s128", "tts_frame_step", "sesame/csm-1b", "audio_frame",
+         {"batch": 1, "context": 128, "layers": 16, "hidden": 2048, "q_heads": 32,
+          "kv_heads": 8, "head_dim": 64, "intermediate": 8192, "text_vocab": 128256,
+          "codebooks": 32, "audio_vocab": 2051, "depth_layers": 4, "depth_hidden": 1024,
+          "depth_q_heads": 8, "depth_kv_heads": 2, "depth_head_dim": 128,
+          "depth_intermediate": 8192},
+         "speech_generation", "p1", atol=0.003, rtol=0.003,
+         note="Synthetic CSM backbone decode plus 31 sequential depth-decoder codebooks; validation pending."),
+    Case("vla-action-step-pi05-b1", "vla_action_step", "lerobot/pi05_base", "action_chunk",
+         {"batch": 1, "images": 3, "image_tokens": 256, "image_size": 224, "patch_size": 14,
+          "text_tokens": 200, "vision_hidden": 1152, "vision_layers": 27,
+          "vision_intermediate": 4304, "vision_heads": 16, "layers": 18, "hidden": 2048,
+          "intermediate": 16384, "q_heads": 8, "kv_heads": 1, "head_dim": 256,
+          "expert_hidden": 1024, "expert_intermediate": 4096, "horizon": 50,
+          "action_dim": 32, "denoise_steps": 10},
+         "vision_language_action", "p2", atol=0.003, rtol=0.003,
+         note="Synthetic PaliGemma prefix fixture; timed 10-step flow-matching action expert; validation pending."),
+    Case("world-frame-step-waypoint15-1b-f128", "world_frame_step", "Overworld/Waypoint-1.5-1B",
+         "latent_frame",
+         {"batch": 1, "frame_index": 128, "layers": 24, "hidden": 2048, "q_heads": 32,
+          "kv_heads": 16, "head_dim": 64, "mlp_ratio": 4, "latent_channels": 32,
+          "latent_height": 32, "latent_width": 64, "patch": 2, "tokens_per_frame": 512,
+          "local_window": 16, "global_window": 128, "global_period": 4,
+          "global_dilation": 8, "buttons": 256, "control_period": 3, "denoise_steps": 4},
+         "world_model", "p2", atol=0.003, rtol=0.003,
+         note="Synthetic causal DiT frame: four denoise passes plus cache commit; validation pending."),
+    # DeepGEMM/FlashInfer MegaMoE geometry: the routed experts of one
+    # DeepSeek-V4-Pro MoE layer, dispatch through combine, at large batch.
+    *(Case(f"megamoe-layer-deepseek-v4-pro-ep8-t{tokens}", "megamoe_layer",
+           "deepseek-ai/DeepSeek-V4-Pro", "moe_layer",
+           {"tokens": tokens, "experts": 384, "topk": 6, "hidden": 7168,
+            "intermediate": 3072, "act_block": 32, "swiglu_limit": 10},
+           "expert_parallel", "p3", gpus=8, ep=8, atol=0.003, rtol=0.003,
+           note="FP8 x MXFP4 routed-expert layer over EP8 all-to-all; validation pending.")
+      for tokens in (512, 4096)),
 )
 
 

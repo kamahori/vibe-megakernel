@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 import torch
 
-from ..cases import CASES, Case, select_cases
+from ..cases import CASES, LAYER_FAMILIES, Case, select_cases
 from ..harness.correctness import _compare
 from ..harness.runner import (_contract_digest, _docker_worker_command,
                               _output_path, _run_one, _run_local_worker, _stop_owned_container,
@@ -62,9 +62,10 @@ TINY_P0 = (TINY_DENSE, TINY_MOE, TINY_W8, TINY_W4, TINY_SPEC)
 class CatalogTests(unittest.TestCase):
     def test_whole_model_catalog_and_priorities(self) -> None:
         self.assertEqual(len(CASES), len({case.id for case in CASES}))
-        # Kimi K3 does not fit eight GPUs, so it alone has single-layer cases.
+        # Kimi K3 does not fit eight GPUs and MegaMoE times one MoE layer, so
+        # only those families have single-layer cases.
         self.assertTrue(all("step" in case.id or "iteration" in case.id
-                            or case.family == "kimi_k3_layer" for case in CASES))
+                            or case.family in LAYER_FAMILIES for case in CASES))
         self.assertEqual({case.id for case in select_cases("core")},
                          {case.id for case in CASES if case.ready})
         self.assertTrue(all(case.ready for case in select_cases("p0")))

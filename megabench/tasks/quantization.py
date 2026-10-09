@@ -59,22 +59,61 @@ def fp8_scale(maximum: torch.Tensor, power_of_two: bool) -> torch.Tensor:
     return torch.exp2(torch.ceil(torch.log2(scale))) if power_of_two else scale
 
 
-def pack_fp8_activation(value: torch.Tensor, *, power_of_two: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dynamic E4M3 per-token, per-128-channel quantization.
+E4M3_MAX_EXPONENT = 8             # 448 = 1.75 * 2**8
+E4M3_MAX_MANTISSA = 0x600000      # FP32 mantissa bits of 1.75
+E8M0_MIN_EXPONENT = 105           # biased 2**-22, the scale of the 1e-4 amax floor
 
-    DeepSeek UE8M0 scales round upward to a power of two; GLM uses FP32
-    scales. Padding participates as zero and is discarded from the payload.
+
+def e8m0_exponent(maximum: torch.Tensor) -> torch.Tensor:
+    """Smallest biased E8M0 exponent whose power of two maps ``maximum`` into E4M3.
+
+    Integer arithmetic on the FP32 bits, as DeepGEMM's ``get_ue8m0_sf_exp``:
+    the exponent of ``maximum`` rises by one when its mantissa exceeds 1.75's,
+    then 448's exponent is removed. The floor equals clamping the block
+    maximum at 1e-4. Returned as uint8.
+    """
+    bits = maximum.float().contiguous().view(torch.int32)
+    rounded = (bits + (0x7FFFFF - E4M3_MAX_MANTISSA)) >> 23
+    return (rounded.clamp_min(E8M0_MIN_EXPONENT + E4M3_MAX_EXPONENT) - E4M3_MAX_EXPONENT).to(torch.uint8)
+
+
+def e8m0_power(exponent: torch.Tensor, *, inverse: bool = False) -> torch.Tensor:
+    """Exact FP32 ``2**(e-127)`` (or its reciprocal) built from exponent bits."""
+    biased = exponent.int()
+    biased = 254 - biased if inverse else biased
+    return (biased << 23).view(torch.float32)
+
+
+def pack_fp8_activation(value: torch.Tensor, *, power_of_two: bool = False, block: int = FP8_BLOCK,
+                        scale_format: str = "float") -> tuple[torch.Tensor, torch.Tensor]:
+    """Dynamic E4M3 per-token, per-``block``-channel quantization.
+
+    ``scale_format="float"`` returns FP32 scales: DeepSeek UE8M0 scales round
+    upward to a power of two, GLM uses unrounded scales. ``"e8m0"`` returns
+    uint8 biased exponents computed exactly from the FP32 bits (DeepGEMM
+    ``per_token_cast_to_fp8(use_ue8m0=True)`` and its fused SwiGLU epilogue).
+    Padding participates as zero and is discarded from the payload.
     """
     width = value.shape[-1]
-    padded = torch.nn.functional.pad(value.float(), (0, (-width) % FP8_BLOCK))
-    groups = padded.unflatten(-1, (-1, FP8_BLOCK))
-    scales = fp8_scale(groups.abs().amax(-1), power_of_two)
-    payload = (groups / scales[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+    padded = torch.nn.functional.pad(value.float(), (0, (-width) % block))
+    groups = padded.unflatten(-1, (-1, block))
+    maximum = groups.abs().amax(-1)
+    if scale_format == "e8m0":
+        scales = e8m0_exponent(maximum)
+        payload = (groups * e8m0_power(scales, inverse=True)[..., None]).to(torch.float8_e4m3fn)
+    elif scale_format == "float":
+        scales = fp8_scale(maximum, power_of_two)
+        payload = (groups / scales[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+    else:
+        raise ValueError(f"unknown FP8 scale format {scale_format}")
     return payload.flatten(-2)[..., :width].contiguous(), scales
 
 
-def unpack_fp8_activation(value: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    return value.float() * scales.repeat_interleave(FP8_BLOCK, dim=-1)[..., :value.shape[-1]]
+def unpack_fp8_activation(value: torch.Tensor, scales: torch.Tensor, *, block: int = FP8_BLOCK) -> torch.Tensor:
+    """FP32 values; uint8 scales are E8M0 exponents, others multiply directly."""
+    if scales.dtype == torch.uint8:
+        scales = e8m0_power(scales)
+    return value.float() * scales.repeat_interleave(block, dim=-1)[..., :value.shape[-1]]
 
 
 def pack_fp8_weight(value: torch.Tensor, *, power_of_two: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
