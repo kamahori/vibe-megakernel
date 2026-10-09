@@ -17,7 +17,7 @@ from unittest.mock import patch
 import torch
 
 from .cases import select_cases
-from .tasks import frontier, kimi
+from .tasks import frontier, glm53, kimi, kimi_layer
 
 
 def matrix(seed, name, rows, cols, fan_in, device, *, row_range=None, col_range=None):
@@ -42,15 +42,17 @@ def mxfp4_matrix(seed, name, rows, cols, device, *, row_range=None, col_range=No
 
 
 def audit(case):
-    module = kimi if case.family == 'kimi_k3_step' else frontier
+    module = {'kimi_k3_step':kimi, 'glm53_flash_step':glm53, 'kimi_k3_layer':kimi_layer}.get(case.family, frontier)
     with patch.object(module, 'matrix', matrix), \
          patch.object(frontier, 'fp8_matrix', fp8_matrix), \
-         patch.object(kimi, 'mxfp4_matrix', mxfp4_matrix):
+         patch.object(glm53, 'fp8_matrix', fp8_matrix), \
+         patch.object(kimi, 'mxfp4_matrix', mxfp4_matrix), \
+         patch.object(kimi_layer, 'mxfp4_matrix', mxfp4_matrix):
         values = module.make_inputs(case, 104729, 'meta', rank=0)
     by_dtype = Counter()
     for value in values.values():
         by_dtype[str(value.dtype)] += value.numel()*value.element_size()
-    return {'case':case.id, 'tp':case.tp, 'tensor_count':len(values),
+    return {'case':case.id, 'tp':case.tp, 'ep':case.ep, 'tensor_count':len(values),
             'rank_input_bytes':sum(by_dtype.values()), 'bytes_by_dtype':dict(by_dtype),
             'method':'meta storage shapes only; not allocated GPU verification'}
 

@@ -20,7 +20,7 @@ TASK_MODULES = {
     "spec_full_iteration": "speculative",
     "distributed_step": "distributed",
     "deepseek_v32_step": "frontier", "glm52_step": "frontier",
-    "kimi_k3_step": "kimi",
+    "kimi_k3_step": "kimi", "glm53_flash_step": "glm53", "kimi_k3_layer": "kimi_layer",
 }
 
 

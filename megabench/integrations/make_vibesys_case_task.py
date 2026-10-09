@@ -64,7 +64,8 @@ def make_task(case_id: str, root: Path,
               "gptoss_step": "gptoss", "hybrid_step": "hybrid",
               "vl_decode_step": "vision", "spec_full_iteration": "speculative",
               "distributed_step": "distributed", "deepseek_v32_step": "frontier",
-              "glm52_step": "frontier", "kimi_k3_step": "kimi"}[case.family]
+              "glm52_step": "frontier", "kimi_k3_step": "kimi",
+              "glm53_flash_step": "glm53", "kimi_k3_layer": "kimi_layer"}[case.family]
     (task / "OBJECTIVE.md").write_text(
         f"# One MegaBench case: {case_id}\n\n"
         f"Implement only `{case_id}`: {case.model}, {case.phase}, geometry "

@@ -24,8 +24,9 @@ import torch.distributed as dist
 from .cases import select_cases
 from .harness.benchmark import _audit_launches, _measure
 from .harness.correctness import _compare
-from .tasks import frontier, kimi
+from .tasks import frontier, glm53, kimi
 from .tests.test_frontier import development
+from .tests.test_glm53 import development as glm53_development
 from .tests.test_kimi import development as kimi_development
 
 
@@ -46,6 +47,19 @@ def advance_state(case, values, outputs):
     reset = is_kimi and bool(values['reset'])
     result = values | {'token':outputs['next_token'].clone()}
     full_slot, recurrent_slot, index_slot = 0, 0, 0
+    if case.family == 'glm53_flash_step':
+        for layer in range(case.params['layers']):
+            prefix = f'l{layer}_'
+            if glm53.mla_layer(layer):
+                for key, write in (('kv_cache', 'kv_write'), ('index_k_cache', 'index_k_write'),
+                                   ('index_gate_cache', 'index_gate_write')):
+                    result[prefix+key] = torch.cat((values[prefix+key], outputs[write][full_slot][None]))
+                full_slot += 1
+            else:
+                result[prefix+'recurrent_state'] = outputs['recurrent_state'][recurrent_slot].clone()
+                result[prefix+'conv_state'] = outputs['conv_state'][recurrent_slot].clone()
+                recurrent_slot += 1
+        return replace(case, params=case.params | {'context':case.params['context']+1}), result
     def append(key, write):
         old = values[key][:0] if reset else values[key]
         # CPU cat/collectives do not uniformly support FP8 arithmetic types.
@@ -78,7 +92,7 @@ def advance_state(case, values, outputs):
     return replace(case, params=case.params | {'context':context}), result
 
 
-def compare_serial(case, actual, expected, device, is_kimi):
+def compare_serial(case, actual, expected, device, sharded_state):
     """Broadcast the complete oracle output, then compare this rank's slice."""
     rank = dist.get_rank()
     details = {}
@@ -86,7 +100,7 @@ def compare_serial(case, actual, expected, device, is_kimi):
         shape = list(value.shape)
         if name == 'logits':
             shape[0] *= case.tp
-        elif is_kimi and name in ('recurrent_state', 'conv_state'):
+        elif sharded_state and name in ('recurrent_state', 'conv_state'):
             shape[1 if name == 'recurrent_state' else 2] *= case.tp
         wanted = torch.empty(shape, device=device, dtype=value.dtype)
         if rank == 0:
@@ -95,7 +109,7 @@ def compare_serial(case, actual, expected, device, is_kimi):
         dist.broadcast(wire, src=0)
         if name == 'logits':
             wanted = wanted.chunk(case.tp)[rank]
-        elif is_kimi and name in ('recurrent_state', 'conv_state'):
+        elif sharded_state and name in ('recurrent_state', 'conv_state'):
             wanted = wanted.chunk(case.tp, dim=1 if name == 'recurrent_state' else 2)[rank]
         # These are distinct schedules of a BF16 model. Logits are widened
         # BF16 results, so use BF16 precision for this serial diagnostic.
@@ -108,9 +122,16 @@ def compare_serial(case, actual, expected, device, is_kimi):
 
 def verify(case, device, trials, full, steps=3):
     rank = dist.get_rank()
-    module = kimi if case.family == 'kimi_k3_step' else frontier
+    module = {'kimi_k3_step':kimi, 'glm53_flash_step':glm53}.get(case.family, frontier)
     if not full:
-        if module is kimi:
+        if module is glm53:
+            case = glm53_development(case)
+            ranks = dist.get_world_size()
+            if ranks > 1:
+                # FP8 TP shards must retain whole 128-channel blocks.
+                case = replace(case,params=case.params | {'q_heads':4*ranks,'linear_heads':max(4,ranks),
+                                                         'intermediate':128*ranks,'dense_intermediate':128*ranks})
+        elif module is kimi:
             case = kimi_development(case)
             if dist.get_world_size() > 2:
                 case = replace(case,params=case.params | {'q_heads':32,'head_dim':8,'v_head_dim':8,
@@ -157,9 +178,10 @@ def verify(case, device, trials, full, steps=3):
                         raise AssertionError(f'non-finite {name}')
                 if before != input_digest(values):
                     raise AssertionError('reference mutated its runtime inputs')
-                keys = ('next_token','expert_ids','cache_length') if module is kimi else ('next_token','sparse_indices','expert_ids')
+                keys = {kimi:('next_token','expert_ids','cache_length'),glm53:('next_token','sparse_mask','expert_ids')}.get(
+                    module,('next_token','sparse_indices','expert_ids'))
                 replicated = {key:actual[key].cpu().tolist() for key in keys}
-                shard_keys = ('logits','recurrent_state','conv_state') if module is kimi else ('logits',)
+                shard_keys = ('logits','recurrent_state','conv_state') if module in (kimi,glm53) else ('logits',)
                 state_hash = input_digest({name:value for name,value in actual.items() if name not in shard_keys})
                 replicated['native_state_sha256'] = state_hash
                 all_ranks = [None]*current.gpus
@@ -173,7 +195,7 @@ def verify(case, device, trials, full, steps=3):
                         from .tests.tp_oracle import tp_rounding
                         with tp_rounding(current, serial_values, module):
                             expected = module.reference(serial_case,serial_values,serial=True)
-                    details = compare_serial(current,actual,expected,device,module is kimi)
+                    details = compare_serial(current,actual,expected,device,module in (kimi,glm53))
                     if rank == 0 and step+1 < steps:
                         serial_case,serial_values = advance_state(serial_case,serial_values,expected)
                 trajectory.append({'step':step,'input_context':current.params['context'],
