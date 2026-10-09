@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from ..cases import Case, select_cases
+from ..sol import WORK_MODELS
 from .make_vibesys_case_task import make_task
 
 
@@ -273,8 +274,11 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "kernel feedback. The capture command must set `TMPDIR=/tmp`, "
         "`TMP=/tmp`, and `TEMP=/tmp` inside the agent sandbox and pass "
         "`--profile-from-start off` to capture the warmed marker window. "
-        "Use `./sol_info --json` for an optimistic HBM "
-        "speed-of-light floor and byte breakdown; pass `--result PATH` for "
+        "Use `./sol_info --json` for an optimistic " +
+        ("speed-of-light floor (the largest of the HBM, tensor-core and NVLink "
+         "bounds) with byte and FLOP breakdowns" if case.family in WORK_MODELS
+         else "HBM speed-of-light floor and byte breakdown") +
+        "; pass `--result PATH` for "
         "the gap to a checked CUDA-event result where a traffic model is available. "
         "The default bandwidth is 8 TB/s per B200. These commands load the trusted benchmark outside "
         "this workspace; final grading is run separately.\n")

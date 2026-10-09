@@ -6,7 +6,8 @@ revisions, configuration hashes, source hashes, and sampled native checkpoint
 tensor layouts are recorded in [`model_specs.json`](../tasks/model_specs.json).
 The current scoring gate is `Case.ready` in [`cases.py`](../cases.py).
 Full Kimi-K3 decode is deferred at the user's request; it remains visible and
-disabled. Two single-layer Kimi-K3 EP8 cases are enabled instead.
+disabled. Two single-layer Kimi-K3 EP8 cases are enabled instead, as are the
+two MegaMoE EP8 layer cases.
 
 | Case | Implementation and timed boundary | Validation and current gate |
 | --- | --- | --- |
@@ -24,7 +25,7 @@ disabled. Two single-layer Kimi-K3 EP8 cases are enabled instead.
 | CSM-1B audio frame | Previous-frame code embedding, all 16 backbone layers with KV append, codebook 0, then 31 sequential depth-decoder steps with per-codebook heads | Pinned transformers `CsmForConditionalGeneration` matches greedy codes and teacher-forced logits on CPU; teacher-forced grading accepts at most four near-greedy departures; full B200 validation pending; disabled |
 | π0.5 action chunk | Untimed SigLIP/PaliGemma prefix fixture; ten timed Euler steps of the 18-layer action expert with adaRMS time conditioning | Pinned LeRobot `PI05Pytorch` matches end to end on CPU (relative L2 0.0013 at reduced geometry); full B200 validation pending; disabled |
 | Waypoint-1.5-1B latent frame | Four denoise passes and the σ=0 cache-commit pass over 512 tokens, local and dilated global rolling KV, controller fusion layers | Clean-room reference; pinned upstream `model.py`/`modular_blocks.py` match in FP32 (relative K/V write error 2.5e-7) and BF16 on CPU; full B200 validation pending; disabled |
-| MegaMoE DeepSeek-V4-Pro EP8 (512, 4,096 tokens per rank) | Routed experts only: FP8 dispatch, FP8×MXFP4 gate/up, clamped SwiGLU, weighted per-32 FP8 requantization, down projection, combine | Pinned DeepGEMM quantizers and Transformers `DeepseekV4Experts` agree with the unquantized path to 7e-5; CPU EP8 equals the serial run bit for bit; eight-B200 validation pending; disabled |
+| MegaMoE DeepSeek-V4-Pro EP8 (512, 4,096 tokens per rank) | Routed experts only: FP8 dispatch, FP8×MXFP4 gate/up, clamped SwiGLU, weighted per-32 FP8 requantization, down projection, combine | Pinned DeepGEMM quantizers and Transformers `DeepseekV4Experts` agree with the unquantized path to 7e-5; CPU and full eight-B200 EP8 outputs equal the serial run bit for bit for both seeds and both sizes; candidate harness passes; enabled |
 
 The full EAGLE iteration consumes target features entering layers 2, 16 and
 29, matching the pinned EAGLE implementation. The corrected taps agree with
@@ -287,3 +288,19 @@ An earlier job 4787 used batched projections. GPU BF16 GEMMs round
 differently for 8 and 64 rows, so the EP and serial results differed. The
 reference now computes dense projections one token at a time, as the whole-model
 Kimi reference does. Expert GEMMs see the same rows in both layouts.
+
+### MegaMoE EP8 layers
+
+Campaign `experiments/2026-10-08/22-30-00-multimodal-megamoe-gpu-validation/`.
+Eight-B200 job 4889 (commit 125d175 with the two cases set ready) ran
+`verify_megamoe --full` and the harness with the reference submission for
+both sizes. For both seeds, every rank's EP output equaled its slice of the
+serial run bit for bit, at 3,072 and 24,576 routed rows per rank. The BF16
+reference differed from the FP32 oracle by 1.32% relative L2 (max absolute
+error 0.98–1.11 against peaks of 62–66). Rank 0, which also holds the serial
+oracle, peaked at 16.5 GB (t512) and 25.5 GB (t4096) allocated; other ranks at
+3.1 GB and 4.7 GB. The harness passed correctness on all ranks for two
+seeds. The slowest rank's eager CUDA-event median was 67.8 ms (t512) and
+75.2 ms (t4096), with 3,293–3,307 kernels per rank, so the
+reference is `non_megakernel`, as expected. Each verify step took about a
+minute and each harness run about 45 s; the job took 3 min 35 s.

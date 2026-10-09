@@ -6,8 +6,9 @@ synthetic-weight tier. All P1 and P2 tasks are also enabled after full GPU valid
 DeepSeek and GLM-5.2 frontier references are enabled after full eight-GPU validation,
 GLM-5.3-Flash after full four-GPU validation. Full Kimi decode is deferred; because
 Kimi K3 does not fit eight GPUs, it instead has two single-layer EP8 cases.
-The multimodal single-batch cases (CSM-1B TTS, π0.5 VLA, Waypoint-1.5 world
-model) and the MegaMoE EP8 layer cases are planned until full GPU validation.
+The two MegaMoE EP8 layer cases are enabled after full eight-GPU validation. The
+multimodal single-batch cases (CSM-1B TTS, π0.5 VLA, Waypoint-1.5 world model)
+are planned until full GPU validation.
 `--suite core` selects every enabled cell. A model-step case exercises every layer in its stated model
 phase, from token or modality input through final logits and state updates.
 The timed boundary and launch policy must be fixed *per phase*: decode and
@@ -44,7 +45,7 @@ separately.
 | P3 | `glm52-step` / frontier decode | **GLM-5.2-FP8**: 78-layer GLM MoE with DSA indexer, 256 routed experts/top-8 plus a shared expert. | Full text decode including index selection, sparse attention, expert routing, LM head, and KV update. | Multi-GPU TP+EP; B=1/8, indexer boundary cases and skewed routes. Pin the indexer pattern and FP8 checkpoint before scoring. |
 | P3 | `glm53-flash-step` / frontier hybrid decode | **GLM-5.3-Flash**: 45 layers (34 KDA, 11 NoPE MLA with DSA indexer), 4-stream mHC with Sinkhorn mixing, 288 routed experts/top-8 plus a shared expert, block FP8. | Full text decode including KDA convolution/recurrent state, MLA KV and index writes, pooled index selection, routing, LM head. | TP4 on four GPUs; B=1, context 128. |
 | P3 | `kimi-k3-{kda,mla}-layer-ep8` / expert parallel layer | **Kimi-K3 layer 61 (KDA) and 63 (gated MLA)**: one mid-block decoder layer with attention residuals over six blocks, latent MoE with 896 MXFP4 experts/top-16 and two shared experts. | One layer for 8 sequences per rank: DP attention with replicated weights, EP8 expert ownership with all-to-all dispatch and combine of BF16 latent rows. | Eight GPUs, 64 sequences in total, context 128. Outputs the new residual prefix, the layer's state writes and sorted expert IDs. |
-| P3 | `megamoe-layer-deepseek-v4-pro-ep8-t{512,4096}` / expert parallel layer | **DeepSeek-V4-Pro routed experts**, as in DeepGEMM's `fp8_fp4_mega_moe`: 384 MXFP4 experts/top-6, hidden 7,168, intermediate 3,072; the shared expert is excluded. | Dispatch FP8 tokens (UE8M0 per-32 scales) to owning ranks, FP8×FP4 gate/up GEMM, clamped SwiGLU weighted by the routing weight, FP8 requantization, down GEMM, then combine back to the source rank. Routing is an input. | **Planned:** eight GPUs, 512 and 4,096 tokens per rank. The EP result must equal the serial reference bit for bit. |
+| P3 | `megamoe-layer-deepseek-v4-pro-ep8-t{512,4096}` / expert parallel layer | **DeepSeek-V4-Pro routed experts**, as in DeepGEMM's `fp8_fp4_mega_moe`: 384 MXFP4 experts/top-6, hidden 7,168, intermediate 3,072; the shared expert is excluded. | Dispatch FP8 tokens (UE8M0 per-32 scales) to owning ranks, FP8×FP4 gate/up GEMM, clamped SwiGLU weighted by the routing weight, FP8 requantization, down GEMM, then combine back to the source rank. Routing is an input. | **Ready:** eight GPUs, 512 and 4,096 tokens per rank; the reference EP result equals the serial run bit for bit. |
 | P3 | `kimi-k3-step` / frontier hybrid decode | **Kimi-K3 text path**: 93 layers (69 Kimi Delta Attention, 24 gated MLA), 896 routed experts/top-16, native quantized expert weights. | Full text decode including recurrent state, MLA KV, expert routing, attention residuals, and LM head. | Memory-audited multi-GPU placement; B=1/8, reset/continuing state and long context. Vision input is outside this text-path task. |
 
 The P0 implementation milestone is active with full layer counts and final

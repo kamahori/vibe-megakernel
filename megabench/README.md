@@ -48,7 +48,7 @@ boundary; [`cases.py`](cases.py) is the active machine-readable catalog.
 | P1 | Sesame CSM-1B TTS audio frame (backbone step plus 31 depth-decoder codebooks) | Planned: synthetic reference and CPU checks pass; GPU validation pending |
 | P2 | π0.5 VLA 10-step flow-matching action chunk over a cached PaliGemma prefix | Planned: synthetic reference and CPU checks pass; GPU validation pending |
 | P2 | Waypoint-1.5-1B world-model latent frame (4 denoise passes plus cache commit) | Planned: synthetic reference and CPU checks pass; GPU validation pending |
-| P3 | DeepSeek-V4-Pro MegaMoE routed-expert layer, EP8 at 512 and 4,096 tokens per rank | Planned: native FP8/MXFP4 synthetic reference and CPU EP8 checks pass; GPU validation pending |
+| P3 | DeepSeek-V4-Pro MegaMoE routed-expert layer, EP8 at 512 and 4,096 tokens per rank | Ready with native synthetic FP8 activations and MXFP4 experts; verified on eight B200 GPUs |
 
 `list --suite core` selects every enabled case; `--suite p0` selects the original five.
 `--suite p1` through `p3`, `planned`, and `all` expose their catalog subsets; an

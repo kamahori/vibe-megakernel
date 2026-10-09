@@ -245,8 +245,8 @@ CASES: tuple[Case, ...] = (
            "deepseek-ai/DeepSeek-V4-Pro", "moe_layer",
            {"tokens": tokens, "experts": 384, "topk": 6, "hidden": 7168,
             "intermediate": 3072, "act_block": 32, "swiglu_limit": 10},
-           "expert_parallel", "p3", gpus=8, ep=8, atol=0.003, rtol=0.003,
-           note="FP8 x MXFP4 routed-expert layer over EP8 all-to-all; validation pending.")
+           "expert_parallel", "p3", ready=True, gpus=8, ep=8, atol=0.003, rtol=0.003,
+           note="FP8 x MXFP4 routed-expert layer over EP8 all-to-all; verified bitwise against the serial run on eight B200 GPUs.")
       for tokens in (512, 4096)),
 )
 
