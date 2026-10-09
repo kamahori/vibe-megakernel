@@ -5,7 +5,8 @@ matching the P0 tier. They do not claim checkpoint accuracy. Immutable model
 revisions, configuration hashes, source hashes, and sampled native checkpoint
 tensor layouts are recorded in [`model_specs.json`](../tasks/model_specs.json).
 The current scoring gate is `Case.ready` in [`cases.py`](../cases.py).
-Kimi-K3 is deferred at the user's request; it remains visible and disabled.
+Full Kimi-K3 decode is deferred at the user's request; it remains visible and
+disabled. Two single-layer Kimi-K3 EP8 cases are enabled instead.
 
 | Case | Implementation and timed boundary | Validation and current gate |
 | --- | --- | --- |
@@ -17,6 +18,8 @@ Kimi-K3 is deferred at the user's request; it remains visible and disabled.
 | Qwen3-30B-A3B TP2/EP2 | All 48 layers, contiguous EP expert ownership, TP attention/FFN and distributed greedy token | CPU and full four-B200 logits, KV and global expert IDs match the independent serial decoder for both seeds; enabled |
 | DeepSeek-V3.2 TP8 | All 61 layers, block FP8 weights/activation quantization, MLA, Hadamard FP8 indexer, grouped routing and shared expert | Independent expanded MLA, YaRN, routing and quantization tests; CPU TP and candidate harness pass; full eight-B200 three-step rollouts pass both seeds with exact replicated-state agreement; enabled |
 | GLM-5.2-FP8 TP8 | All 78 layers, block FP8 weights, MLA, scheduled full/shared indexers and MoE | Independent expanded MLA, FP8 and routing tests; CPU TP and candidate harness pass; full eight-B200 three-step rollouts pass both seeds with exact replicated-state agreement; enabled |
+| GLM-5.3-Flash TP4 | All 45 layers: mHC (4 streams, 20 Sinkhorn iterations), 34 KDA and 11 NoPE MLA/DSA layers, block FP8 weights, 288-expert MoE | Pinned transformers 5.17.0 `Glm5NextTextModel` decode matches every output for three seeds; CPU TP2/TP4 rollouts and candidate harness pass; full four-B200 three-step rollout passes with exact replicated-state agreement; enabled |
+| Kimi-K3 layer EP8 (KDA layer 61, MLA layer 63) | One mid-block layer per attention variant: attention residuals, DP attention over 8 sequences per rank, EP8 MXFP4 experts with all-to-all dispatch/combine, latent norm/up and shared experts | Matches the whole-model Kimi reference's layer slice; CPU 2/8-rank all-to-all equals the serial 64-sequence batch; candidate harness passes; full eight-B200 EP8 outputs equal the serial run bit for bit for both seeds; enabled |
 | Kimi-K3 TP16 | All 93 layers, 69 KDA/24 gated MLA, attention residuals, BF16 latent/shared paths and native MXFP4 routed experts | Official pinned decoder/FLA oracle, eight-step independent KDA recurrence and 16-rank CPU protocol pass; deferred by request; disabled |
 
 The full EAGLE iteration consumes target features entering layers 2, 16 and
@@ -124,8 +127,17 @@ These are commands for the batch script, not direct interactive GPU runs:
   --device cuda --full --trials 2 --output /path/deepseek
 ```
 
-Use `--case glm52-step` with eight ranks or `--case kimi-k3-step` with sixteen
-ranks for the other full frontier checks. Omit `--full` and use `--device cpu`
+Use `--case glm52-step` with eight ranks, `--case glm53-flash-step` with four,
+or `--case kimi-k3-step` with sixteen ranks for the other full frontier checks.
+The Kimi layer cases use their own verifier, which compares the EP all-to-all
+result with a serial single-rank run of all 64 sequences, at full geometry too:
+
+```bash
+.venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=8 \
+  -m megabench.verify_kimi_layer --case kimi-k3-kda-layer-ep8 \
+  --device cuda --full --trials 2 --output /path/kimi-kda-layer
+```
+ Omit `--full` and use `--device cpu`
 for development protocol checks. A one-GPU allocation can separately run
 `python -m megabench.verify_kimi_shard --output /path/kimi-shard.json`; its
 report explicitly sets `full_distributed_decode_verified` to false.
@@ -179,3 +191,35 @@ the timed decoder step. All eight requested non-P0 tasks are now enabled;
 Kimi remains deferred.
 
 Kimi shard job 4163 was canceled after the user deferred that task.
+
+### GLM-5.3-Flash and Kimi-K3 layers
+
+Campaign `experiments/2026-10-08/16-36-37-glm53-flash-gpu-validation/`.
+Four-B200 job 4784 passed the full GLM-5.3-Flash three-step rollout (contexts
+128–130) on every rank in 12:18. Inputs occupy 80.34 GB per rank and build in
+48 s; allocated peaks were 80.76 GB. The eager reference took 260.9 ms
+(CUDA-event median) and recorded 42,158 device events per rank. Harness job
+4785 ran the reference submission: correctness passed and the launch gate
+failed, as expected, with a 310 GiB host peak.
+
+At full depth the BF16 reference is far from the FP32 oracle: relative L2
+errors are 0.79 for logits, 0.56 for MLA latents, 0.74 for index scores and
+0.22–0.27 for KDA state. FP8 activation quantization amplifies BF16 rounding
+differences layer by layer. Since the band is `noise_factor` times this error,
+it is loose for this case; review candidate outputs rather than relying on
+the band alone.
+
+Campaign `experiments/2026-10-08/16-56-00-kimi-k3-layer-gpu-validation/`.
+Eight-B200 job 4795 ran `verify_kimi_layer --full` for both layer cases with
+two seeds. On every rank, the EP8 all-to-all outputs (residual prefix, state
+writes and expert IDs) were bitwise equal to rank 0's serial run of all 64
+sequences with all 896 experts. The reference was deterministic, preserved
+its inputs and depended on the expert weights. Inputs occupy 3.29 GB (KDA) and
+2.81 GB (MLA) per rank. Eager reference CUDA-event medians were 47.1–57.2 ms
+and 46.0–59.4 ms. The reference submission passed harness correctness on all
+ranks and failed the launch gate with 3,640–4,746 device events per rank.
+
+An earlier job 4787 used batched projections. GPU BF16 GEMMs round
+differently for 8 and 64 rows, so the EP and serial results differed. The
+reference now computes dense projections one token at a time, as the whole-model
+Kimi reference does. Expert GEMMs see the same rows in both layouts.

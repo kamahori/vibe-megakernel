@@ -45,7 +45,7 @@ def tp_rounding(case, values, module):
 
     with ExitStack() as stack:
         stack.enter_context(patch.object(torch.Tensor, '__matmul__', rounded_matmul))
-        if module.__name__.endswith('.frontier'):
+        if module.__name__.endswith(('.frontier', '.glm53')):
             native_linear = module.linear
             row_weights = {}
             for layer in range(case.params['layers']):

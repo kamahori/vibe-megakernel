@@ -15,12 +15,13 @@ from ..cases import select_cases
 from ..harness.distributed import evaluate_distributed, worst_rank_timing
 from .distributed_probe import development
 from .test_frontier import development as frontier_development
+from .test_glm53 import development as glm53_development
 from .test_kimi import development as kimi_development
 
 
 class DistributedReferenceTests(unittest.TestCase):
     def test_frontier_state_rollouts_match_serial_oracles(self):
-        cases = select_cases('p3')
+        cases = [case for case in select_cases('p3') if case.family != 'kimi_k3_layer']
         checks = [(case,2) for case in cases] + [(case,8) for case in cases[:2]]
         for case,ranks in checks:
             with self.subTest(case=case.id,ranks=ranks), tempfile.TemporaryDirectory() as directory:
@@ -44,10 +45,15 @@ class DistributedReferenceTests(unittest.TestCase):
     def test_frontier_native_outputs_pass_the_submission_harness(self):
         submission = Path(__file__).parents[1] / 'examples/reference_submission.py'
         for original in select_cases('p3'):
+            if original.family == 'kimi_k3_layer':
+                continue  # tests/test_kimi_layer.py runs these through the harness.
             with self.subTest(case=original.id):
-                tiny = (kimi_development(original) if original.family == 'kimi_k3_step'
-                        else frontier_development(original))
+                tiny = {'kimi_k3_step':kimi_development, 'glm53_flash_step':glm53_development}.get(
+                    original.family, frontier_development)(original)
                 case = replace(tiny, ready=True, gpus=2, tp=2)
+                if case.family == 'glm53_flash_step':
+                    # FP8 TP shards must retain whole 128-channel blocks.
+                    case = replace(case, params=case.params | {'q_heads':8, 'intermediate':256, 'dense_intermediate':256})
                 report = evaluate_distributed(case, submission, device='cpu',
                                               trials=2, warmup=0, reps=1)
                 self.assertEqual(report['status'], 'correctness_only', report)
