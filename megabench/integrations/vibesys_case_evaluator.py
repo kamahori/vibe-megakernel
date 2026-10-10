@@ -11,6 +11,17 @@ from ..harness.correctness import check_trials
 from ..harness.runner import _load_submission, evaluate_case
 
 
+def benchmark_output(case_id: str, result: dict, score: float) -> dict:
+    """The result file VibeSys reads back, without raw per-rank records.
+
+    Multi-GPU results keep every rank's raw record, including the eager
+    reference's launch audit, under ``ranks``. Their summaries are already in
+    ``correctness`` and ``launch_audit``, so the result file omits the copies.
+    """
+    compact = {key: value for key, value in result.items() if key != "ranks"}
+    return {"case": case_id, "progress_score": score, "result": compact}
+
+
 def main(case_id: str, argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("accuracy", "benchmark"))
@@ -49,7 +60,7 @@ def main(case_id: str, argv: list[str] | None = None) -> int:
         result = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"}
     speedup = result.get("speedup_vs_best_baseline_cuda_event")
     score = 1.0 + speedup / (1.0 + speedup) if result["status"] == "ok_provisional" else 0.0
-    output = {"case": case_id, "progress_score": score, "result": result}
+    output = benchmark_output(case_id, result, score)
     with args.output_json.open("x", encoding="utf-8") as file:
         json.dump(output, file)
     print(json.dumps({"case": case_id, "progress_score": score,

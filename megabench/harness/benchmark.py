@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import statistics
 import time
+from collections import Counter
 from typing import Callable
 
 
@@ -46,6 +47,24 @@ def _measure(fn: Callable, inputs: dict, device: str, warmup: int,
             "cuda_event_p95_ms": p95(event_ms) if cuda else None}
 
 
+# An eager multi-GPU reference launches tens of thousands of kernels per step.
+# Every name is kept only for small counts, such as a candidate's launches.
+_MAX_LISTED_KERNEL_NAMES = 32
+_TOP_KERNEL_NAMES = 16
+
+
+def _kernel_name_summary(names: list[str]) -> dict:
+    """List small sets of launched kernel names; summarize large ones by frequency."""
+    if len(names) <= _MAX_LISTED_KERNEL_NAMES:
+        return {"gpu_kernel_names": names}
+    counts = Counter(names)
+    return {"gpu_kernel_names": names[:_MAX_LISTED_KERNEL_NAMES],
+            "gpu_kernel_names_truncated": True,
+            "distinct_gpu_kernel_names": len(counts),
+            "top_gpu_kernel_names": [{"name": name, "count": count}
+                                     for name, count in counts.most_common(_TOP_KERNEL_NAMES)]}
+
+
 def _audit_launches(fn: Callable, inputs: dict, device: str,
                     launch_budget: int) -> dict:
     import torch
@@ -67,7 +86,7 @@ def _audit_launches(fn: Callable, inputs: dict, device: str,
         return {"status": "within_budget" if 1 <= count <= launch_budget else
                 "launch_budget_failed", "gpu_kernel_count": count,
                 "max_gpu_launches": launch_budget,
-                "gpu_kernel_names": [event.name for event in gpu_events],
+                **_kernel_name_summary([event.name for event in gpu_events]),
                 "cuda_graph_runtime_hint": graph_hint,
                 "review_required": True}
     except Exception as exc:
