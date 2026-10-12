@@ -27,99 +27,136 @@ def development(case):
 
 
 class FrontierMathTests(unittest.TestCase):
-    def test_native_sparse_selection_matches_upstream_indexers(self):
+    def test_deepseek_sparse_selection_matches_upstream_indexer(self):
         from transformers.models.deepseek_v32.configuration_deepseek_v32 import DeepseekV32Config
-        from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32Indexer, DeepseekV32RotaryEmbedding, DeepseekV32RMSNorm
-        from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
-        from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaIndexer, GlmMoeDsaRotaryEmbedding, GlmMoeDsaRMSNorm
-        for original in select_cases('p3')[:2]:
-            case = development(original)
-            case = replace(case,gpus=1,tp=1,params=case.params | {'layers':1,'first_dense':1})
-            p = case.params
-            deepseek = case.family == 'deepseek_v32_step'
-            config_class,indexer_class,rotary_class,norm_class = (
-                (DeepseekV32Config,DeepseekV32Indexer,DeepseekV32RotaryEmbedding,DeepseekV32RMSNorm)
-                if deepseek else (GlmMoeDsaConfig,GlmMoeDsaIndexer,GlmMoeDsaRotaryEmbedding,GlmMoeDsaRMSNorm))
-            rope = {'rope_type':'yarn','rope_theta':10000.,'factor':40.,'original_max_position_embeddings':4096,
-                    'beta_fast':32,'beta_slow':1,'mscale':1.,'mscale_all_dim':1.} if deepseek else {'rope_type':'default','rope_theta':8_000_000.}
-            config = config_class(hidden_size=p['hidden'],q_lora_rank=p['q_lora_rank'],qk_rope_head_dim=p['qk_rope_dim'],
-                                  index_n_heads=p['index_heads'],index_head_dim=p['index_dim'],index_topk=p['index_topk'],rope_parameters=rope)
-            # This independently constructs the normalized Hadamard matrix.
-            hadamard = torch.ones(1,1)
-            while hadamard.shape[0] < p['index_dim']:
-                hadamard = torch.cat((torch.cat((hadamard,hadamard),1),torch.cat((hadamard,-hadamard),1)),0)
-            for seed in (17,19):
-                with self.subTest(case=case.id,seed=seed), torch.no_grad():
-                    values = frontier.make_inputs(case,seed,'cpu',rank=0)
-                    values['l0_iw'].abs_()  # Positive scores avoid source-specific zero-score topk ties.
-                    indexer = indexer_class(config,0).float().eval()
-                    def quantize(value):
-                        payload,scale = pack_fp8_activation(value.to(torch.bfloat16),power_of_two=deepseek)
-                        return unpack_fp8_activation(payload,scale)
-                    for short,long in (('iq','wq_b'),('ik','wk')):
-                        module = getattr(indexer,long)
-                        module.weight.copy_(unpack_fp8_weight(values['l0_'+short],values['l0_'+short+'_scale']))
-                        # TileRT's DeepSeek wq_b consumes the BF16 q residual (W8A16).
-                        activation = (lambda value: value.float()) if deepseek and short == 'iq' else quantize
-                        module.register_forward_pre_hook(lambda module,args,activation=activation:(activation(args[0]),))
-                        module.register_forward_hook(lambda module,args,out:out.to(torch.bfloat16))
-                    indexer.k_norm.to(torch.bfloat16)
-                    indexer.k_norm.weight.copy_(values['l0_inorm'])
-                    indexer.k_norm.bias.copy_(values['l0_ibias'])
-                    indexer.weights_proj.weight.copy_(values['l0_iw'])
-                    if deepseek:
-                        # TileRT publishes the head weights as BF16.
-                        indexer.weights_proj.register_forward_hook(lambda module,args,out:out.to(torch.bfloat16))
-                    qa = torch.nn.Linear(p['hidden'],p['q_lora_rank'],bias=False)
-                    qa.weight.copy_(unpack_fp8_weight(values['l0_qa'],values['l0_qa_scale']))
-                    if deepseek:
-                        # TileRT multiplies the FP32 gamma before rounding once.
-                        hidden = rms(values['embed'][values['token']],values['ln1'][0],eps=1e-6,weight_in_fp32=True)[None,None]
-                        q_resid = rms(qa(quantize(hidden)).to(torch.bfloat16),values['l0_qn'],eps=1e-6,weight_in_fp32=True)
-                    else:
-                        norm = norm_class(p['hidden'],eps=1e-5).to(torch.bfloat16)
-                        norm.weight.copy_(values['ln1'][0])
-                        hidden = norm(values['embed'][values['token']])[None,None]
-                        qnorm = norm_class(p['q_lora_rank'],eps=1e-6).to(torch.bfloat16)
-                        qnorm.weight.copy_(values['l0_qn'])
-                        q_resid = qnorm(qa(quantize(hidden)).to(torch.bfloat16))
-                    def native_coordinates(value):
-                        if not deepseek:
-                            # HF emits half-split rotated pairs; native MLA/index cache uses interleaved pairs.
-                            rotated,passed = value.split((p['qk_rope_dim'],p['index_dim']-p['qk_rope_dim']),-1)
-                            left,right = rotated.chunk(2,-1)
-                            value = torch.cat((torch.stack((left,right),-1).flatten(-2),passed),-1)
-                        value = value.to(torch.bfloat16)
-                        return (value.float()@hadamard/p['index_dim']**0.5).to(torch.bfloat16) if deepseek else value
-                    written = {}
-                    class NativeCache:
-                        def update_indexer(self,key,layer):
-                            if deepseek:
-                                # TileRT keeps a BF16 Hadamard-domain key cache.
-                                written.update(key=native_coordinates(key)[0,0])
-                                return torch.cat((values['l0_index_cache'][None],native_coordinates(key)),1).float()
-                            payload,scale = pack_fp8_activation(native_coordinates(key),power_of_two=deepseek)
-                            written.update(payload=payload[0,0],scale=scale[0,0])
-                            old = unpack_fp8_activation(values['l0_index_cache'],values['l0_index_cache_scale'])[None]
-                            return torch.cat((old,unpack_fp8_activation(payload,scale)),1)
-                    matmul = torch.matmul
-                    def native_matmul(left,right,*args,**kwargs):
-                        if left.shape[-1] == p['index_dim'] and right.shape[-2] == p['index_dim']:
-                            left = native_coordinates(left).float() if deepseek else quantize(native_coordinates(left))
-                        return matmul(left,right,*args,**kwargs)
-                    position = torch.tensor([[p['context']]])
-                    # DeepSeek rotates with FP32 tables (TileRT); GLM with BF16 ones.
-                    rotary = rotary_class(config)(hidden.float() if deepseek else hidden,position)
-                    with patch('torch.matmul',native_matmul):
-                        selected = indexer(hidden,q_resid,rotary,
-                                           torch.zeros(1,1,p['context']+1),position,NativeCache())[0,0]
-                    actual = frontier.reference(case,values,serial=True)
-                    torch.testing.assert_close(actual['sparse_indices'][0],selected,rtol=0,atol=0)
-                    if deepseek:
-                        torch.testing.assert_close(actual['index_k_write'][0],written['key'],rtol=0,atol=0)
-                    else:
-                        torch.testing.assert_close(actual['index_k_write'][0].float(),written['payload'].float(),rtol=0,atol=0)
-                        torch.testing.assert_close(actual['index_scale_write'][0],written['scale'],rtol=0,atol=0)
+        from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32Indexer, DeepseekV32RotaryEmbedding
+        original = next(case for case in select_cases('p3') if case.family == 'deepseek_v32_step')
+        case = development(original)
+        case = replace(case,gpus=1,tp=1,params=case.params | {'layers':1,'first_dense':1})
+        p = case.params
+        rope = {'rope_type':'yarn','rope_theta':10000.,'factor':40.,'original_max_position_embeddings':4096,
+                'beta_fast':32,'beta_slow':1,'mscale':1.,'mscale_all_dim':1.}
+        config = DeepseekV32Config(hidden_size=p['hidden'],q_lora_rank=p['q_lora_rank'],qk_rope_head_dim=p['qk_rope_dim'],
+                                   index_n_heads=p['index_heads'],index_head_dim=p['index_dim'],index_topk=p['index_topk'],rope_parameters=rope)
+        # This independently constructs the normalized Hadamard matrix.
+        hadamard = torch.ones(1,1)
+        while hadamard.shape[0] < p['index_dim']:
+            hadamard = torch.cat((torch.cat((hadamard,hadamard),1),torch.cat((hadamard,-hadamard),1)),0)
+        for seed in (17,19):
+            with self.subTest(case=case.id,seed=seed), torch.no_grad():
+                values = frontier.make_inputs(case,seed,'cpu',rank=0)
+                values['l0_iw'].abs_()  # Positive scores avoid source-specific zero-score topk ties.
+                indexer = DeepseekV32Indexer(config,0).float().eval()
+                def quantize(value):
+                    payload,scale = pack_fp8_activation(value.to(torch.bfloat16),power_of_two=True)
+                    return unpack_fp8_activation(payload,scale)
+                for short,long in (('iq','wq_b'),('ik','wk')):
+                    module = getattr(indexer,long)
+                    module.weight.copy_(unpack_fp8_weight(values['l0_'+short],values['l0_'+short+'_scale']))
+                    # TileRT's DeepSeek wq_b consumes the BF16 q residual (W8A16).
+                    activation = (lambda value: value.float()) if short == 'iq' else quantize
+                    module.register_forward_pre_hook(lambda module,args,activation=activation:(activation(args[0]),))
+                    module.register_forward_hook(lambda module,args,out:out.to(torch.bfloat16))
+                indexer.k_norm.to(torch.bfloat16)
+                indexer.k_norm.weight.copy_(values['l0_inorm'])
+                indexer.k_norm.bias.copy_(values['l0_ibias'])
+                indexer.weights_proj.weight.copy_(values['l0_iw'])
+                # TileRT publishes the head weights as BF16.
+                indexer.weights_proj.register_forward_hook(lambda module,args,out:out.to(torch.bfloat16))
+                qa = torch.nn.Linear(p['hidden'],p['q_lora_rank'],bias=False)
+                qa.weight.copy_(unpack_fp8_weight(values['l0_qa'],values['l0_qa_scale']))
+                # TileRT multiplies the FP32 gamma before rounding once.
+                hidden = rms(values['embed'][values['token']],values['ln1'][0],eps=1e-6,weight_in_fp32=True)[None,None]
+                q_resid = rms(qa(quantize(hidden)).to(torch.bfloat16),values['l0_qn'],eps=1e-6,weight_in_fp32=True)
+                def native_coordinates(value):
+                    value = value.to(torch.bfloat16)
+                    return (value.float()@hadamard/p['index_dim']**0.5).to(torch.bfloat16)
+                written = {}
+                class NativeCache:
+                    def update_indexer(self,key,layer):
+                        # TileRT keeps a BF16 Hadamard-domain key cache.
+                        written.update(key=native_coordinates(key)[0,0])
+                        return torch.cat((values['l0_index_cache'][None],native_coordinates(key)),1).float()
+                matmul = torch.matmul
+                def native_matmul(left,right,*args,**kwargs):
+                    if left.shape[-1] == p['index_dim'] and right.shape[-2] == p['index_dim']:
+                        left = native_coordinates(left).float()
+                    return matmul(left,right,*args,**kwargs)
+                position = torch.tensor([[p['context']]])
+                # DeepSeek rotates with FP32 tables (TileRT).
+                rotary = DeepseekV32RotaryEmbedding(config)(hidden.float(),position)
+                with patch('torch.matmul',native_matmul):
+                    selected = indexer(hidden,q_resid,rotary,
+                                       torch.zeros(1,1,p['context']+1),position,NativeCache())[0,0]
+                actual = frontier.reference(case,values,serial=True)
+                torch.testing.assert_close(actual['sparse_indices'][0],selected,rtol=0,atol=0)
+                torch.testing.assert_close(actual['index_k_write'][0],written['key'],rtol=0,atol=0)
+
+    def test_glm_indexer_matches_tilert_rocm_goldens(self):
+        """GLM index keys and selection against TileRT's ROCm goldens.
+
+        Re-implements tilert/models/glm_5_2_rocm/ops/rotate.py (lane-wise
+        hadamard128, FP32 LayerNorm and interleaved RoPE, one rounding),
+        llm_preprocess.make_freqs_cis and sparse_index.select_golden, whose
+        top-k keeps every strictly larger logit and leaves threshold ties open.
+        """
+        case = replace(development(next(case for case in select_cases('p3') if case.family == 'glm52_step')),
+                       gpus=1, tp=1)
+        case = replace(case, params=case.params | {'layers': 1, 'first_dense': 1})
+        p = case.params
+        rd, ih, idim, position = p['qk_rope_dim'], p['index_heads'], p['index_dim'], p['context']
+
+        def hadamard128(x):
+            v = x.reshape(-1, 16, 8).clone()
+            for stage in range(3):
+                stride = 1 << stage
+                for j in range(4):
+                    low = j & stride - 1
+                    index = (j - low) * 2 + low
+                    a, b = v[:, :, index].clone(), v[:, :, index + stride].clone()
+                    v[:, :, index], v[:, :, index + stride] = a + b, a - b
+            lane = torch.arange(16)
+            for stage in range(4):
+                mask = 1 << stage
+                partner = v.index_select(1, lane ^ mask)
+                sign = torch.where((lane & mask).bool(), torch.tensor(-1.0), torch.tensor(1.0))
+                v = sign[None, :, None] * v + partner
+            return v.reshape(x.shape)
+
+        inv = 1.0 / 8_000_000.0 ** (torch.arange(0, rd, 2, dtype=torch.float32) / rd)
+        angle = torch.outer(torch.arange(position + 1), inv)
+        freqs = torch.view_as_real(torch.polar(torch.ones_like(angle), angle)).reshape(position + 1, rd)[position]
+
+        def rope_rotate(x):
+            out = x.clone()
+            pairs = x[..., :rd].reshape(*x.shape[:-1], rd // 2, 2)
+            c, d = freqs.reshape(rd // 2, 2)[:, 0], freqs.reshape(rd // 2, 2)[:, 1]
+            a, b = pairs[..., 0], pairs[..., 1]
+            out[..., :rd] = torch.stack([a * c - b * d, a * d + b * c], -1).reshape(*x.shape[:-1], rd)
+            return (hadamard128(out) * 0.08838834764831843).to(torch.bfloat16)
+
+        for seed in (17, 19):
+            with self.subTest(seed=seed), torch.no_grad():
+                values = frontier.make_inputs(case, seed, 'cpu', rank=0)
+                actual = frontier.reference(case, values, serial=True)
+                gemv = lambda name, value: (unpack_fp8_weight(values['l0_'+name], values['l0_'+name+'_scale'])
+                                            @ value.float()).to(torch.bfloat16)
+                normalized = rms(values['embed'][values['token']], values['ln1'][0], eps=1e-5, weight_in_fp32=True)
+                q_norm = rms(gemv('qa', normalized), values['l0_qn'], eps=1e-5, weight_in_fp32=True)
+                key = gemv('ik', normalized).float()
+                mean = key.mean(-1, keepdim=True)
+                key = (key - mean) * torch.rsqrt(((key - mean) ** 2).mean(-1, keepdim=True) + 1e-6)
+                key = rope_rotate(key * values['l0_inorm'].float() + values['l0_ibias'].float())
+                torch.testing.assert_close(actual['index_k_write'][0], key, rtol=0, atol=0)
+                query = rope_rotate(gemv('iq', q_norm).float().view(ih, idim))
+                weights = (values['l0_iw'].float() @ normalized.float()).to(torch.bfloat16).float()
+                cache = torch.cat((values['l0_index_cache'], key[None])).float()
+                logits = (torch.relu(query.float() @ cache.T * (ih**-0.5 * idim**-0.5)) * weights[:, None]).sum(0)
+                threshold = logits.sort(descending=True).values[p['index_topk'] - 1]
+                chosen = set(actual['sparse_indices'][0].tolist())
+                self.assertEqual(len(chosen), p['index_topk'])
+                self.assertTrue(set(torch.nonzero(logits > threshold).flatten().tolist()) <= chosen)
+                self.assertTrue(chosen <= set(torch.nonzero(logits >= threshold).flatten().tolist()))
 
     def test_absorbed_mla_matches_independent_expanded_attention(self):
         from transformers import DynamicCache
@@ -155,8 +192,10 @@ class FrontierMathTests(unittest.TestCase):
                         module.float()
                     module.weight.copy_(unpack_fp8_weight(values['l0_'+short],values['l0_'+short+'_scale']))
                     if short != 'kb':
-                        # DeepSeek (TileRT) quantizes only the input-norm projections.
-                        activation = (lambda value: value.float()) if deepseek and short in ('qb','o') else quantized
+                        # DeepSeek (TileRT) quantizes only the input-norm projections;
+                        # GLM (TileRT ROCm) keeps BF16 activations everywhere (W8A16).
+                        w8a16 = short not in frontier.DEEPSEEK_FP8_ACTIVATIONS if deepseek else short not in frontier.GLM_FP8_ACTIVATIONS
+                        activation = (lambda value: value.float()) if w8a16 else quantized
                         module.register_forward_pre_hook(lambda module,args,activation=activation: (activation(args[0]),))
                         module.register_forward_hook(lambda module,args,out:out.to(torch.bfloat16))
                     else:
@@ -167,11 +206,8 @@ class FrontierMathTests(unittest.TestCase):
                 attention.kv_a_layernorm.to(torch.bfloat16)
                 attention.q_a_layernorm.weight.copy_(values['l0_qn'])
                 attention.kv_a_layernorm.weight.copy_(values['l0_kn'])
-                if deepseek:
-                    latent = values['l0_kv_cache']
-                else:
-                    attention.kv_a_layernorm.register_forward_hook(lambda module,args,out: quantized(out).to(torch.bfloat16))
-                    latent = unpack_fp8_activation(values['l0_kv_cache'],values['l0_kv_cache_scale']).to(torch.bfloat16)
+                # TileRT caches the BF16 latent without FP8 scales.
+                latent = values['l0_kv_cache']
                 cache = DynamicCache(config=config)
                 nr,rd,vd = p['qk_nope_dim'],p['qk_rope_dim'],p['v_head_dim']
                 expanded = (latent@attention.kv_b_proj.weight.T).view(p['context'],p['q_heads'],nr+vd)
@@ -189,12 +225,18 @@ class FrontierMathTests(unittest.TestCase):
                 # Disable only the FFN so full reference logits expose the attention residual.
                 values['l0_down'].zero_()
                 absorbed_output = {}
-                native_linear = frontier.linear
+                native_linear, native_partial = frontier.linear, frontier.rank_partial
                 def observe_linear(value, weight, scale, power, **options):
                     if weight is values['l0_o']:
                         absorbed_output['attention'] = value.detach().clone()
                     return native_linear(value, weight, scale, power, **options)
-                with patch.object(frontier, 'linear', observe_linear):
+                def observe_partial(terms):
+                    # GLM fuses o_proj into TileRT's residual reduce.
+                    for value, weight, _, _ in terms:
+                        if weight is values['l0_o']:
+                            absorbed_output['attention'] = value.detach().clone()
+                    return native_partial(terms)
+                with patch.object(frontier, 'linear', observe_linear), patch.object(frontier, 'rank_partial', observe_partial):
                     frontier.reference(case,values,serial=True)
                 # Compare before the next FP8 quantization: different BF16
                 # schedules can cross its discrete thresholds. This check
@@ -202,10 +244,9 @@ class FrontierMathTests(unittest.TestCase):
                 expected = expanded_output['attention'].flatten().float()
                 actual = absorbed_output['attention'].float()
                 relative_l2 = (actual-expected).norm()/expected.norm()
-                # The native latent cache also passes through FP8 before
-                # either schedule; BF16 norm/expansion order can change that
-                # quantization. Bound RMS error rather than requiring the
-                # distinct schedules to produce bit-identical activations.
+                # FP8 input quantization (DeepSeek q_a/kv_a) and BF16
+                # norm/expansion order differ between the schedules. Bound RMS
+                # error rather than requiring bit-identical activations.
                 self.assertLess(float(relative_l2), 0.05)
 
     def test_agent_workspace_output_contract_matches_reference(self):
@@ -215,10 +256,142 @@ class FrontierMathTests(unittest.TestCase):
                 case = replace(development(original), gpus=1, tp=1)
                 outputs = frontier.reference(case, frontier.make_inputs(case, 5, 'cpu', rank=0), serial=True)
                 self.assertEqual(set(outputs), set(OUTPUT_KEYS[case.family]))
-                # DeepSeek follows TileRT's BF16 caches; GLM keeps native FP8 payloads.
-                cache_dtype = torch.bfloat16 if case.family == 'deepseek_v32_step' else torch.float8_e4m3fn
-                self.assertEqual(outputs['kv_write'].dtype, cache_dtype)
-                self.assertEqual(outputs['index_k_write'].dtype, cache_dtype)
+                # Both follow TileRT's BF16 caches, without FP8 scales.
+                for name in ('kv_write', 'pe_write', 'index_k_write'):
+                    self.assertEqual(outputs[name].dtype, torch.bfloat16)
+                self.assertEqual(outputs['logits'].dtype, torch.float32)
+
+    def test_activation_quantization_sites(self):
+        """GLM quantizes activations only for experts; DeepSeek only for q_a/kv_a/indexer wk."""
+        for family in ('deepseek_v32_step', 'glm52_step'):
+            with self.subTest(family=family):
+                case = replace(development(next(case for case in select_cases('p3') if case.family == family)),
+                               gpus=1, tp=1)
+                p = case.params
+                values = frontier.make_inputs(case, 7, 'cpu', rank=0)
+                native_pack, native_quantize = frontier.pack_fp8_activation, frontier.tilert_quantize
+                packed, quantized = [], []
+                def pack(value, **options):
+                    packed.append(value.shape[-1])
+                    return native_pack(value, **options)
+                def quantize(value):
+                    quantized.append(value.shape[-1])
+                    return native_quantize(value)
+                with patch.object(frontier, 'pack_fp8_activation', pack), patch.object(frontier, 'tilert_quantize', quantize):
+                    frontier.reference(case, values, serial=True)
+                moe_layers = p['layers'] - p['first_dense']
+                if family == 'deepseek_v32_step':
+                    # q_a and kv_a read the same normalized input; indexer wk too.
+                    self.assertEqual(packed, [p['hidden']]*3*p['layers'])
+                    self.assertEqual(quantized, [])
+                else:
+                    self.assertEqual(packed, [])
+                    inter = p['intermediate']
+                    # Normalized input, then the shared and routed mids.
+                    self.assertEqual(quantized, ([p['hidden']] + [inter]*(1+p['topk']))*moe_layers)
+
+    def test_glm_residual_reduce_rounds_once(self):
+        """o_proj and dense down partials join the residual in FP32 before one rounding."""
+        case = replace(development(next(case for case in select_cases('p3') if case.family == 'glm52_step')),
+                       gpus=1, tp=1)
+        case = replace(case, params=case.params | {'layers': 1, 'first_dense': 1})
+        values = frontier.make_inputs(case, 11, 'cpu', rank=0)
+        native, partials = frontier.rank_partial, []
+        def record(terms):
+            partials.append(native(terms))
+            return partials[-1]
+        with torch.no_grad(), patch.object(frontier, 'rank_partial', record):
+            actual = frontier.reference(case, values, serial=True)
+        self.assertEqual(len(partials), 2)
+        self.assertTrue(all(partial.dtype == torch.bfloat16 for partial in partials))
+        x = values['embed'][values['token']]
+        for partial in partials:
+            x = (x.float() + partial.float()).to(torch.bfloat16)
+        final = rms(x, values['fnorm'], eps=1e-5, weight_in_fp32=True)
+        self.assertTrue(torch.equal(actual['logits'], values['lm_head'].float() @ final.float()))
+        # The partial itself is one FP32 accumulation rounded once.
+        weight, scale = values['l0_down'], values['l0_down_scale']
+        mid = torch.randn(weight.shape[1]).to(torch.bfloat16)
+        expected = (unpack_fp8_weight(weight, scale) @ mid.float() * 0.5 + unpack_fp8_weight(weight, scale) @ mid.float()).to(torch.bfloat16)
+        self.assertTrue(torch.equal(native([(mid, weight, scale, 0.5), (mid, weight, scale, 1.0)]), expected))
+
+    def test_glm_moe_matches_tilert_w8a8_goldens(self):
+        """Routing, W8A8 experts and the down partial against TileRT ROCm goldens.
+
+        Re-implements moe_router.select_topk_golden, upgate_silu_w8a8.quant_std_blocks
+        and fused_moe_w8a8.golden_forward_w8a8/golden_down_w8a8 (per-K-block
+        scale folding); only FP32 summation order differs from the reference.
+        """
+        case = replace(development(next(case for case in select_cases('p3') if case.family == 'glm52_step')),
+                       gpus=1, tp=1)
+        # Layer 0 is dense (first_dense >= 1); layer 1 is the MoE layer under test.
+        case = replace(case, params=case.params | {'layers': 2, 'first_dense': 1})
+        p = case.params
+
+        def quant(x):
+            blocks = x.float().reshape(-1, 128)
+            scale = blocks.abs().amax(-1).clamp_min(1e-4) * torch.tensor(1.0 / 448, dtype=torch.float32)
+            return (blocks * (torch.ones_like(scale) / scale)[:, None]).to(torch.float8_e4m3fn).float(), scale
+
+        def blocked(weight, scale, payload, act_scale, factor=1.0):
+            out = torch.zeros(weight.shape[0])
+            rows = torch.arange(weight.shape[0]) // 128
+            for kb in range(weight.shape[1] // 128):
+                part = weight.float()[:, kb*128:(kb+1)*128] @ payload[kb]
+                out += part * (scale[rows, kb] * factor * float(act_scale[kb]))
+            return out
+
+        for seed in (5, 23):
+            with self.subTest(seed=seed), torch.no_grad():
+                values = frontier.make_inputs(case, seed, 'cpu', rank=0)
+                native, partials = frontier.rank_partial, []
+                def record(terms):
+                    partials.append(native(terms))
+                    return partials[-1]
+                with patch.object(frontier, 'rank_partial', record):
+                    actual = frontier.reference(case, values, serial=True)
+                x = values['embed'][values['token']]
+                for partial in partials[:3]:  # o_proj, dense down, o_proj
+                    x = (x.float() + partial.float()).to(torch.bfloat16)
+                normalized = rms(x, values['ln2'][1], eps=1e-5, weight_in_fp32=True)
+                logits = values['l1_router'].float() @ normalized.float()
+                scores = torch.sigmoid(logits)
+                ranked, ids, picked = scores + values['l1_router_bias'].float(), [], []
+                for _ in range(p['topk']):
+                    expert = int(torch.argmax(ranked))
+                    ids.append(expert)
+                    picked.append(float(scores[expert]))
+                    ranked[expert] = -float('inf')
+                total = sum(picked)
+                probabilities = [v * (2.5 / total) for v in picked]
+                self.assertEqual(actual['expert_ids'][1].tolist(), ids)
+                activation, activation_scale = quant(normalized)
+                out = torch.zeros(p['hidden'])
+                slots = [('shared_', None, 1.0)] + [('', e, w) for e, w in zip(ids, probabilities)]
+                for prefix, expert, factor in slots:
+                    def weight(name):
+                        w, s = values[f'l1_{prefix}{name}'], values[f'l1_{prefix}{name}_scale']
+                        return (w, s) if expert is None else (w[expert], s[expert])
+                    gate = blocked(*weight('gate'), activation, activation_scale)
+                    up = blocked(*weight('up'), activation, activation_scale)
+                    mid = (gate * torch.sigmoid(gate) * up).to(torch.bfloat16)
+                    out += blocked(*weight('down'), *quant(mid), factor)
+                torch.testing.assert_close(partials[3].float(), out.to(torch.bfloat16).float(), rtol=0.008, atol=1e-6)
+
+    def test_glm_route_and_quantizer_formulas(self):
+        ids, weights = frontier.route_tilert(torch.zeros(8), torch.zeros(8), 2)
+        self.assertTrue(torch.equal(ids, torch.tensor([0, 1])))
+        self.assertTrue(torch.equal(weights, torch.full((2,), 1.25)))
+        torch.manual_seed(3)
+        value = (torch.randn(2, 256)*3).to(torch.bfloat16)
+        value[1, 128:] = 0
+        payload, scale = frontier.tilert_quantize(value)
+        blocks = value.float().view(2, 2, 128)
+        expected_scale = blocks.abs().amax(-1).clamp_min(1e-4) * torch.tensor(1/448, dtype=torch.float32)
+        self.assertTrue(torch.equal(scale, expected_scale))
+        self.assertEqual(float(scale[1, 1]), float(torch.tensor(1e-4) * torch.tensor(1/448)))
+        expected = (blocks * (torch.ones_like(expected_scale)/expected_scale)[..., None]).to(torch.float8_e4m3fn)
+        self.assertTrue(torch.equal(payload.view(torch.uint8), expected.view(2, 256).view(torch.uint8)))
 
     def test_fp8_native_block_and_dynamic_scales(self):
         torch.manual_seed(13)

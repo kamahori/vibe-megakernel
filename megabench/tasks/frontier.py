@@ -6,11 +6,22 @@ block scales, dynamic activation quantization, sparse selection, and all
 collectives are consumed inside reference(), with no cached dequantization.
 The pinned model geometries and primary-source revisions are in model_specs.
 
-DeepSeek follows TileRT's B=1 decode numerics (tile-ai/TileRT 0.1.6), so the
-TileRT engine can be graded and timed on the same task: BF16 latent, rope and
-index-key caches; a BF16 indexer without FP8 Q/K; FP8 activations only for the
-input-norm projections (q_a, kv_a, indexer wk); BF16 activations against FP8
-weights elsewhere; and FP32 logits. GLM keeps its native FP8 caches.
+Both families follow TileRT 0.1.6's non-MTP B=1 decode numerics
+(tile-ai/TileRT), so the TileRT engine can be graded and timed on the same
+task. Shared: BF16 latent, rope and index-key caches without scales; FP32
+gamma applied before one BF16 rounding; FP32 rotary tables and products; a
+BF16 Hadamard-domain indexer; BF16 head weights with FP32 logits.
+
+DeepSeek (CUDA backend): FP8 activations only for q_a/kv_a/indexer wk, YaRN,
+grouped routing, power-of-two scales.
+
+GLM (ROCm backend, tilert/models/glm_5_2_rocm): W8A16 attention and dense
+FFN GEMVs with FP32 accumulation; FP32 LayerNorm/RoPE/Hadamard index keys and
+queries rounded once; MLA probabilities rounded to BF16 before the latent
+product; W8A8 routed and shared experts (TileRT's per-128 activation
+quantizer); each output projection's rank-local BF16 partial is summed in
+FP32 with the residual and rounded once. Choices the public sources cannot
+settle are the GLM_* constants below.
 """
 
 from __future__ import annotations
@@ -28,6 +39,25 @@ from .distributed import matrix, seed_for, reduce_sum, greedy_token
 from .parallel import initialize
 from .quantization import (FP8_BLOCK, pack_fp8_activation, pack_fp8_weight,
                            unpack_fp8_activation, unpack_fp8_weight)
+
+
+# Families whose decode numerics follow TileRT 0.1.6 (every frontier family).
+TILERT_FAMILIES = frozenset({'deepseek_v32_step', 'glm52_step'})
+
+# GLM-5.2 choices that TileRT's binary-only ROCm kernels leave open. Each is
+# the most likely reading of the public goldens; flip after MI350X checks
+# (probes/tilert_glm52_probe.py --check-ops).
+# Names of attention/dense-FFN projections that quantize their BF16 input to
+# FP8 (W8A8). The goldens (unprojo_allreduce.partial_golden) use BF16 inputs.
+GLM_FP8_ACTIVATIONS: frozenset[str] = frozenset()
+# Dense SwiGLU: FP32 gate/up accumulators, silu(gate)*up in FP32, one BF16
+# rounding (as the W8A8 MoE golden). False rounds gate/up to BF16 first.
+GLM_DENSE_SWIGLU_FP32 = True
+# Sparse MLA rounds the FP32 softmax probabilities to BF16 before the latent
+# product (flash_sparse_mla.golden_attention); split-K kernels may not.
+GLM_PROBABILITIES_BF16 = True
+# q_a and kv_a RMSNorm epsilon (rmsnorm_projq_wqb.EPS, rmsnorm_kv.EPS).
+GLM_LATENT_NORM_EPS = 1e-5
 
 
 def indexer_layer(case: Case, layer: int) -> bool:
@@ -55,6 +85,8 @@ def fp8_matrix(seed: int, name: str, rows: int, cols: int, device: str,
 
 
 def _check_topology(case: Case, rank: int) -> None:
+    if case.family not in TILERT_FAMILIES:
+        raise ValueError(f'{case.family} is not a frontier family')
     if case.ep != 1 or case.gpus != case.tp or not 0 <= rank < case.gpus:
         raise ValueError('frontier reference requires one TP group covering all ranks')
     p = case.params
@@ -109,11 +141,8 @@ def layer_inputs(case: Case, seed: int, layer: int, device: str, *, rank: int) -
     weight('ka', krank+rotary, h)
     weight('kb', heads*(nope+vd), krank, rr=split(heads*(nope+vd)))
     weight('o', h, heads*vd, cr=split(heads*vd))
-    latent = matrix(seed, prefix+'latent_cache', p['context'], krank, krank, device)
-    if power:
-        values[prefix+'kv_cache'] = latent
-    else:
-        values[prefix+'kv_cache'], values[prefix+'kv_cache_scale'] = pack_fp8_activation(latent, power_of_two=power)
+    # TileRT keeps BF16 latent, rope and index-key caches without scales.
+    values[prefix+'kv_cache'] = matrix(seed, prefix+'latent_cache', p['context'], krank, krank, device)
     values[prefix+'pe_cache'] = matrix(seed, prefix+'pe_cache', p['context'], rotary, rotary, device)
     if indexer_layer(case, layer):
         ih, idim = p['index_heads'], p['index_dim']
@@ -122,11 +151,7 @@ def layer_inputs(case: Case, seed: int, layer: int, device: str, *, rank: int) -
         values[prefix+'inorm'] = (matrix(seed, prefix+'inorm', 1, idim, 100, device)[0].float()+1).to(torch.bfloat16)
         values[prefix+'ibias'] = matrix(seed, prefix+'ibias', 1, idim, 100, device)[0]
         values[prefix+'iw'] = matrix(seed, prefix+'iw', ih, h, h, device)
-        old = matrix(seed, prefix+'index_cache', p['context'], idim, idim, device)
-        if power:
-            values[prefix+'index_cache'] = old
-        else:
-            values[prefix+'index_cache'], values[prefix+'index_cache_scale'] = pack_fp8_activation(old, power_of_two=power)
+        values[prefix+'index_cache'] = matrix(seed, prefix+'index_cache', p['context'], idim, idim, device)
     if layer < p['first_dense']:
         inter = p['dense_intermediate']
         weight('gate', inter, h, rr=split(inter))
@@ -134,8 +159,8 @@ def layer_inputs(case: Case, seed: int, layer: int, device: str, *, rank: int) -
         weight('down', h, inter, cr=split(inter))
     else:
         inter, experts = p['intermediate'], p['experts']
-        router = matrix(seed, prefix+'router', experts, h, h, device)
-        values[prefix+'router'] = router if power else router.float()
+        # TileRT stores BF16 router weights and forms FP32 logits.
+        values[prefix+'router'] = matrix(seed, prefix+'router', experts, h, h, device)
         values[prefix+'router_bias'] = matrix(seed, prefix+'router_bias', 1, experts, 100, device)[0].float()
         for name, rows, cols, rr, cr in (('gate', inter, h, split(inter), None),
                                       ('up', inter, h, split(inter), None),
@@ -168,7 +193,35 @@ def linear(value: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, power
 DEEPSEEK_FP8_ACTIVATIONS = frozenset({'qa', 'ka', 'ik'})
 
 
+def tilert_quantize(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """TileRT ROCm W8A8 activation quantizer (upgate_silu_w8a8.quant_std_blocks).
+
+    Per 128 channels: ``scale = max(amax, 1e-4) * fp32(1/448)`` and
+    ``q = x * (1/scale)`` without clamping; returns FP8 payload and FP32 scales.
+    """
+    groups = value.float().unflatten(-1, (-1, FP8_BLOCK))
+    scale = groups.abs().amax(-1).clamp_min(1e-4) * torch.tensor(1/448, dtype=torch.float32, device=value.device)
+    payload = (groups * (1/scale)[..., None]).to(torch.float8_e4m3fn)
+    return payload.flatten(-2), scale
+
+
+def rank_partial(terms) -> torch.Tensor:
+    """One rank's residual-reduce operand, rounded once to BF16.
+
+    ``terms`` are ``(activation, fp8_weight, scale, factor)``: FP32 GEMVs over
+    this rank's K shard, scaled by ``factor`` and summed in FP32. TileRT then
+    sums the ranks' BF16 partials and the residual in FP32 and rounds once
+    (unprojo_allreduce/moe_down_allreduce ``partial_golden``/``reduce_golden``).
+    """
+    total = None
+    for activation, weight, scale, factor in terms:
+        part = (unpack_fp8_weight(weight, scale) @ activation.float()) * factor
+        total = part if total is None else total + part
+    return total.to(torch.bfloat16)
+
+
 def rotate(value: torch.Tensor, position: int, *, deepseek: bool, interleaved: bool) -> torch.Tensor:
+    """Rotary embedding in FP32 with FP32 tables, rounded once to ``value``'s dtype."""
     dim = value.shape[-1]
     theta = 10000.0 if deepseek else 8_000_000.0
     frequencies = theta ** (torch.arange(0, dim, 2, device=value.device, dtype=torch.float32)/dim)
@@ -181,17 +234,16 @@ def rotate(value: torch.Tensor, position: int, *, deepseek: bool, interleaved: b
         inv = (1.0/(40*frequencies))*(1-extrapolation) + inv*extrapolation
     angle = position*inv
     a, b = (value[..., 0::2], value[..., 1::2]) if interleaved else value.chunk(2, -1)
-    # DeepSeek rotates in FP32 with FP32 tables and rounds once, as TileRT does.
-    compute = torch.float32 if deepseek else value.dtype
-    a, b = a.to(compute), b.to(compute)
-    cos, sin = angle.cos().to(compute), angle.sin().to(compute)
+    # TileRT rotates in FP32 with FP32 tables and rounds once.
+    a, b = a.float(), b.float()
+    cos, sin = angle.cos().float(), angle.sin().float()
     a, b = a*cos-b*sin, b*cos+a*sin
     result = torch.stack((a,b), -1).flatten(-2) if interleaved else torch.cat((a,b), -1)
     return result.to(value.dtype)
 
 
-def hadamard(value: torch.Tensor) -> torch.Tensor:
-    """Normalized Walsh-Hadamard transform used before DeepSeek FP8 indexing."""
+def walsh_hadamard(value: torch.Tensor) -> torch.Tensor:
+    """Unnormalized natural-order (Sylvester) Walsh-Hadamard transform in FP32."""
     width = value.shape[-1]
     if width & (width-1):
         raise ValueError('Hadamard width must be a power of two')
@@ -201,7 +253,29 @@ def hadamard(value: torch.Tensor) -> torch.Tensor:
         left, right = blocks[..., 0, :], blocks[..., 1, :]
         output = torch.stack((left+right, left-right), -2).flatten(-3)
         stride *= 2
-    return (output/width**0.5).to(torch.bfloat16)
+    return output
+
+
+def hadamard(value: torch.Tensor) -> torch.Tensor:
+    """Normalized Walsh-Hadamard transform used before DeepSeek indexing."""
+    return (walsh_hadamard(value)/value.shape[-1]**0.5).to(torch.bfloat16)
+
+
+def glm_index_transform(value: torch.Tensor, position: int, rotary: int) -> torch.Tensor:
+    """TileRT GLM indexer rows (ops/rotate.py): FP32 interleaved RoPE on the
+    first ``rotary`` dims, Hadamard times width**-0.5, one BF16 rounding."""
+    value = value.float()
+    value = torch.cat((rotate(value[..., :rotary], position, deepseek=False, interleaved=True),
+                       value[..., rotary:]), -1)
+    return (walsh_hadamard(value)*value.shape[-1]**-0.5).to(torch.bfloat16)
+
+
+def layer_norm_fp32(value: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float) -> torch.Tensor:
+    """FP32 LayerNorm with FP32 affine terms (ops/rotate.py rows_golden_f32)."""
+    value = value.float()
+    mean = value.mean(-1, keepdim=True)
+    variance = ((value-mean)**2).mean(-1, keepdim=True)
+    return (value-mean)*torch.rsqrt(variance+eps)*weight.float() + bias.float()
 
 
 def route(scores: torch.Tensor, bias: torch.Tensor, topk: int, groups: int, selected_groups: int,
@@ -220,9 +294,21 @@ def route(scores: torch.Tensor, bias: torch.Tensor, topk: int, groups: int, sele
     return indices, weights/(weights.sum()+1e-20)*scaling
 
 
+def route_tilert(scores: torch.Tensor, bias: torch.Tensor, topk: int,
+                 scaling: float = 2.5) -> tuple[torch.Tensor, torch.Tensor]:
+    """GLM routing as moe_router.select_topk_golden: sigmoid plus FP32 bias,
+    top-k with the lowest index winning ties, ``v * (scale / sum(v))``."""
+    probability = scores.float().sigmoid()
+    indices = (probability+bias.float()).argsort(descending=True, stable=True)[:topk]
+    weights = probability[indices]
+    return indices, weights*(scaling/weights.sum())
+
+
 def reference(case: Case, values: dict[str, torch.Tensor], *, serial: bool = False) -> dict[str, torch.Tensor]:
     if serial and (case.gpus, case.tp, case.ep) != (1, 1, 1):
         raise ValueError('serial validation requires unsharded geometry')
+    if case.family not in TILERT_FAMILIES:
+        raise ValueError(f'{case.family} is not a frontier family')
     ctx = SimpleNamespace(tp_rank=0, tp_group=None) if serial else initialize(case)
     sum_value = (lambda value: value) if serial else (lambda value: reduce_sum(value, ctx.tp_group))
     p, tp = case.params, case.tp
@@ -234,9 +320,22 @@ def reference(case: Case, values: dict[str, torch.Tensor], *, serial: bool = Fal
     x = values['embed'][token-offset] if offset <= token < offset+chunk else torch.zeros(h, device=values['token'].device, dtype=torch.bfloat16)
     x = sum_value(x)
     eps = 1e-6 if deepseek else 1e-5
-    # DeepSeek applies the FP32 gamma before its single BF16 rounding.
-    norm = lambda value, gamma, eps=eps: rms(value, gamma, eps=eps, weight_in_fp32=deepseek)
-    latent_out, latent_scales, pe_out, index_keys, index_scales, indices_out, expert_ids = [], [], [], [], [], [], []
+    latent_eps = 1e-6 if deepseek else GLM_LATENT_NORM_EPS
+    # TileRT applies the FP32 gamma before its single BF16 rounding.
+    norm = lambda value, gamma, eps=eps: rms(value, gamma, eps=eps, weight_in_fp32=True)
+    activations = DEEPSEEK_FP8_ACTIVATIONS if deepseek else GLM_FP8_ACTIVATIONS
+
+    def glm_input(name, value):
+        """A GLM GEMV input: BF16 (W8A16) unless listed in GLM_FP8_ACTIVATIONS."""
+        if name not in GLM_FP8_ACTIVATIONS:
+            return value
+        return unpack_fp8_activation(*pack_fp8_activation(value.to(torch.bfloat16)))
+
+    def residual_add(residual, partial):
+        """TileRT's fused reduce: FP32 sum of BF16 rank partials and the residual, one rounding."""
+        return (residual.float()+sum_value(partial.float())).to(residual.dtype)
+
+    latent_out, pe_out, index_keys, indices_out, expert_ids = [], [], [], [], []
     selected = None
     for layer in range(p['layers']):
         prefix = f'l{layer}_'
@@ -244,95 +343,123 @@ def reference(case: Case, values: dict[str, torch.Tensor], *, serial: bool = Fal
             weight, scale = values[prefix+name], values[prefix+name+'_scale']
             if expert is not None:
                 weight, scale = weight[expert], scale[expert]
-            return linear(value, weight, scale, power,
-                          quantize=not deepseek or name in DEEPSEEK_FP8_ACTIVATIONS)
+            return linear(value, weight, scale, power, quantize=name in activations)
+        def gemv(name, value, expert=None):
+            """FP32 GLM GEMV output, before any BF16 rounding."""
+            weight, scale = values[prefix+name], values[prefix+name+'_scale']
+            if expert is not None:
+                weight, scale = weight[expert], scale[expert]
+            return unpack_fp8_weight(weight, scale) @ value.float()
         normalized = norm(x, values['ln1'][layer])
-        qr = norm(project('qa', normalized), values[prefix+'qn'], eps=1e-6)
+        qr = norm(project('qa', normalized), values[prefix+'qn'], eps=latent_eps)
         query = project('qb', qr).view(heads, nr+rd)
         raw = project('ka', normalized)
-        latent = norm(raw[:kr], values[prefix+'kn'], eps=1e-6)
-        if deepseek:
-            latent_out.append(latent)
-            old_latent = values[prefix+'kv_cache']
-        else:
-            latent_payload, latent_scale = pack_fp8_activation(latent.to(torch.bfloat16), power_of_two=power)
-            latent = unpack_fp8_activation(latent_payload, latent_scale).to(torch.bfloat16)
-            latent_out.append(latent_payload)
-            latent_scales.append(latent_scale)
-            old_latent = unpack_fp8_activation(values[prefix+'kv_cache'], values[prefix+'kv_cache_scale']).to(torch.bfloat16)
+        latent = norm(raw[:kr], values[prefix+'kn'], eps=latent_eps)
+        latent_out.append(latent)
         pe = rotate(raw[kr:], p['context'], deepseek=deepseek, interleaved=True)
         query_pe = rotate(query[:, nr:], p['context'], deepseek=deepseek, interleaved=True)
         pe_out.append(pe.to(torch.bfloat16))
-        all_latent = torch.cat((old_latent, latent[None]))
+        all_latent = torch.cat((values[prefix+'kv_cache'], latent[None]))
         all_pe = torch.cat((values[prefix+'pe_cache'], pe[None]))
         if indexer_layer(case, layer):
             ih, idim = p['index_heads'], p['index_dim']
             iq = project('iq', qr).view(ih, idim)
-            ik = F.layer_norm(project('ik', normalized), (idim,), values[prefix+'inorm'], values[prefix+'ibias'], eps=1e-6)
-            iq = torch.cat((rotate(iq[:, :rd], p['context'], deepseek=deepseek, interleaved=not deepseek), iq[:, rd:]), -1)
-            ik = torch.cat((rotate(ik[:rd], p['context'], deepseek=deepseek, interleaved=not deepseek), ik[rd:]), -1)
             if deepseek:
+                ik = F.layer_norm(project('ik', normalized), (idim,), values[prefix+'inorm'], values[prefix+'ibias'], eps=1e-6)
+                iq = torch.cat((rotate(iq[:, :rd], p['context'], deepseek=deepseek, interleaved=False), iq[:, rd:]), -1)
+                ik = torch.cat((rotate(ik[:rd], p['context'], deepseek=deepseek, interleaved=False), ik[rd:]), -1)
                 # TileRT rotates both sides by a Hadamard transform and keeps
                 # BF16 query, key cache and head weights (no FP8 indexer).
                 iq = hadamard(iq.to(torch.bfloat16))
                 ik = hadamard(ik.to(torch.bfloat16))
                 index_cache = torch.cat((values[prefix+'index_cache'], ik[None])).float()
                 iw = (values[prefix+'iw'].float() @ normalized.float()).to(torch.bfloat16).float() / ih**0.5
-                index_keys.append(ik)
-                iq = iq.float()
+                scores = (F.relu(iq.float() @ index_cache.T / idim**0.5)*iw[:, None]).sum(0)
             else:
-                # GLM's published eager indexer works directly in BF16/FP32.
-                iq_payload, iq_scale = pack_fp8_activation(iq.to(torch.bfloat16), power_of_two=power)
-                ik_payload, ik_scale = pack_fp8_activation(ik.to(torch.bfloat16), power_of_two=power)
-                iq = unpack_fp8_activation(iq_payload, iq_scale)
-                index_cache = torch.cat((unpack_fp8_activation(values[prefix+'index_cache'], values[prefix+'index_cache_scale']),
-                                         unpack_fp8_activation(ik_payload, ik_scale)[None]))
-                # Upstream keeps the sparse-index weighting projection in FP32.
-                iw = (values[prefix+'iw'].float() @ normalized.float()) / ih**0.5
-                index_keys.append(ik_payload)
-                index_scales.append(ik_scale)
-            scores = (F.relu(iq @ index_cache.T / idim**0.5)*iw[:, None]).sum(0)
+                # TileRT ROCm (ops/rotate.py, ops/sparse_index.py): the BF16
+                # key is LayerNormed, rotated and Hadamard-transformed in FP32
+                # and rounded once, as is each query head; BF16 head weights;
+                # FP32 logits with both scales inside the ReLU.
+                ik = layer_norm_fp32(project('ik', normalized), values[prefix+'inorm'], values[prefix+'ibias'], 1e-6)
+                ik = glm_index_transform(ik, p['context'], rd)
+                iq = glm_index_transform(iq, p['context'], rd)
+                index_cache = torch.cat((values[prefix+'index_cache'], ik[None])).float()
+                iw = (values[prefix+'iw'].float() @ normalized.float()).to(torch.bfloat16)
+                scores = (F.relu(iq.float() @ index_cache.T * (ih**-0.5*idim**-0.5))*iw.float()[:, None]).sum(0)
+            index_keys.append(ik)
+            # Lowest index wins ties (TileRT's radix select leaves them open).
             selected = scores.argsort(descending=True, stable=True)[:min(p['index_topk'], p['context']+1)].to(torch.int32)
         indices_out.append(selected)
-        weight = unpack_fp8_weight(values[prefix+'kb'], values[prefix+'kb_scale']).to(x.dtype).view(heads, nr+vd, kr)
-        absorbed = torch.einsum('hd,hdc->hc', query[:, :nr], weight[:, :nr])
+        if deepseek:
+            weight = unpack_fp8_weight(values[prefix+'kb'], values[prefix+'kb_scale']).to(x.dtype).view(heads, nr+vd, kr)
+            absorbed = torch.einsum('hd,hdc->hc', query[:, :nr], weight[:, :nr])
+        else:
+            # Absorptions keep the FP32-dequantized kv_b block (W8A16, BF16 out).
+            weight = unpack_fp8_weight(values[prefix+'kb'], values[prefix+'kb_scale']).view(heads, nr+vd, kr)
+            absorbed = torch.einsum('hd,hdc->hc', query[:, :nr].float(), weight[:, :nr]).to(x.dtype)
         scores = (absorbed.float() @ all_latent.float().T + query_pe.float() @ all_pe.float().T)/(nr+rd)**0.5
         if deepseek:
             scores = scores*(1+0.1*math.log(40))**2
         mask = torch.ones(p['context']+1, device=x.device, dtype=torch.bool)
         mask[selected.long()] = False
         probability = scores.masked_fill(mask[None], -torch.inf).softmax(-1)
-        attention_latent = probability.to(x.dtype) @ all_latent
-        attention = torch.einsum('hc,hdc->hd', attention_latent, weight[:, nr:]).flatten()
-        x = x+sum_value(project('o', attention))
+        if deepseek:
+            attention_latent = probability.to(x.dtype) @ all_latent
+            attention = torch.einsum('hc,hdc->hd', attention_latent, weight[:, nr:]).flatten()
+            x = x+sum_value(project('o', attention))
+        else:
+            if GLM_PROBABILITIES_BF16:
+                probability = probability.to(x.dtype).float()
+            attention_latent = (probability @ all_latent.float()).to(x.dtype)
+            attention = torch.einsum('hc,hdc->hd', attention_latent.float(), weight[:, nr:]).to(x.dtype).flatten()
+            x = residual_add(x, rank_partial([(glm_input('o', attention), values[prefix+'o'], values[prefix+'o_scale'], 1.0)]))
         normalized = norm(x, values['ln2'][layer])
-        # TileRT forms silu(gate)*up in FP32 and rounds once.
-        swiglu = ((lambda gate, up: (F.silu(gate.float())*up.float()).to(gate.dtype)) if deepseek
-                  else (lambda gate, up: F.silu(gate)*up))
-        if layer < p['first_dense']:
-            output = project('down', swiglu(project('gate', normalized), project('up', normalized)))
+        if deepseek:
+            # TileRT forms silu(gate)*up in FP32 and rounds once.
+            swiglu = lambda gate, up: (F.silu(gate.float())*up.float()).to(gate.dtype)
+            if layer < p['first_dense']:
+                output = project('down', swiglu(project('gate', normalized), project('up', normalized)))
+                expert_ids.append(torch.full((p['topk'],), -1, device=x.device, dtype=torch.int64))
+            else:
+                ids, weights = route(values[prefix+'router'].float() @ normalized.float(), values[prefix+'router_bias'],
+                                     p['topk'], p['router_groups'], p['router_top_groups'])
+                expert_ids.append(ids)
+                # Experts accumulate in FP32. TileRT rounds each weighted routed
+                # expert's TP partial to BF16; that rank-local rounding is not
+                # TP-invariant, so it is left to the tolerance band.
+                output = torch.zeros_like(x, dtype=torch.float32)
+                for slot, expert in enumerate(ids.tolist()):
+                    hidden = swiglu(project('gate', normalized, expert), project('up', normalized, expert))
+                    output = output+project('down', hidden, expert).float()*weights[slot]
+                output = output+project('shared_down', swiglu(project('shared_gate', normalized), project('shared_up', normalized))).float()
+            x = x+sum_value(output).to(x.dtype)
+        elif layer < p['first_dense']:
+            gate, up = gemv('gate', glm_input('gate', normalized)), gemv('up', glm_input('up', normalized))
+            if not GLM_DENSE_SWIGLU_FP32:
+                gate, up = gate.to(x.dtype).float(), up.to(x.dtype).float()
+            mid = (gate*torch.sigmoid(gate)*up).to(x.dtype)
+            x = residual_add(x, rank_partial([(glm_input('down', mid), values[prefix+'down'], values[prefix+'down_scale'], 1.0)]))
             expert_ids.append(torch.full((p['topk'],), -1, device=x.device, dtype=torch.int64))
         else:
-            ids, weights = route(values[prefix+'router'].float() @ normalized.float(), values[prefix+'router_bias'],
-                                 p['topk'], p['router_groups'], p['router_top_groups'])
+            ids, weights = route_tilert(values[prefix+'router'].float() @ normalized.float(), values[prefix+'router_bias'], p['topk'])
             expert_ids.append(ids)
-            # Experts accumulate in FP32. TileRT rounds each weighted routed
-            # expert's TP partial to BF16; that rank-local rounding is not
-            # TP-invariant, so it is left to the tolerance band.
-            output = torch.zeros_like(x, dtype=torch.float32)
-            for slot, expert in enumerate(ids.tolist()):
-                hidden = swiglu(project('gate', normalized, expert), project('up', normalized, expert))
-                output = output+project('down', hidden, expert).float()*weights[slot]
-            output = output+project('shared_down', swiglu(project('shared_gate', normalized), project('shared_up', normalized))).float()
-        x = x+sum_value(output).to(x.dtype)
+            # W8A8 experts (fused_moe_w8a8 goldens): FP32 gate/up, mid rounded
+            # to BF16 and re-quantized; slot 0 is the shared expert (weight 1).
+            activation = unpack_fp8_activation(*tilert_quantize(normalized))
+            def expert_term(gate, up, down, expert, factor):
+                gate, up = gemv(gate, activation, expert), gemv(up, activation, expert)
+                mid = (gate*torch.sigmoid(gate)*up).to(x.dtype)
+                weight, scale = values[prefix+down], values[prefix+down+'_scale']
+                if expert is not None:
+                    weight, scale = weight[expert], scale[expert]
+                return unpack_fp8_activation(*tilert_quantize(mid)), weight, scale, factor
+            terms = [expert_term('shared_gate', 'shared_up', 'shared_down', None, 1.0)]
+            terms += [expert_term('gate', 'up', 'down', expert, weights[slot]) for slot, expert in enumerate(ids.tolist())]
+            x = residual_add(x, rank_partial(terms))
     final = norm(x, values['fnorm'])
-    # DeepSeek (TileRT) keeps FP32 logits from the BF16 head GEMV.
-    logits = values['lm_head'].float() @ final.float() if deepseek else values['lm_head'] @ final
-    outputs = {'logits': logits.float(), 'next_token': logits.argmax() if serial else greedy_token(logits, offset, ctx.tp_group),
-               'kv_write': torch.stack(latent_out), 'pe_write': torch.stack(pe_out),
-               'index_k_write': torch.stack(index_keys),
-               'sparse_indices': torch.stack(indices_out), 'expert_ids': torch.stack(expert_ids)}
-    if not deepseek:
-        # Native FP8 cache payloads and their scales must travel together.
-        outputs |= {'kv_scale_write': torch.stack(latent_scales), 'index_scale_write': torch.stack(index_scales)}
-    return outputs
+    # TileRT keeps FP32 logits from the BF16 head GEMV.
+    logits = values['lm_head'].float() @ final.float()
+    return {'logits': logits, 'next_token': logits.argmax() if serial else greedy_token(logits, offset, ctx.tp_group),
+            'kv_write': torch.stack(latent_out), 'pe_write': torch.stack(pe_out),
+            'index_k_write': torch.stack(index_keys),
+            'sparse_indices': torch.stack(indices_out), 'expert_ids': torch.stack(expert_ids)}

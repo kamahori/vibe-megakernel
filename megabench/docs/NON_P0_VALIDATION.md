@@ -18,7 +18,7 @@ two MegaMoE EP8 layer cases.
 | Gemma 3 27B TP2 | All 62 layers with vocabulary/head/intermediate shards and live TP reductions | CPU and full two-B200 outputs match the independent serial decoder for both seeds; enabled |
 | Qwen3-30B-A3B TP2/EP2 | All 48 layers, contiguous EP expert ownership, TP attention/FFN and distributed greedy token | CPU and full four-B200 logits, KV and global expert IDs match the independent serial decoder for both seeds; enabled |
 | DeepSeek-V3.2 TP8 (contexts 128, 4K, 32K) | All 61 layers in TileRT 0.1.6 decode numerics: block FP8 weights, FP8 activations only for q_a/kv_a/indexer-wk, BF16 latent/rope/index-key caches, BF16 Hadamard indexer, grouped routing and shared expert, FP32 logits | Independent expanded MLA, upstream indexer (exact selection and key writes), YaRN, routing and quantization tests; CPU TP rollouts and candidate harness pass; eight-B200 verification of the TileRT numerics pending; enabled |
-| GLM-5.2-FP8 TP8 | All 78 layers, block FP8 weights, MLA, scheduled full/shared indexers and MoE | Independent expanded MLA, FP8 and routing tests; CPU TP and candidate harness pass; full eight-B200 three-step rollouts pass both seeds with exact replicated-state agreement; enabled |
+| GLM-5.2-FP8 TP8 (contexts 128, 4K, 32K) | All 78 layers in TileRT 0.1.6 ROCm decode numerics: block FP8 weights, BF16 activations for attention/dense GEMVs, W8A8 routed and shared experts, BF16 latent/rope/index-key caches, BF16 Hadamard indexer on scheduled full/shared layers, rank partials fused into the residual reduce, FP32 logits | Independent expanded MLA, TileRT ROCm indexer and W8A8 MoE goldens, residual-reduce and routing tests; CPU TP rollouts and candidate harness pass; eight-MI350X verification of the TileRT numerics pending; enabled |
 | GLM-5.3-Flash TP4 | All 45 layers: mHC (4 streams, 20 Sinkhorn iterations), 34 KDA and 11 NoPE MLA/DSA layers, block FP8 weights, 288-expert MoE | Pinned transformers 5.17.0 `Glm5NextTextModel` decode matches every output for three seeds; CPU TP2/TP4 rollouts and candidate harness pass; full four-B200 three-step rollout passes with exact replicated-state agreement; enabled |
 | Kimi-K3 layer EP8 (KDA layer 61, MLA layer 63) | One mid-block layer per attention variant: attention residuals, DP attention over 8 sequences per rank, EP8 MXFP4 experts with all-to-all dispatch/combine, latent norm/up and shared experts | Matches the whole-model Kimi reference's layer slice; CPU 2/8-rank all-to-all equals the serial 64-sequence batch; candidate harness passes; full eight-B200 EP8 outputs equal the serial run bit for bit for both seeds; enabled |
 | Kimi-K3 TP16 | All 93 layers, 69 KDA/24 gated MLA, attention residuals, BF16 latent/shared paths and native MXFP4 routed experts | Official pinned decoder/FLA oracle, eight-step independent KDA recurrence and 16-rank CPU protocol pass; deferred by request; disabled |
@@ -42,8 +42,8 @@ Reset fixtures clear both conventional/compressed and recurrent history.
 
 Frontier FP8 payloads and FP32 block/activation scales remain separate runtime
 inputs; the reference performs activation quantization and dequantization
-inside the timed call. DeepSeek caches are BF16 without scales, and its outputs
-omit `kv_scale_write`/`index_scale_write`; GLM keeps native FP8 caches. GPT-OSS uses its native input/output expert orientation;
+inside the timed call. DeepSeek and GLM caches are BF16 without scales (TileRT
+numerics), so their outputs have no `kv_scale_write`/`index_scale_write`. GPT-OSS uses its native input/output expert orientation;
 Kimi uses native row-major MXFP4/E8M0 groups of 32. No dequantized expert weights
 or precomputed timed decoder activations are supplied to candidates.
 
@@ -95,6 +95,66 @@ reproductions/TileRT/.venv/bin/python -m megabench.probes.tilert_dsv32_probe til
 The `tilert` step checks a digest of regenerated inputs against the reference
 run, so torch RNG drift between the two environments fails loudly.
 
+## TileRT comparison (GLM-5.2, ROCm)
+
+The GLM-5.2 cases follow the numerics of TileRT 0.1.6's ROCm backend
+(`tilert/models/glm_5_2_rocm`, eight MI350X/MI355X, non-MTP, B=1), read from
+its public Python goldens and weight converter:
+
+- FP32-gamma RMSNorm rounded once (eps 1e-5, including q_a/kv_a norms); BF16
+  latent, rope and index-key caches (`TILERT_GLM5_FP8_KV=0`,
+  `TILERT_GLM5_FP8_KI=0`).
+- Attention and dense-FFN GEMVs: FP8 weights with 128x128 scales, BF16
+  activations, FP32 accumulation, BF16 outputs; kv_b absorptions keep the
+  FP32-dequantized blocks.
+- Interleaved FP32 RoPE (theta 8e6). MLA scores and softmax in FP32 with scale
+  256^-0.5; probabilities rounded to BF16 before the latent product.
+- Indexer (layers 0-2 and every fourth layer from 6; the others reuse the last
+  selection): key = FP32 LayerNorm (eps 1e-6), RoPE on the first 64 dims and a
+  natural-order Hadamard times 128^-0.5, rounded once; queries likewise; BF16
+  head weights; logits `sum_h relu(q.k * 32^-0.5 * 128^-0.5) * w_h` in FP32;
+  top-2048 over `[0, position]`.
+- Routing: BF16 router weights, FP32 logits, sigmoid plus bias, top-8,
+  weights `v * (2.5 / sum v)`.
+- Experts (routed and shared, `TILERT_GLM5_MOE_W8A8=1`): per-128 activation
+  scale `max(amax, 1e-4) * fp32(1/448)`, FP32 gate/up, `bf16(silu(g) * u)`
+  re-quantized, down projection accumulated in FP32 over the nine slots with
+  the routing weight folded in.
+- o_proj, dense down and MoE down: each rank's BF16 partial is summed in FP32
+  with the residual and rounded once.
+
+Where TileRT's kernels are binary-only, `tasks/frontier.py` makes the most
+likely choice behind a module constant: `GLM_FP8_ACTIVATIONS` (empty: no
+activation quantization outside experts), `GLM_DENSE_SWIGLU_FP32`,
+`GLM_PROBABILITIES_BF16` (split-K flash kernels may round elsewhere) and
+`GLM_LATENT_NORM_EPS`. Selection ties keep the lowest index, which TileRT's
+radix select leaves open. TileRT's head partition also differs (ranks 1-7
+hold ten heads each on full layers, rank 0 runs the indexer; shared layers
+use TP8), so its rank-local BF16 rounding is left to the tolerance band.
+
+[`probes/tilert_glm52_probe.py`](../probes/tilert_glm52_probe.py) mirrors
+the DeepSeek probe: the `reference` step stores reference/oracle outputs; the
+`tilert` step converts the seeded weights in memory with TileRT's own
+`shard_layer`/`shard_tail`/`pack_rank_params`, injects the BF16 prefix (KV and
+rope on every rank, index keys on rank 0 in full-layer order), runs one
+`glm52_show_hands` step and grades logits, the greedy token and every
+layer's latent/rope/index-key write. `--layers N` truncates both steps for
+bisecting numerics. `check-ops` calls TileRT's single ops (head projection,
+o_proj all-reduce, dense up/gate, sparse index and top-k, W8A8 fused MoE) on
+random inputs and reports their distance to each candidate formula, so the
+constants above can be confirmed or flipped on MI350X. Inside an eight-GPU
+ROCm allocation, with TileRT installed per its README:
+
+```bash
+.venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=8 \
+  -m megabench.probes.tilert_glm52_probe reference --case glm52-step-ctx4k \
+  --output /path/run/reference
+reproductions/TileRT/.venv/bin/python -m megabench.probes.tilert_glm52_probe tilert \
+  --case glm52-step-ctx4k --reference /path/run/reference --output /path/run/tilert.json
+reproductions/TileRT/.venv/bin/python -m megabench.probes.tilert_glm52_probe check-ops \
+  --output /path/run/check-ops.json
+```
+
 The new families do not yet have speed-of-light traffic models. Their SOL
 output explicitly reports unavailable rather than borrowing a P0 formula.
 
@@ -111,7 +171,8 @@ OMP_NUM_THREADS=1 CUDA_VISIBLE_DEVICES='' .venv/bin/python -m unittest discover 
 
 `verify_storage` counts input tensors using meta shapes; it does not measure
 GPU allocation or transient execution peaks. Current native input storage
-per rank is 86,026,008,968 bytes for DeepSeek TP8, 94,925,899,592 for GLM TP8,
+per rank at context 128 is 86,030,849,928 bytes for DeepSeek TP8, 94,695,255,368
+for GLM TP8 (97,803,627,848 at 32K),
 and 108,308,019,073 for Kimi TP16. Kimi TP8 needs 205,114,366,457 bytes before
 temporary allocations, exceeding a 192 GB B200's capacity.
 The full unsharded native inputs also total 1,560,403,229,833 bytes, exceeding

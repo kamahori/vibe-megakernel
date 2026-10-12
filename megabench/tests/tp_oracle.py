@@ -3,6 +3,8 @@
 An unpartitioned BF16 matmul rounds once. TP rounds each partial matmul
 before the collective. Emulate only those boundaries in the full-weight
 oracle; actual rank execution still exercises real communication/sharding.
+Each emulated partial covers one rank's contiguous K shard, so K/TP must keep
+whole 128-channel FP8 blocks (as fp8_matrix already requires).
 """
 
 from contextlib import contextmanager, ExitStack
@@ -71,6 +73,21 @@ def tp_rounding(case, values, module):
                 return result if row_weights[pointer] else result.to(vector.dtype)
 
             stack.enter_context(patch.object(module, 'linear', fp8_linear))
+        if module.__name__.endswith('.frontier'):
+            # GLM (TileRT) rounds each rank's K-shard partial of o_proj and
+            # FFN down to BF16; the reference then adds the residual in FP32.
+            def split_partial(terms):
+                parts = []
+                for rank in range(tp):
+                    total = None
+                    for activation, weight, scale, factor in terms:
+                        decoded = unpack_fp8_weight(weight, scale).chunk(tp, dim=1)[rank]
+                        part = matmul(decoded, activation.float().chunk(tp)[rank])*factor
+                        total = part if total is None else total+part
+                    parts.append(total.bfloat16().float())
+                return torch.stack(parts).sum(0)
+
+            stack.enter_context(patch.object(module, 'rank_partial', split_partial))
         if module.__name__.endswith('.kimi'):
             unpack = module.unpack_mxfp4
             down = {storage(value) for key, value in values.items() if key.endswith('_down_blocks')}

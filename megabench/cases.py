@@ -61,6 +61,16 @@ DEEPSEEK_V32 = {"batch": 1, "context": 128, "layers": 61,
 DEEPSEEK_NOTE = ("Synthetic FP8-weight MLA/DSA TP8 decode with TileRT 0.1.6 numerics "
                  "(BF16 caches and indexer); eight-B200 verification pending.")
 
+GLM52 = {"batch": 1, "context": 128, "layers": 78,
+         "experts": 256, "topk": 8, "hidden": 6144, "q_heads": 64,
+         "q_lora_rank": 2048, "kv_lora_rank": 512, "qk_nope_dim": 192,
+         "qk_rope_dim": 64, "v_head_dim": 256, "intermediate": 2048,
+         "dense_intermediate": 12288, "first_dense": 3, "shared_experts": 1,
+         "vocab": 154880, "index_heads": 32, "index_dim": 128,
+         "index_topk": 2048, "router_groups": 1, "router_top_groups": 1}
+GLM52_NOTE = ("Synthetic FP8-weight MLA/DSA TP8 decode with TileRT 0.1.6 ROCm numerics "
+              "(BF16 caches and indexer, W8A8 experts); eight-MI350X verification pending.")
+
 CASES: tuple[Case, ...] = (
     Case("dense-step-qwen3-06b-b1-s128", "dense_step", "Qwen/Qwen3-0.6B",
          "decode", {"batch": 1, "context": 128, "layers": 28,
@@ -154,16 +164,9 @@ CASES: tuple[Case, ...] = (
          "deepseek-ai/DeepSeek-V3.2", "decode", DEEPSEEK_V32,
          "frontier_moe", "p3", ready=True, gpus=8, tp=8, atol=0.003, rtol=0.003,
          note=DEEPSEEK_NOTE),
-    Case("glm52-step", "glm52_step", "zai-org/GLM-5.2-FP8", "decode",
-         {"batch": 1, "context": 128, "layers": 78,
-          "experts": 256, "topk": 8, "hidden": 6144, "q_heads": 64,
-          "q_lora_rank": 2048, "kv_lora_rank": 512, "qk_nope_dim": 192,
-          "qk_rope_dim": 64, "v_head_dim": 256, "intermediate": 2048,
-          "dense_intermediate": 12288, "first_dense": 3, "shared_experts": 1,
-          "vocab": 154880, "index_heads": 32, "index_dim": 128,
-          "index_topk": 2048, "router_groups": 1, "router_top_groups": 1},
+    Case("glm52-step", "glm52_step", "zai-org/GLM-5.2-FP8", "decode", GLM52,
          "frontier_moe", "p3", ready=True, gpus=8, tp=8, atol=0.003, rtol=0.003,
-         note="Native synthetic FP8 DSA TP8 decode; verified on eight B200 GPUs."),
+         note=GLM52_NOTE),
     Case("glm53-flash-step", "glm53_flash_step", "zai-org/GLM-5.3-Flash", "decode",
          {"batch": 1, "context": 128, "layers": 45, "hidden": 4096,
           "hc_mult": 4, "hc_sinkhorn_iters": 20, "linear_heads": 64,
@@ -213,6 +216,10 @@ CASES: tuple[Case, ...] = (
            "deepseek-ai/DeepSeek-V3.2", "decode", DEEPSEEK_V32 | {"context": context},
            "frontier_moe", "p3", ready=True, gpus=8, tp=8, atol=0.003, rtol=0.003,
            note=DEEPSEEK_NOTE) for context in (4096, 32768)),
+    *(Case(f"glm52-step-ctx{context // 1024}k", "glm52_step",
+           "zai-org/GLM-5.2-FP8", "decode", GLM52 | {"context": context},
+           "frontier_moe", "p3", ready=True, gpus=8, tp=8, atol=0.003, rtol=0.003,
+           note=GLM52_NOTE) for context in (4096, 32768)),
     Case("tts-frame-step-csm-1b-b1-s128", "tts_frame_step", "sesame/csm-1b", "audio_frame",
          {"batch": 1, "context": 128, "layers": 16, "hidden": 2048, "q_heads": 32,
           "kv_heads": 8, "head_dim": 64, "intermediate": 8192, "text_vocab": 128256,

@@ -23,10 +23,14 @@ BF16, while computing softmax reduction in FP32. Vision attention uses
 PyTorch SDPA with BF16 inputs and outputs. MLA retains FP32 score/softmax
 reductions and BF16 model/latent outputs. Normalization follows each model's
 weighting order: Llama/Qwen cast normalized activations before weighting;
-Gemma and GPT-OSS apply weights before the final cast. GLM's sparse
-index weighting projection retains its upstream FP32 exception; DeepSeek
-follows TileRT (BF16 head weights, FP32-gamma normalization, FP32 rotary and
-SwiGLU products, FP8 activations only for q_a/kv_a/indexer wk, FP32 logits).
+Gemma and GPT-OSS apply weights before the final cast. DeepSeek and GLM
+follow TileRT 0.1.6 (FP32-gamma normalization, FP32 rotary, BF16 caches,
+BF16 index head weights, FP32 logits). DeepSeek quantizes activations only for
+q_a/kv_a/indexer wk and forms SwiGLU in FP32. GLM (TileRT's ROCm backend) keeps
+BF16 activations for attention and dense-FFN GEMVs, rounds indexer keys and
+queries once after FP32 LayerNorm/RoPE/Hadamard, rounds MLA probabilities to
+BF16, runs W8A8 experts, and adds each output projection's per-rank BF16
+partials to the residual in FP32 before one rounding.
 
 Quantized inputs retain their native representation: signed INT8, packed INT4,
 native FP8 with block scales, or packed MXFP4 E2M1 values with E8M0 scales.
