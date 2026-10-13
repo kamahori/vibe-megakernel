@@ -60,13 +60,32 @@ GLM_PROBABILITIES_BF16 = True
 GLM_LATENT_NORM_EPS = 1e-5
 
 
+# GLM residual-branch output projections (attention o, dense and expert down,
+# shared-expert down) are sampled with gain 1/sqrt(2 * layers), as in GPT-2
+# style initialization. With unit-gain branches, the 78-layer synthetic GLM
+# step is chaotic: rounding differences grow until the BF16 reference is
+# further from its FP32 oracle than the logits' own norm, and no
+# implementation can be graded. Trained checkpoints are not chaotic.
+GLM_BRANCH_OUTPUTS = frozenset({'o', 'down', 'shared_down'})
+
+
+def branch_gain(case: Case, name: str) -> float:
+    if case.family == 'glm52_step' and name in GLM_BRANCH_OUTPUTS:
+        return (2 * case.params['layers']) ** -0.5
+    return 1.0
+
+
 def indexer_layer(case: Case, layer: int) -> bool:
     return case.family == 'deepseek_v32_step' or layer < 3 or (layer >= 6 and (layer - 6) % 4 == 0)
 
 
 def fp8_matrix(seed: int, name: str, rows: int, cols: int, device: str,
-               power_of_two: bool, *, row_range=None, col_range=None):
-    """Quantize canonical global blocks before selecting rank-local shards."""
+               power_of_two: bool, *, row_range=None, col_range=None, gain: float = 1.0):
+    """Quantize canonical global blocks before selecting rank-local shards.
+
+    ``gain`` scales the sampled matrix before quantization; FP8 block scales
+    absorb it, so relative FP8 precision is unchanged.
+    """
     r0, r1 = row_range or (0, rows)
     c0, c1 = col_range or (0, cols)
     if r0 % FP8_BLOCK or c0 % FP8_BLOCK or (r1 != rows and r1 % FP8_BLOCK) or (c1 != cols and c1 % FP8_BLOCK):
@@ -78,6 +97,8 @@ def fp8_matrix(seed: int, name: str, rows: int, cols: int, device: str,
         end = min(start + FP8_BLOCK, rows)
         # Sampling is independent of TP, including each global block's scale.
         source = matrix(seed, name, rows, cols, cols, device, row_range=(start, end))
+        if gain != 1.0:
+            source = (source.float() * gain).to(source.dtype)
         block, scale = pack_fp8_weight(source, power_of_two=power_of_two)
         payload[start-r0:end-r0].copy_(block[:, c0:c1])
         scales[(start-r0)//FP8_BLOCK].copy_(scale[0, c0//FP8_BLOCK:math.ceil(c1/FP8_BLOCK)])
@@ -132,7 +153,8 @@ def layer_inputs(case: Case, seed: int, layer: int, device: str, *, rank: int) -
     values = {}
     prefix = f'l{layer}_'
     def weight(name, rows, cols, rr=None, cr=None):
-        quant, scale = fp8_matrix(seed, prefix+name, rows, cols, device, power, row_range=rr, col_range=cr)
+        quant, scale = fp8_matrix(seed, prefix+name, rows, cols, device, power, row_range=rr, col_range=cr,
+                                  gain=branch_gain(case, name))
         values[prefix+name], values[prefix+name+'_scale'] = quant, scale
     for name, width in (('qn', qrank), ('kn', krank)):
         values[prefix+name] = (matrix(seed, prefix+name, 1, width, 100, device)[0].float()+1).to(torch.bfloat16)
@@ -169,7 +191,8 @@ def layer_inputs(case: Case, seed: int, layer: int, device: str, *, rank: int) -
             weights = torch.empty((experts, r, c), device=device, dtype=torch.float8_e4m3fn)
             scales = torch.empty((experts, math.ceil(r/128), math.ceil(c/128)), device=device)
             for expert in range(experts):
-                quant, scale = fp8_matrix(seed, prefix+name+f':{expert}', rows, cols, device, power, row_range=rr, col_range=cr)
+                quant, scale = fp8_matrix(seed, prefix+name+f':{expert}', rows, cols, device, power,
+                                          row_range=rr, col_range=cr, gain=branch_gain(case, name))
                 weights[expert].copy_(quant)
                 scales[expert].copy_(scale)
             values[prefix+name], values[prefix+name+'_scale'] = weights, scales

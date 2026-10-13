@@ -26,7 +26,7 @@ def matrix(seed, name, rows, cols, fan_in, device, *, row_range=None, col_range=
     return torch.empty((r1-r0, c1-c0), device='meta', dtype=torch.bfloat16)
 
 
-def fp8_matrix(seed, name, rows, cols, device, power_of_two, *, row_range=None, col_range=None):
+def fp8_matrix(seed, name, rows, cols, device, power_of_two, *, row_range=None, col_range=None, gain=1.0):
     r0, r1 = row_range or (0, rows)
     c0, c1 = col_range or (0, cols)
     return (torch.empty((r1-r0, c1-c0), device='meta', dtype=torch.float8_e4m3fn),
