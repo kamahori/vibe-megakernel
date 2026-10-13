@@ -391,7 +391,9 @@ def run_check_ops(args) -> None:
         try:
             report[name] = check()
         except Exception as error:  # Report and continue: each op is an independent probe.
-            report[name] = {'error': f'{type(error).__name__}: {error}'}
+            import traceback
+            report[name] = {'error': f'{type(error).__name__}: {error}',
+                            'traceback': traceback.format_exc(limit=8)}
         print(json.dumps({name: report[name]}), flush=True)
 
     x = (torch.randn(1, hidden) * 2).to(torch.bfloat16)
@@ -481,7 +483,8 @@ def run_check_ops(args) -> None:
         bias = 0.01 * torch.randn(256)
         up_gate = [fp8_weight(2 * inter, hidden) for _ in range(banks)]
         down = [fp8_weight(hidden, inter) for _ in range(banks)]
-        op.front.router.w, op.front.router.gamma = router.to(device), gamma.to(device)
+        # TileRT packs the router weight on the CPU before moving it to the device.
+        op.front.router.w, op.front.router.gamma = router, gamma.to(device)
         op.front.moe.w_fp8 = torch.stack([w for w, _ in up_gate])
         op.front.moe.scales = torch.stack([s for _, s in up_gate]).to(device)
         op.down.w_fp8 = torch.stack([w for w, _ in down])
