@@ -60,18 +60,22 @@ GLM_PROBABILITIES_BF16 = True
 GLM_LATENT_NORM_EPS = 1e-5
 
 
-# GLM residual-branch output projections (attention o, dense and expert down,
-# shared-expert down) are sampled with gain 1/sqrt(2 * layers), as in GPT-2
-# style initialization. With unit-gain branches, the 78-layer synthetic GLM
-# step is chaotic: rounding differences grow until the BF16 reference is
-# further from its FP32 oracle than the logits' own norm, and no
-# implementation can be graded. Trained checkpoints are not chaotic.
+# Synthetic GLM weights are conditioned so the 78-layer step is not chaotic.
+# With fan-in-scaled embeddings, the embedding is about sqrt(hidden) times
+# smaller than one residual branch, so the pre-norm stack is invariant to any
+# branch gain and rounding differences (amplified by MoE routing flips) grow
+# until the BF16 reference is uncorrelated with its FP32 oracle. GLM
+# embeddings therefore have unit element RMS, and the residual-branch output
+# projections (attention o, dense and expert down, shared-expert down) are
+# sampled with gain 1/(4 * sqrt(2 * layers)), about 0.02 at 78 layers. In a
+# scaled-down serial simulation this keeps the reference about 2% (relative
+# L2) from the oracle on logits. Trained checkpoints are not chaotic.
 GLM_BRANCH_OUTPUTS = frozenset({'o', 'down', 'shared_down'})
 
 
 def branch_gain(case: Case, name: str) -> float:
     if case.family == 'glm52_step' and name in GLM_BRANCH_OUTPUTS:
-        return (2 * case.params['layers']) ** -0.5
+        return (2 * case.params['layers']) ** -0.5 / 4
     return 1.0
 
 
@@ -123,7 +127,8 @@ def global_inputs(case: Case, seed: int, device: str, *, rank: int) -> dict[str,
     rows = (rank * (p['vocab'] // tp), (rank + 1) * (p['vocab'] // tp))
     values = {'token': torch.tensor(seed_for(seed, 'token') % p['vocab'], device=device)}
     for name in ('embed', 'lm_head'):
-        values[name] = matrix(seed, name, p['vocab'], h, h, device, row_range=rows)
+        fan_in = 1 if name == 'embed' and case.family == 'glm52_step' else h
+        values[name] = matrix(seed, name, p['vocab'], h, fan_in, device, row_range=rows)
     values['fnorm'] = (matrix(seed, 'fnorm', 1, h, 100, device)[0].float() + 1).to(torch.bfloat16)
     values['ln1'] = (matrix(seed, 'ln1', p['layers'], h, 100, device).float() + 1).to(torch.bfloat16)
     values['ln2'] = (matrix(seed, 'ln2', p['layers'], h, 100, device).float() + 1).to(torch.bfloat16)
