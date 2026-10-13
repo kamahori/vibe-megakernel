@@ -213,7 +213,8 @@ def build_tilert_params(case, seed: int, model_args, generate_on: str, log):
 
 
 def _load_reference(directory: Path, case, seed: int) -> dict:
-    ranks = [torch.load(directory / f'reference-rank-{rank}.pt', weights_only=True) for rank in range(case.gpus)]
+    # The reference command writes these files (tensors plus metadata), so full unpickling is trusted.
+    ranks = [torch.load(directory / f'reference-rank-{rank}.pt', weights_only=False) for rank in range(case.gpus)]
     if any(record['case'] != case.id or record['seed'] != seed or record['layers'] != case.params['layers']
            for record in ranks):
         raise SystemExit('reference files were produced for a different case, seed or --layers')
