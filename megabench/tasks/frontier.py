@@ -1,4 +1,8 @@
-"""Synthetic native-FP8 DeepSeek V3.2 and GLM 5.2 distributed decode.
+"""Native-FP8 DeepSeek V3.2 and GLM 5.2 distributed decode.
+
+GLM uses seeded synthetic weights and caches. DeepSeek cases that set
+``Case.checkpoint`` read the real checkpoint and prefilled prompt caches
+(deepseek_checkpoint); the rest of this module is shared by both.
 
 Attention heads and FFN intermediates use TP. Compressed MLA KV and DSA
 indexer state are replicated; logits are vocabulary shards. FP8 payloads,
@@ -66,6 +70,13 @@ def _check_topology(case: Case, rank: int) -> None:
 def global_inputs(case: Case, seed: int, device: str, *, rank: int) -> dict[str, torch.Tensor]:
     """Token, embedding/head shards and the per-layer norm stacks."""
     _check_topology(case, rank)
+    if case.checkpoint:
+        # Imported lazily: workspaces of the other frontier families omit it.
+        from . import deepseek_checkpoint
+
+        record = deepseek_checkpoint.prompt_record(case, seed)
+        return deepseek_checkpoint.global_weights(case, device, rank=rank) | {
+            'token': torch.tensor(record['tokens'][case.params['context']], device=device)}
     p, tp, h = case.params, case.tp, case.params['hidden']
     rows = (rank * (p['vocab'] // tp), (rank + 1) * (p['vocab'] // tp))
     values = {'token': torch.tensor(seed_for(seed, 'token') % p['vocab'], device=device)}
@@ -79,6 +90,11 @@ def global_inputs(case: Case, seed: int, device: str, *, rank: int) -> dict[str,
 
 def make_inputs(case: Case, seed: int, device: str, *, rank: int | None = None) -> dict[str, torch.Tensor]:
     rank = dist.get_rank() if rank is None else rank
+    if case.checkpoint:
+        from . import deepseek_checkpoint
+
+        _check_topology(case, rank)
+        return deepseek_checkpoint.make_inputs(case, seed, device, rank=rank)
     values = global_inputs(case, seed, device, rank=rank)
     for layer in range(case.params['layers']):
         values |= layer_inputs(case, seed, layer, device, rank=rank)
@@ -92,6 +108,12 @@ def layer_inputs(case: Case, seed: int, layer: int, device: str, *, rank: int) -
     same canonical blocks, so external engines can consume global tensors.
     """
     _check_topology(case, rank)
+    if case.checkpoint:
+        from . import deepseek_checkpoint
+
+        record = deepseek_checkpoint.prompt_record(case, seed)
+        return deepseek_checkpoint.layer_weights(case, layer, device, rank=rank) | {
+            f'l{layer}_{name}': record[name][layer].to(device) for name in ('kv_cache', 'pe_cache', 'index_cache')}
     p, tp = case.params, case.tp
     h, heads, qrank, krank = p['hidden'], p['q_heads'], p['q_lora_rank'], p['kv_lora_rank']
     nope, rotary, vd = p['qk_nope_dim'], p['qk_rope_dim'], p['v_head_dim']
@@ -268,7 +290,12 @@ def reference(case: Case, values: dict[str, torch.Tensor], *, serial: bool = Fal
         if indexer_layer(case, layer):
             ih, idim = p['index_heads'], p['index_dim']
             iq = project('iq', qr).view(ih, idim)
-            ik = F.layer_norm(project('ik', normalized), (idim,), values[prefix+'inorm'], values[prefix+'ibias'], eps=1e-6)
+            ik, gamma, beta = project('ik', normalized), values[prefix+'inorm'], values[prefix+'ibias']
+            if gamma.dtype == torch.float32:
+                # Checkpoint k_norm parameters are FP32: normalize in FP32 and round once.
+                ik = F.layer_norm(ik.float(), (idim,), gamma, beta.float(), eps=1e-6).to(ik.dtype)
+            else:
+                ik = F.layer_norm(ik, (idim,), gamma, beta, eps=1e-6)
             iq = torch.cat((rotate(iq[:, :rd], p['context'], deepseek=deepseek, interleaved=not deepseek), iq[:, rd:]), -1)
             ik = torch.cat((rotate(ik[:rd], p['context'], deepseek=deepseek, interleaved=not deepseek), ik[rd:]), -1)
             if deepseek:

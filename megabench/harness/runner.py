@@ -42,6 +42,7 @@ CONTRACT_FILES = (
     "megabench/harness/distributed.py", "megabench/tasks/distributed.py",
     "megabench/tasks/parallel.py",
     "megabench/tasks/frontier.py",
+    "megabench/tasks/deepseek_checkpoint.py",
     "megabench/tasks/kimi.py",
     "megabench/tasks/glm53.py",
     "megabench/tasks/kimi_layer.py",
@@ -107,6 +108,7 @@ def evaluate_case(case: Case, submission: Path, *, device: str,
              "megabench.tasks.gptoss", "megabench.tasks.hybrid",
              "megabench.tasks.vision", "megabench.tasks.speculative",
              "megabench.tasks.distributed", "megabench.tasks.frontier",
+             "megabench.tasks.deepseek_checkpoint",
              "megabench.tasks.kimi", "megabench.tasks.glm53", "megabench.tasks.kimi_layer",
              "megabench.tasks.csm", "megabench.tasks.pi05", "megabench.tasks.waypoint",
              "megabench.tasks.megamoe",
@@ -216,6 +218,29 @@ def _worker(args: argparse.Namespace) -> int:
     return 0
 
 
+def _checkpoint_mounts(case: Case) -> list[str]:
+    """Read-only mounts and environment for a real-weight case's checkpoint and prompt caches."""
+    if not case.checkpoint:
+        return []
+    from ..tasks import deepseek_checkpoint as checkpoint
+
+    snapshot = checkpoint.checkpoint_dir(case)
+    # Hugging Face snapshots hold relative symlinks into the repository's blobs.
+    if snapshot.parent.name == "snapshots":
+        source, target = snapshot.parent.parent, Path("/checkpoint/snapshots") / snapshot.name
+    else:
+        source, target = snapshot, Path("/checkpoint")
+    caches = checkpoint.cache_path(case, 0).parent
+    cache_target = Path("/megabench-cache") / caches.relative_to(caches.parent.parent)
+    mounts = ["--volume", f"{source.resolve()}:/checkpoint:ro",
+              "--env", f"{checkpoint.CHECKPOINT_ENV}={target}",
+              "--env", f"{checkpoint.CACHE_ENV}=/megabench-cache"]
+    # Docker would create a missing source as root; the worker reports missing caches.
+    if caches.is_dir():
+        mounts[2:2] = ["--volume", f"{caches.resolve()}:{cache_target}:ro"]
+    return mounts
+
+
 def _docker_worker_command(args: argparse.Namespace, case: Case,
                            tempdir: Path, result_path: Path) -> tuple[list[str], str, str]:
     """Run only this case in a disposable, unprivileged container."""
@@ -241,6 +266,7 @@ def _docker_worker_command(args: argparse.Namespace, case: Case,
            "--workdir", "/workspace",
            "--volume", f"{ROOT}:/workspace:ro",
            "--volume", f"{tempdir}:/results:rw", *extra_mount]
+    cmd.extend(_checkpoint_mounts(case))
     for group in os.getgroups():
         cmd.extend(["--group-add", str(group)])
     if args.docker_gpus:

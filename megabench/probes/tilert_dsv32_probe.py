@@ -2,18 +2,19 @@
 
 TileRT (tile-ai/TileRT 0.1.6) is one host process driving eight GPUs, so it
 cannot run as a per-rank MegaBench submission. This probe runs it on the
-same seeded synthetic weights, cache prefix and token as the case instead:
+same weights (seeded synthetic, or the real checkpoint for cases that set
+``Case.checkpoint``), cache prefix and token as the case instead:
 
 ``reference`` (MegaBench venv, ``torch.distributed.run`` on eight ranks)
     Builds the case inputs and stores the BF16 reference outputs, the FP32
     oracle outputs, and a digest of replicated inputs, one file per rank.
 
 ``tilert`` (TileRT venv, one process, eight GPUs)
-    Regenerates the case weights layer by layer without sharding, converts
+    Rebuilds the case weights layer by layer without sharding, converts
     them in memory with TileRT's own checkpoint transforms (no checkpoint on
     disk), injects the BF16 cache prefix, and runs one non-MTP greedy step at
-    position ``context``. Outputs are graded with MegaBench's ``_compare``
-    bands; host latency is timed per step with all eight devices
+    position ``context``. Outputs are graded with the case's gate (the
+    ``_compare`` bands, or ``tilert_metrics`` for TileRT-style cases); host latency is timed per step with all eight devices
     synchronized, matching ``harness.benchmark._measure``'s host timer.
 
 TileRT exposes the KV/rope/index-key cache rows it wrote, full FP32 logits
@@ -70,58 +71,29 @@ def run_reference(args) -> None:
     rank = dist.get_rank()
     device = f'cuda:{rank}'
     torch.cuda.set_device(device)
-    with torch.inference_mode():
-        values = frontier.make_inputs(case, args.seed, device)
-        expected = reference(case, values)
-        exact = oracle(case, values)
-    record = {'case': case.id, 'seed': args.seed, 'rank': rank, 'torch': torch.__version__,
-              'input_digest': _digest(values, case.params['layers']),
-              'expected': {name: value.cpu() for name, value in expected.items()},
-              'exact': {name: value.cpu() for name, value in exact.items()}}
-    args.output.mkdir(parents=True, exist_ok=True)
-    with (args.output / f'reference-rank-{rank}.pt').open('xb') as file:
-        torch.save(record, file)
+    for seed in args.seed:
+        with torch.inference_mode():
+            values = frontier.make_inputs(case, seed, device)
+            expected = reference(case, values)
+            exact = oracle(case, values)
+        record = {'case': case.id, 'seed': seed, 'rank': rank, 'torch': str(torch.__version__),
+                  'input_digest': _digest(values, case.params['layers']),
+                  'expected': {name: value.cpu() for name, value in expected.items()},
+                  'exact': {name: value.cpu() for name, value in exact.items()}}
+        directory = args.output / f'seed-{seed}'
+        directory.mkdir(parents=True, exist_ok=True)
+        with (directory / f'reference-rank-{rank}.pt').open('xb') as file:
+            torch.save(record, file)
+        del values, expected, exact
     dist.barrier()
     dist.destroy_process_group()
 
 
-def _hf_layer(values: dict[str, torch.Tensor], layer: int, case) -> dict[str, torch.Tensor]:
-    """Name one unsharded MegaBench layer as a DeepSeek-V3.2 HF checkpoint."""
-    prefix, out = f'l{layer}_', {}
-    scope = f'model.layers.{layer}.'
-
-    def fp8(hf_name: str, name: str) -> None:
-        out[scope + hf_name + '.weight'] = values[prefix + name]
-        out[scope + hf_name + '.weight_scale_inv'] = values[prefix + name + '_scale']
-
-    out[scope + 'input_layernorm.weight'] = values['ln1'][layer]
-    out[scope + 'post_attention_layernorm.weight'] = values['ln2'][layer]
-    out[scope + 'self_attn.q_a_layernorm.weight'] = values[prefix + 'qn']
-    out[scope + 'self_attn.kv_a_layernorm.weight'] = values[prefix + 'kn']
-    for hf_name, name in (('q_a_proj', 'qa'), ('q_b_proj', 'qb'), ('kv_a_proj_with_mqa', 'ka'),
-                          ('kv_b_proj', 'kb'), ('o_proj', 'o'), ('indexer.wq_b', 'iq'),
-                          ('indexer.wk', 'ik')):
-        fp8('self_attn.' + hf_name, name)
-    out[scope + 'self_attn.indexer.k_norm.weight'] = values[prefix + 'inorm']
-    out[scope + 'self_attn.indexer.k_norm.bias'] = values[prefix + 'ibias']
-    out[scope + 'self_attn.indexer.weights_proj.weight'] = values[prefix + 'iw']
-    if layer < case.params['first_dense']:
-        for name in ('gate', 'up', 'down'):
-            fp8(f'mlp.{name}_proj', name)
-        return out
-    out[scope + 'mlp.gate.weight'] = values[prefix + 'router']
-    out[scope + 'mlp.gate.e_score_correction_bias'] = values[prefix + 'router_bias']
-    for name in ('gate', 'up', 'down'):
-        fp8(f'mlp.shared_experts.{name}_proj', 'shared_' + name)
-        for expert in range(case.params['experts']):
-            out[f'{scope}mlp.experts.{expert}.{name}_proj.weight'] = values[prefix + name][expert]
-            out[f'{scope}mlp.experts.{expert}.{name}_proj.weight_scale_inv'] = values[prefix + name + '_scale'][expert]
-    return out
-
-
 def convert_layer(converter, values: dict[str, torch.Tensor], layer: int, case) -> dict[int, dict[str, torch.Tensor]]:
     """Apply TileRT's checkpoint transforms; return per-device TileRT keys."""
-    hf = _hf_layer(values, layer, case)
+    from megabench.tasks.deepseek_checkpoint import hf_layer
+
+    hf = hf_layer(values, layer, case)
     groups = [converter.transform_mla(hf, layer),
               (converter.transform_mlp if layer < case.params['first_dense'] else converter.transform_moe)(hf, layer)]
     devices = {}
@@ -172,10 +144,26 @@ def build_tilert_inputs(case, seed: int, devices: int, generate_on: str, log):
         states[device] |= {f'layer_{last}_lm_head.weight_dev_{device}': head[device].to(f'cuda:{device}'),
                            f'layer_{last}_model.norm.weight_dev_{device}': gamma[device].to(f'cuda:{device}'),
                            'model.embed_tokens.weight': top['embed'].to(f'cuda:{device}')}
-    return states, caches, int(top['token']), _digest(digest_values, case.params['layers'])
+    return states, caches, int(top['token']), digest_values
+
+
+def _prompt_inputs(case, seed: int, digest_values: dict) -> tuple[list, int, str]:
+    """Another seed's cache prefix and token for a real-weight case (same weights)."""
+    from megabench.tasks import deepseek_checkpoint
+
+    record = deepseek_checkpoint.prompt_record(case, seed)
+    layers = case.params['layers']
+    caches = [(record['index_cache'][layer], record['kv_cache'][layer], record['pe_cache'][layer])
+              for layer in range(layers)]
+    token = record['tokens'][case.params['context']]
+    values = dict(digest_values) | {'token': torch.tensor(token)} | {
+        f'l{layer}_{name}': record[name][layer] for layer in {0, 3, layers - 1} if layer < layers
+        for name in ('kv_cache', 'pe_cache', 'index_cache')}
+    return caches, token, _digest(values, layers)
 
 
 def _load_reference(directory: Path, case, seed: int) -> dict:
+    directory = directory / f'seed-{seed}'
     ranks = [torch.load(directory / f'reference-rank-{rank}.pt', weights_only=True) for rank in range(case.gpus)]
     if any(record['case'] != case.id or record['seed'] != seed for record in ranks):
         raise SystemExit('reference files were produced for a different case or seed')
@@ -187,7 +175,7 @@ def _load_reference(directory: Path, case, seed: int) -> dict:
 
 
 def run_tilert(args) -> None:
-    from megabench.harness.correctness import _compare
+    from megabench.harness.correctness import _compare, tilert_metrics
     from tilert.models.deepseek_v3_2.model_args import ModelArgs
     from tilert.models.deepseek_v3_2.modules.end2end import ShowHandsDSALayer
     from tilert.models.deepseek_v3_2.temp_var_indices import Idx
@@ -198,18 +186,22 @@ def run_tilert(args) -> None:
     if torch.cuda.device_count() < devices:
         raise SystemExit(f'TileRT DeepSeek-V3.2 needs {devices} visible GPUs')
     log = lambda message: print(f'[{datetime.now(timezone.utc).isoformat(timespec="seconds")}] {message}', flush=True)
+    if len(args.seed) > 1 and not case.checkpoint:
+        raise SystemExit('several seeds need a real-weight case (synthetic weights change with the seed)')
     args.output.parent.mkdir(parents=True, exist_ok=True)
     output = args.output.open('x')  # Claim the result path before the long build.
-    reference = _load_reference(args.reference, case, args.seed)
+    references = {seed: _load_reference(args.reference, case, seed) for seed in args.seed}
     phases = {}
     start = time.perf_counter()
     with torch.inference_mode():
-        states, caches, token, digest = build_tilert_inputs(case, args.seed, devices, 'cuda:0', log)
+        states, caches, token, digest_values = build_tilert_inputs(case, args.seed[0], devices, 'cuda:0', log)
     phases['generate_and_convert_s'] = time.perf_counter() - start
-    if digest != reference['input_digest']:
-        raise SystemExit('regenerated inputs differ from the reference run (torch RNG drift?)')
 
     start = time.perf_counter()
+    import tilert
+    if hasattr(tilert, 'load_backend'):
+        # 0.1.6.post3 ships one library per model and loads none on import.
+        tilert.load_backend('deepseek_v3_2')
     tilert_init()
     engine = ShowHandsDSALayer(ModelArgs(), model_path='megabench-synthetic', with_mtp=False, use_topp=False)
     # Hand each device its dict once, so the engine holds the only reference
@@ -217,20 +209,13 @@ def run_tilert(args) -> None:
     engine.load_device_weights = lambda path, device, extra, skip_keys=None: (
         states.pop(device) | {'freqs_cis': engine._gen_freqs_cis().to(device)})
     engine._init_weights('megabench-synthetic')
-    for device in range(devices):
-        device_caches = engine._get_device_result(device)[1]
-        for layer, prefix_caches in enumerate(caches):
-            for slot, cache in enumerate(prefix_caches):
-                device_caches[3*layer + slot][0, :position].copy_(cache.to(f'cuda:{device}'))
     phases['engine_build_s'] = time.perf_counter() - start
-
-    token_input = torch.tensor(token)
 
     def synchronize() -> None:
         for device in range(devices):
             torch.cuda.synchronize(device)
 
-    def step() -> float:
+    def step(token_input: torch.Tensor) -> float:
         # The engine advances its position after each step; pin it to the case.
         torch.ops.tilert.dsa_show_hands_set_cur_pos(position)
         synchronize()
@@ -239,64 +224,87 @@ def run_tilert(args) -> None:
         synchronize()
         return (time.perf_counter() - begin) * 1000
 
-    step()
-    results = [engine._get_device_result(device) for device in range(devices)]
-    layers = case.params['layers']
-    actual = {
-        'logits': torch.cat([results[device][0][Idx.LOGITS_OUT].reshape(-1, results[device][0][Idx.LOGITS_OUT].shape[-1])[0].cpu()
-                             for device in range(devices)]),
-        'next_token': results[0][0][Idx.TOKEN_OUT].reshape(-1)[0].to(torch.int64).cpu(),
-        # MLA devices 1-7 write the latent and rope rows; device 0 the index key.
-        'kv_write': torch.stack([results[1][1][3*layer + 1][0, position].cpu() for layer in range(layers)]),
-        'pe_write': torch.stack([results[1][1][3*layer + 2][0, position].cpu() for layer in range(layers)]),
-        'index_k_write': torch.stack([results[0][1][3*layer][0, position].cpu() for layer in range(layers)]),
-    }
-    expected = {name: reference['expected'][name] for name in GRADED}
-    exact = {name: reference['exact'][name] for name in GRADED}
-    correctness = {}
-    # Logits are gathered here, so the greedy token may use the harness's
-    # single-rank near-tie rule against full-vocabulary logits.
-    gathered = replace(case, gpus=1, tp=1)
-    for name in GRADED:
-        names = (name, 'logits') if name == 'next_token' else (name,)
-        try:
-            correctness[name] = _compare({key: expected[key] for key in names}, {key: actual[key] for key in names},
-                                         gathered, 'cpu', {key: exact[key] for key in names})[name]
-        except AssertionError as error:
-            correctness[name] = {'pass': False, 'reason': str(error)}
-    logits, want = actual['logits'].double(), reference['exact']['logits'].double()
-    correctness['logits_cosine_vs_oracle'] = float(torch.nn.functional.cosine_similarity(logits, want, dim=0))
-    topk = min(case.params['index_topk'], position + 1)
-    last_indices = results[0][0][Idx.IDX_SELECTS].reshape(-1)[:topk].long().cpu()
-    want_indices = reference['expected']['sparse_indices'][-1].long()
-    last_experts = results[0][0][Idx.SEL_INDICES].reshape(-1)[:case.params['topk']].long().cpu()
-    correctness['last_layer_sparse_index_overlap'] = len(set(last_indices.tolist()) & set(want_indices.tolist())) / topk
-    correctness['last_layer_expert_ids'] = {'tilert': sorted(last_experts.tolist()),
-                                            'reference': sorted(reference['expected']['expert_ids'][-1].tolist())}
-    graded_pass = all(correctness[name]['pass'] for name in GRADED)
+    runs, layers = {}, case.params['layers']
+    for index, seed in enumerate(args.seed):
+        reference = references[seed]
+        if index:
+            caches, token, digest = _prompt_inputs(case, seed, digest_values)
+        else:
+            digest = _digest(digest_values, layers)
+        if digest != reference['input_digest']:
+            raise SystemExit(f'seed {seed}: rebuilt inputs differ from the reference run')
+        for device in range(devices):
+            device_caches = engine._get_device_result(device)[1]
+            for layer, prefix_caches in enumerate(caches):
+                for slot, cache in enumerate(prefix_caches):
+                    device_caches[3*layer + slot][0, :position].copy_(cache.to(f'cuda:{device}'))
+        token_input = torch.tensor(token)
+        step(token_input)
+        results = [engine._get_device_result(device) for device in range(devices)]
+        actual = {
+            'logits': torch.cat([results[device][0][Idx.LOGITS_OUT].reshape(-1, results[device][0][Idx.LOGITS_OUT].shape[-1])[0].cpu()
+                                 for device in range(devices)]),
+            'next_token': results[0][0][Idx.TOKEN_OUT].reshape(-1)[0].to(torch.int64).cpu(),
+            # MLA devices 1-7 write the latent and rope rows; device 0 the index key.
+            'kv_write': torch.stack([results[1][1][3*layer + 1][0, position].cpu() for layer in range(layers)]),
+            'pe_write': torch.stack([results[1][1][3*layer + 2][0, position].cpu() for layer in range(layers)]),
+            'index_k_write': torch.stack([results[0][1][3*layer][0, position].cpu() for layer in range(layers)]),
+        }
+        expected = {name: reference['expected'][name] for name in GRADED}
+        exact = {name: reference['exact'][name] for name in GRADED}
+        correctness = {}
+        # Logits are gathered here, so the greedy token may use the harness's
+        # single-rank near-tie rule against full-vocabulary logits.
+        gathered = replace(case, gpus=1, tp=1)
+        if case.gate == 'tilert':
+            correctness |= tilert_metrics(expected, actual, gathered, 'cpu', exact)
+        for name in () if case.gate == 'tilert' else GRADED:
+            names = (name, 'logits') if name == 'next_token' else (name,)
+            try:
+                correctness[name] = _compare({key: expected[key] for key in names}, {key: actual[key] for key in names},
+                                             gathered, 'cpu', {key: exact[key] for key in names})[name]
+            except AssertionError as error:
+                correctness[name] = {'pass': False, 'reason': str(error)}
+        logits, want = actual['logits'].double(), reference['exact']['logits'].double()
+        correctness['logits_cosine_vs_oracle'] = float(torch.nn.functional.cosine_similarity(logits, want, dim=0))
+        topk = min(case.params['index_topk'], position + 1)
+        last_indices = results[0][0][Idx.IDX_SELECTS].reshape(-1)[:topk].long().cpu()
+        want_indices = reference['expected']['sparse_indices'][-1].long()
+        last_experts = results[0][0][Idx.SEL_INDICES].reshape(-1)[:case.params['topk']].long().cpu()
+        correctness['last_layer_sparse_index_overlap'] = len(set(last_indices.tolist()) & set(want_indices.tolist())) / topk
+        correctness['last_layer_expert_ids'] = {'tilert': sorted(last_experts.tolist()),
+                                                'reference': sorted(reference['expected']['expert_ids'][-1].tolist())}
 
-    for _ in range(args.warmup):
-        step()
-    host_ms = [step() for _ in range(args.reps)]
-    ordered = sorted(host_ms)
-    at = (len(ordered) - 1) * 0.95
-    p95 = ordered[int(at)] + (ordered[min(int(at) + 1, len(ordered) - 1)] - ordered[int(at)]) * (at - int(at))
+        for _ in range(args.warmup):
+            step(token_input)
+        host_ms = [step(token_input) for _ in range(args.reps)]
+        ordered = sorted(host_ms)
+        at = (len(ordered) - 1) * 0.95
+        p95 = ordered[int(at)] + (ordered[min(int(at) + 1, len(ordered) - 1)] - ordered[int(at)]) * (at - int(at))
+        runs[seed] = {
+            'status': 'pass' if all(detail['pass'] for detail in correctness.values()
+                                    if isinstance(detail, dict) and 'pass' in detail) else 'incorrect',
+            'reference_torch': reference['torch'], 'correctness': correctness,
+            'timing': {'host_ms': host_ms, 'host_p50_ms': statistics.median(host_ms), 'host_p95_ms': p95,
+                       'tokens_per_s_at_p50': 1000 / statistics.median(host_ms)}}
+        log(f'seed {seed}: {runs[seed]["status"]}, host p50 {runs[seed]["timing"]["host_p50_ms"]:.3f} ms')
+    first = runs[args.seed[0]]
     report = {
-        'probe': 'tilert_dsv32', 'case': case.id, 'seed': args.seed, 'position': position,
+        'probe': 'tilert_dsv32', 'case': case.id, 'seed': args.seed[0], 'position': position,
         'tilert_version': __import__('tilert').__version__, 'torch': torch.__version__,
-        'reference_torch': reference['torch'], 'gpus': [torch.cuda.get_device_name(device) for device in range(devices)],
+        'reference_torch': first['reference_torch'], 'gpus': [torch.cuda.get_device_name(device) for device in range(devices)],
         'mode': 'non-MTP greedy decode, one step per call; sampling, MTP and prefill excluded',
-        'status': 'pass' if graded_pass else 'incorrect', 'correctness': correctness, 'phases': phases,
-        'timing': {'host_ms': host_ms, 'host_p50_ms': statistics.median(host_ms), 'host_p95_ms': p95,
-                   'tokens_per_s_at_p50': 1000 / statistics.median(host_ms),
-                   'warmup': args.warmup, 'reps': args.reps,
-                   'method': 'perf_counter around engine.forward with all eight devices synchronized before and after'},
+        'status': 'pass' if all(run['status'] == 'pass' for run in runs.values()) else 'incorrect',
+        'correctness': first['correctness'], 'phases': phases,
+        'timing': first['timing'] | {'warmup': args.warmup, 'reps': args.reps,
+                                     'method': 'perf_counter around engine.forward with all eight devices synchronized before and after'},
+        'seeds': {str(seed): run for seed, run in runs.items()},
     }
     with output:
         json.dump(report, output, indent=2)
     print(json.dumps({key: report[key] for key in ('case', 'status', 'phases')} |
-                     {'host_p50_ms': report['timing']['host_p50_ms'],
-                      'logits': correctness['logits'], 'next_token': correctness['next_token']}, indent=2))
+                     {str(seed): {'host_p50_ms': run['timing']['host_p50_ms'], 'logits': run['correctness']['logits'],
+                                  'next_token': run['correctness']['next_token']} for seed, run in runs.items()}, indent=2))
     engine.cleanup()
 
 
@@ -307,13 +315,15 @@ def main() -> None:
     tilert = commands.add_parser('tilert', help='grade and time TileRT (TileRT venv, one process)')
     for command in (reference, tilert):
         command.add_argument('--case', default='deepseek-v32-step')
-        command.add_argument('--seed', type=int, default=20261008)
-    reference.add_argument('--output', type=Path, required=True, help='directory for reference-rank-*.pt')
+        command.add_argument('--seed', type=int, action='append',
+                             help='trial seed (repeatable; real-weight cases only for tilert; default 20261008)')
+    reference.add_argument('--output', type=Path, required=True, help='directory for seed-*/reference-rank-*.pt')
     tilert.add_argument('--reference', type=Path, required=True, help='directory written by the reference command')
     tilert.add_argument('--output', type=Path, required=True, help='new JSON report path (exclusive create)')
     tilert.add_argument('--warmup', type=int, default=10)
     tilert.add_argument('--reps', type=int, default=50)
     args = parser.parse_args()
+    args.seed = args.seed or [20261008]
     (run_reference if args.command == 'reference' else run_tilert)(args)
 
 

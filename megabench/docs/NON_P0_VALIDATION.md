@@ -17,7 +17,7 @@ two MegaMoE EP8 layer cases.
 | Llama 3.1 8B + EAGLE3 full iteration | Actual draft head, proposal tree, full target verification, greedy acceptance, both KV commits/rollback and next-draft features | Upstream target ancestor-mask/features tests, K=2/4/8 and partial/full/reject acceptance; full B200 K=4 run passed; enabled |
 | Gemma 3 27B TP2 | All 62 layers with vocabulary/head/intermediate shards and live TP reductions | CPU and full two-B200 outputs match the independent serial decoder for both seeds; enabled |
 | Qwen3-30B-A3B TP2/EP2 | All 48 layers, contiguous EP expert ownership, TP attention/FFN and distributed greedy token | CPU and full four-B200 logits, KV and global expert IDs match the independent serial decoder for both seeds; enabled |
-| DeepSeek-V3.2 TP8 (contexts 128, 4K, 32K) | All 61 layers in TileRT 0.1.6 decode numerics: block FP8 weights, FP8 activations only for q_a/kv_a/indexer-wk, BF16 latent/rope/index-key caches, BF16 Hadamard indexer, grouped routing and shared expert, FP32 logits | Independent expanded MLA, upstream indexer (exact selection and key writes), YaRN, routing and quantization tests; CPU TP rollouts and candidate harness pass; eight-B200 verification of the TileRT numerics pending; enabled |
+| DeepSeek-V3.2 TP8 (contexts 128, 4K, 32K) | Real FP8 checkpoint and prefilled prompt caches; TileRT-style cosine/relative-L2 gate. All 61 layers in TileRT 0.1.6 decode numerics: block FP8 weights, FP8 activations only for q_a/kv_a/indexer-wk, BF16 latent/rope/index-key caches, BF16 Hadamard indexer, grouped routing and shared expert, FP32 logits | Independent expanded MLA, upstream indexer (exact selection and key writes), YaRN, routing and quantization tests; CPU TP rollouts and candidate harness pass; eight-B200 verification of the TileRT numerics pending; enabled |
 | GLM-5.2-FP8 TP8 | All 78 layers, block FP8 weights, MLA, scheduled full/shared indexers and MoE | Independent expanded MLA, FP8 and routing tests; CPU TP and candidate harness pass; full eight-B200 three-step rollouts pass both seeds with exact replicated-state agreement; enabled |
 | GLM-5.3-Flash TP4 | All 45 layers: mHC (4 streams, 20 Sinkhorn iterations), 34 KDA and 11 NoPE MLA/DSA layers, block FP8 weights, 288-expert MoE | Pinned transformers 5.17.0 `Glm5NextTextModel` decode matches every output for three seeds; CPU TP2/TP4 rollouts and candidate harness pass; full four-B200 three-step rollout passes with exact replicated-state agreement; enabled |
 | Kimi-K3 layer EP8 (KDA layer 61, MLA layer 63) | One mid-block layer per attention variant: attention residuals, DP attention over 8 sequences per rank, EP8 MXFP4 experts with all-to-all dispatch/combine, latent norm/up and shared experts | Matches the whole-model Kimi reference's layer slice; CPU 2/8-rank all-to-all equals the serial 64-sequence batch; candidate harness passes; full eight-B200 EP8 outputs equal the serial run bit for bit for both seeds; enabled |
@@ -56,20 +56,83 @@ The one-launch budget applies per rank and includes communication kernels.
 Eager references use many launches and serve as correctness/timing baselines;
 passing their correctness checks does not produce a fused-candidate score.
 
+## DeepSeek-V3.2 real weights and TileRT-style gate
+
+The DeepSeek cases read the real FP8 checkpoint
+(`deepseek-ai/DeepSeek-V3.2` at revision `a7e62ac0`, recorded in
+`Case.checkpoint`) instead of seeded synthetic weights. With synthetic
+weights at full depth the step was numerically chaotic: a one-ulp change
+flipped expert routing or a sparse selection somewhere in 61 layers, so only
+a bit-exact copy of the reference passed. Real weights are well conditioned.
+
+The cache prefix is real as well. Each case has four prompts: fixed windows
+of the checkpoint's own chat-encoded transcripts (`encoding/test_output*.txt`),
+each starting with BOS. Their latent, rope and index-key caches come from a
+one-time eight-GPU prefill (causal MLA with the indexer's top-2,048 mask, as in
+DeepSeek's `inference/model.py`). A trial seed selects the prompt, and the decode
+token is the prompt's next token. Weights are loaded once per worker process
+and shared by all trials.
+
+The checkpoint resolves from `$MEGABENCH_DEEPSEEK_V32_CHECKPOINT` (a snapshot
+directory) or the Hugging Face cache (`HF_HUB_CACHE`) at the pinned revision.
+Caches go to `$MEGABENCH_CACHE_DIR/deepseek-v32/<revision>/` (default
+`~/.cache/megabench`). Build them once inside an eight-GPU allocation. One
+pass over the weights prefills every prompt of the listed cases:
+
+```bash
+hf download deepseek-ai/DeepSeek-V3.2 --revision a7e62ac04ecb2c0a54d736dc46601c5606cf10a6
+.venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=8 \
+  -m megabench.prepare_deepseek_v32 --case deepseek-v32-step \
+  --case deepseek-v32-step-ctx4k --case deepseek-v32-step-ctx32k
+```
+
+The prepare log reports each prompt's teacher-forced next-token accuracy and
+mean NLL as a sanity check on the weights.
+
+With `evaluate --docker-image`, the runner mounts the checkpoint's repository
+and the case's cache directory read-only and points both variables at them.
+
+Their gate (`Case.gate = "tilert"`, `harness.correctness.tilert_metrics`)
+uses TileRT's accuracy metrics, cosine similarity and relative L2 error
+(`tilert/utils.py`). TileRT applies them per operator against golden
+forwards and publishes no thresholds or end-to-end gate. Applying them to a
+whole decode step, and the rules below, are MegaBench's choice. They replace
+the element-wise BF16 band:
+
+- A floating output passes if its cosine similarity is at least
+  `TILERT_MIN_COSINE` and its relative L2 error at most
+  `TILERT_MAX_RELATIVE_L2`, measured against either the FP32 oracle or the
+  BF16 reference. Logit sums are reduced over the vocabulary shards.
+- Cache writes (`kv_write`, `pe_write`, `index_k_write`) are graded over the
+  first `TILERT_GRADED_LAYERS` (4) layers: the three dense layers and the
+  first MoE layer. Metrics over all 61 layers are reported, not graded.
+  Near-tie sparse-selection and routing flips compound with depth. On one 4K
+  prompt the BF16 reference itself reaches cosine 0.87 / relative L2 0.52
+  against the oracle over all layers, and 0.986 / 0.16 in its logits. Over
+  the first four layers it stays within 2.3% relative L2 on every prompt.
+  The logits still check the whole step.
+- `next_token` passes if it equals the BF16 reference's or the oracle's token,
+  or if its oracle logit is within the near-tie margin of the oracle's maximum.
+- `sparse_indices` and `expert_ids` are reported as recall against the
+  reference, not graded. So sparse attention, other summation orders and
+  FP8 GEMMs that legitimately flip a near-tie selection can pass.
+
+Shapes, dtypes, devices and input preservation are still enforced.
+
 ## TileRT comparison (DeepSeek-V3.2)
 
 The DeepSeek cases follow [TileRT](https://github.com/tile-ai/TileRT) 0.1.6's
 non-MTP B=1 decode numerics so that TileRT can be graded and timed on the same
 task. TileRT drives eight GPUs from one host process and cannot run as a
-per-rank submission; [`probes/tilert_dsv32_probe.py`](../probes/tilert_dsv32_probe.py)
-instead feeds it the case's seeded weights (converted in memory by TileRT's own
-checkpoint transforms), cache prefix and token, runs one step at position
-`context`, grades logits, the greedy token and every layer's latent/rope/index
-key write with the harness bands, and times host latency with all devices
-synchronized. Compare its `host_p50_ms` with a candidate's
+per-rank submission. [`probes/tilert_dsv32_probe.py`](../probes/tilert_dsv32_probe.py)
+instead feeds it the case's weights (converted in memory by TileRT's own
+checkpoint transforms), the cache prefix and the token. It runs one step at
+position `context` and grades it with the case's gate, as a candidate's
+outputs are. It times host latency with
+all devices synchronized. Compare its `host_p50_ms` with a candidate's
 `candidate_timing.host_p50_ms` (slowest rank per repetition).
 
-Two numerics differ from TileRT and are left to the tolerance band: TileRT
+Two numerics differ from TileRT and are covered by the gate: TileRT
 re-quantizes q_a/kv_a weights per K block on its seven attention devices, and
 rounds each weighted routed expert's rank-local partial to BF16, which is not
 TP-invariant. TileRT keeps sparse indices and expert IDs only for the last
@@ -92,8 +155,9 @@ reproductions/TileRT/.venv/bin/python -m megabench.probes.tilert_dsv32_probe til
   --output /path/run/tilert.json
 ```
 
-The `tilert` step checks a digest of regenerated inputs against the reference
-run, so torch RNG drift between the two environments fails loudly.
+The `tilert` step checks a digest of the rebuilt inputs against the reference
+run, so any input drift between the two environments fails loudly. Both
+environments need the checkpoint and the prepared caches.
 
 The new families do not yet have speed-of-light traffic models. Their SOL
 output explicitly reports unavailable rather than borrowing a P0 formula.

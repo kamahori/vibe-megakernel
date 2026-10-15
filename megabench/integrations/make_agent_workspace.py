@@ -27,7 +27,7 @@ REFERENCE_FILES = {
     "vl_decode_step": ("vision.py", "gemma.py", "common.py"),
     "spec_full_iteration": ("speculative.py", "eagle3.py", "common.py"),
     "distributed_step": ("distributed.py", "parallel.py", "common.py"),
-    "deepseek_v32_step": ("frontier.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
+    "deepseek_v32_step": ("frontier.py", "deepseek_checkpoint.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
     "glm52_step": ("frontier.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
     "kimi_k3_step": ("kimi.py", "frontier.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
     "kimi_k3_layer": ("kimi_layer.py", "kimi.py", "frontier.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),

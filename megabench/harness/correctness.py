@@ -82,6 +82,140 @@ def _teacher_forced(case: Case, inputs: dict, expected: dict, exact: dict,
     return expected, exact
 
 
+# TileRT-style per-step gate. Every floating output must point the same way as
+# the FP32 oracle and stay within a relative L2 error of it; the greedy token
+# must be the reference's or oracle's, or a near-tie of the oracle's top logit.
+# Routing and sparse-selection integers are reported, not graded, so any
+# implementation of the same math (sparse attention, other summation orders)
+# can pass.
+TILERT_MIN_COSINE = 0.99
+TILERT_MAX_RELATIVE_L2 = 0.15
+# Cache writes are graded over the first layers only (DeepSeek-V3.2: three
+# dense layers and the first MoE layer); later layers are reported. Near-tie
+# sparse-index and expert flips compound with depth: on one 4K prompt the
+# BF16 reference's cache writes reach cosine 0.87 to the oracle over all 61
+# layers, but stay within 2.3% relative L2 over these four.
+TILERT_GRADED_LAYERS = 4
+TILERT_CACHE_WRITES = ("kv_write", "pe_write", "index_k_write")
+TILERT_DIAGNOSTIC = ("sparse_indices", "expert_ids")
+
+
+def tilert_metrics(expected: dict, actual: dict, case: Case, device: str, exact: dict) -> dict:
+    """Per-output cosine similarity and relative L2, with verdicts.
+
+    Each floating output is measured against both the FP32 oracle and the
+    BF16 reference, and passes if it is within the thresholds of either.
+    Cache writes are graded over their first ``TILERT_GRADED_LAYERS`` layers
+    and reported over all layers.
+
+    In a TP process group the logits are vocabulary shards, so their sums,
+    maxima and the greedy token's logit are reduced over the group. Every rank
+    reaches every collective, even when its own outputs are malformed.
+    """
+    import torch
+    import torch.distributed as dist
+
+    sharded = dist.is_available() and dist.is_initialized() and case.tp > 1 and dist.get_world_size() == case.tp
+    problem = None
+    if not isinstance(actual, dict) or set(actual) != set(expected):
+        problem = (f"output keys: expected {sorted(expected)}, got "
+                   f"{sorted(actual) if isinstance(actual, dict) else type(actual)}")
+    else:
+        for name, want in expected.items():
+            got = actual[name]
+            if not isinstance(got, torch.Tensor):
+                problem = f"{name}: output must be a Tensor"
+            elif got.shape != want.shape or got.dtype != want.dtype:
+                problem = (f"{name}: expected {tuple(want.shape)} {want.dtype}, "
+                           f"got {tuple(got.shape)} {got.dtype}")
+            elif got.device != want.device:
+                problem = f"{name}: output is on {got.device}, expected {device}"
+            if problem:
+                break
+    flag = torch.tensor([problem is not None], device=device, dtype=torch.int32)
+    if sharded:
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    if problem or flag.item():
+        raise AssertionError(problem or "another rank returned malformed outputs")
+
+    def total(value: torch.Tensor, op=None) -> torch.Tensor:
+        if sharded:
+            dist.all_reduce(value, op=op or dist.ReduceOp.SUM)
+        return value
+
+    def measure(got: torch.Tensor, want: torch.Tensor, oracle: torch.Tensor, reduce: bool) -> dict:
+        got, want, oracle = (value.double().flatten() for value in (got, want, oracle))
+        sums = torch.stack([got @ oracle, got @ want, got.square().sum(), oracle.square().sum(),
+                            want.square().sum(), (got - oracle).square().sum(), (got - want).square().sum(),
+                            want @ oracle, (want - oracle).square().sum()])
+        if reduce:
+            sums = total(sums)
+        dot, ref_dot, got_sq, oracle_sq, ref_sq, error_sq, ref_error_sq, agree, drift_sq = sums.tolist()
+        tiny = torch.finfo(torch.float64).tiny
+        result = {"cosine": dot / max((got_sq * oracle_sq) ** 0.5, tiny),
+                  "relative_l2": (error_sq / max(oracle_sq, tiny)) ** 0.5,
+                  "cosine_to_reference": ref_dot / max((got_sq * ref_sq) ** 0.5, tiny),
+                  "relative_l2_to_reference": (ref_error_sq / max(ref_sq, tiny)) ** 0.5,
+                  "reference_cosine": agree / max((ref_sq * oracle_sq) ** 0.5, tiny),
+                  "reference_relative_l2": (drift_sq / max(oracle_sq, tiny)) ** 0.5}
+        result["pass"] = any(result[cosine] >= TILERT_MIN_COSINE and result[relative] <= TILERT_MAX_RELATIVE_L2
+                             for cosine, relative in (("cosine", "relative_l2"),
+                                                      ("cosine_to_reference", "relative_l2_to_reference")))
+        return result
+
+    details = {}
+    for name, want in expected.items():
+        if not want.is_floating_point():
+            continue
+        got, oracle = actual[name], exact[name]
+        details[name] = measure(got, want, oracle, name == "logits")
+        if name in TILERT_CACHE_WRITES and want.shape[0] > TILERT_GRADED_LAYERS:
+            details[name]["graded"] = False
+            details[name].pop("pass")
+            graded = slice(0, TILERT_GRADED_LAYERS)
+            details[f"{name}[:{TILERT_GRADED_LAYERS}]"] = measure(got[graded], want[graded], oracle[graded], False)
+
+    if "next_token" not in expected:
+        return details
+    # Greedy token: the oracle logit it selects against the oracle maximum.
+    token, logits, oracle_logits = int(actual["next_token"]), expected["logits"], exact["logits"].double()
+    offset = dist.get_rank() * logits.numel() if sharded else 0
+    vocabulary = logits.numel() * (case.tp if sharded else 1)
+    picked = torch.zeros((), device=device, dtype=torch.float64)
+    if not 0 <= token < vocabulary:
+        picked -= torch.inf
+    elif offset <= token < offset + logits.numel():
+        picked += oracle_logits[token - offset]
+    picked = total(picked)
+    maximum = total(oracle_logits.max().clone(), dist.ReduceOp.MAX)
+    noise = total(torch.stack([(logits.double() - oracle_logits).square().sum(),
+                               torch.tensor(float(logits.numel()), device=device, dtype=torch.float64)]))
+    margin = case.noise_factor * float((noise[0] / noise[1]).sqrt())
+    details["next_token"] = {"token": token, "reference_token": int(expected["next_token"]),
+                             "oracle_token": int(exact["next_token"]),
+                             "oracle_logit_gap": float(maximum - picked), "near_tie_margin": margin}
+    details["next_token"]["pass"] = (token in (details["next_token"]["reference_token"],
+                                               details["next_token"]["oracle_token"])
+                                     or float(maximum - picked) <= margin)
+
+    for name in (name for name in TILERT_DIAGNOSTIC if name in expected):
+        got, want = actual[name].reshape(actual[name].shape[0], -1), expected[name].reshape(expected[name].shape[0], -1)
+        recall = [len(set(row.tolist()) & set(ref.tolist()) - {-1}) / max(len(set(ref.tolist()) - {-1}), 1)
+                  for row, ref in zip(got.cpu(), want.cpu()) if (ref >= 0).any()]
+        details[name] = {"graded": False, "mean_recall": sum(recall) / max(len(recall), 1),
+                         "min_recall": min(recall, default=1.0)}
+    return details
+
+
+def _tilert_gate(expected: dict, actual: dict, case: Case, device: str, exact: dict) -> dict:
+    """Raise unless every graded output passes ``tilert_metrics``."""
+    details = tilert_metrics(expected, actual, case, device, exact)
+    failed = [name for name, detail in details.items() if detail.get("pass") is False]
+    if failed:
+        raise AssertionError("; ".join(f"{name}: {details[name]}" for name in failed))
+    return details
+
+
 def _compare(expected: dict, actual: dict, case: Case, device: str,
              exact: dict | None = None) -> dict:
     """Check outputs against the reference, or within the BF16 band of ``exact``.
@@ -93,6 +227,8 @@ def _compare(expected: dict, actual: dict, case: Case, device: str,
     """
     import torch
 
+    if exact is not None and case.gate == "tilert":
+        return _tilert_gate(expected, actual, case, device, exact)
     if not isinstance(actual, dict) or set(actual) != set(expected):
         raise AssertionError(f"output keys: expected {sorted(expected)}, got "
                              f"{sorted(actual) if isinstance(actual, dict) else type(actual)}")

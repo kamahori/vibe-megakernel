@@ -42,6 +42,9 @@ def mxfp4_matrix(seed, name, rows, cols, device, *, row_range=None, col_range=No
 
 
 def audit(case):
+    # Checkpoint cases have the synthetic shapes; only their norm gammas and
+    # router bias are FP32 instead of BF16 (about 2 MB more per rank).
+    case = replace(case, checkpoint='', gate='band')
     module = {'kimi_k3_step':kimi, 'glm53_flash_step':glm53, 'kimi_k3_layer':kimi_layer}.get(case.family, frontier)
     with patch.object(module, 'matrix', matrix), \
          patch.object(frontier, 'fp8_matrix', fp8_matrix), \
