@@ -1,4 +1,4 @@
-"""Capture-safe PyTorch baselines for timing P0 candidates.
+"""Capture-safe PyTorch baselines for timing P0 and multimodal candidates.
 
 The grading references in ``megabench.tasks`` synchronize with the host: they
 read token ids and routing or acceptance indices with ``.item()`` and build
@@ -32,6 +32,7 @@ Inputs = dict[str, torch.Tensor]
 Step = Callable[[Inputs], dict[str, torch.Tensor]]
 
 SUPPORTED_FAMILIES = ("dense_step", "moe_step", "quant_step", "spec_target_step")
+MULTIMODAL_FAMILIES = ("tts_frame_step", "vla_action_step", "world_frame_step")
 # Inductor autotunes matmul and reduction configs; graph replay is applied
 # separately so each variant's time is attributable.
 COMPILE_MODE = "max-autotune-no-cudagraphs"
@@ -232,12 +233,209 @@ def _eagle3(case: Case, device) -> Step:
     return step
 
 
+def _csm(case: Case, device) -> Step:
+    from .tasks import csm
+
+    p = case.params
+    books, vocab, context = p["codebooks"], p["audio_vocab"], p["context"]
+    offsets = torch.arange(books, device=device) * vocab
+
+    def phases(width: int, scaling: dict, positions) -> dict[int, torch.Tensor]:
+        # csm.rotate's FP32 phase, with the host-built llama3 frequencies
+        # copied to the device once instead of on every call.
+        inv = csm.llama3_inv_freq(width, scaling).to(device)
+        table = {}
+        for position in positions:
+            phase = inv * float(position)
+            table[position] = torch.cat((phase, phase))
+        return table
+
+    backbone_phase = phases(p["head_dim"], csm.BACKBONE_ROPE, [context])[context]
+    depth_phase = phases(p["depth_head_dim"], csm.DEPTH_ROPE, range(books))
+
+    def rotate(x: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
+        cos, sin = phase.cos().to(x.dtype), phase.sin().to(x.dtype)
+        half = x.shape[-1] // 2
+        return x * cos + torch.cat((-x[..., half:], x[..., :half]), dim=-1) * sin
+
+    def layer_step(x, w, layer, keys, values, phase, heads):
+        qh, kvh, d = heads
+        xn = rms(x, w["ln1"][layer], csm.RMS_EPS)
+        q = rotate((xn @ w["wq"][layer].T).view(qh, d), phase)
+        k = rotate((xn @ w["wk"][layer].T).view(kvh, d), phase)
+        v = (xn @ w["wv"][layer].T).view(kvh, d)
+        ks, vs = torch.cat((keys, k[None])), torch.cat((values, v[None]))
+        x = x + attention(q, ks, vs).reshape(qh * d) @ w["wo"][layer].T
+        xn = rms(x, w["ln2"][layer], csm.RMS_EPS)
+        x = x + (F.silu(xn @ w["wg"][layer].T) * (xn @ w["wu"][layer].T)) @ w["wd"][layer].T
+        return x, k, v
+
+    def step(t: Inputs) -> dict[str, torch.Tensor]:
+        x = t["embed_audio"][t["prev_codes"] + offsets].sum(0)
+        backbone = {name: t[name] for name in csm.LAYER_NAMES}
+        heads = (p["q_heads"], p["kv_heads"], p["head_dim"])
+        k_writes, v_writes = [], []
+        for layer in range(p["layers"]):
+            x, k, v = layer_step(x, backbone, layer, t["kcache"][layer], t["vcache"][layer],
+                                 backbone_phase, heads)
+            k_writes.append(k)
+            v_writes.append(v)
+        hidden = rms(x, t["fnorm"], csm.RMS_EPS)
+        logits = [hidden @ t["lm_head"].T]
+        depth = {name: t["depth_" + name] for name in csm.LAYER_NAMES}
+        dheads = (p["depth_q_heads"], p["depth_kv_heads"], p["depth_head_dim"])
+        dlayers, dd = p["depth_layers"], p["depth_head_dim"]
+        keys = [hidden.new_empty((0, dheads[1], dd)) for _ in range(dlayers)]
+        vals = [hidden.new_empty((0, dheads[1], dd)) for _ in range(dlayers)]
+        codes = [logits[0].argmax()]
+        for position in range(books):
+            if position == 0:
+                embedded = hidden
+            else:
+                embedded = _row(t["embed_audio"], codes[position - 1] + offsets[position - 1])
+            y = embedded @ t["depth_proj"].T
+            for layer in range(dlayers):
+                y, k, v = layer_step(y, depth, layer, keys[layer], vals[layer],
+                                     depth_phase[position], dheads)
+                keys[layer] = torch.cat((keys[layer], k[None]))
+                vals[layer] = torch.cat((vals[layer], v[None]))
+            if position > 0:
+                y = rms(y, t["depth_fnorm"], csm.RMS_EPS)
+                logits.append(y @ t["codebooks_head"][position - 1])
+                codes.append(logits[position].argmax())
+        return {"codes": torch.stack(codes).to(torch.int64),
+                "logits": torch.stack(logits).float(),
+                "k_write": torch.stack(k_writes).to(torch.bfloat16),
+                "v_write": torch.stack(v_writes).to(torch.bfloat16)}
+
+    return step
+
+
+def _pi05(case: Case, device) -> Step:
+    from .tasks import pi05
+
+    p = case.params
+    steps, d, qh, kvh = p["denoise_steps"], p["head_dim"], p["q_heads"], p["kv_heads"]
+    # pi05.rope's FP32 frequencies, copied to the device once.
+    inv = (1.0 / (pi05.ROPE_THETA ** (torch.arange(0, d, 2, dtype=torch.int64).float() / d))).to(device)
+    dt = -1.0 / steps
+
+    def rope(x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        phase = positions.float()[:, None] * inv[None, :]
+        phase = torch.cat((phase, phase), -1)
+        cos, sin = phase.cos().to(x.dtype)[:, None], phase.sin().to(x.dtype)[:, None]
+        half = d // 2
+        return x * cos + torch.cat((-x[..., half:], x[..., :half]), -1) * sin
+
+    def expert(t: Inputs, h, cond, positions, allowed):
+        tokens = h.shape[0]
+        for layer in range(p["layers"]):
+            normalized, gate = pi05.ada_rms(h, F.linear(cond, t["attn_norm_weight"][layer],
+                                                        t["attn_norm_bias"][layer]))
+            query = rope((normalized @ t["wq"][layer].T).view(tokens, qh, d), positions)
+            key = rope((normalized @ t["wk"][layer].T).view(tokens, kvh, d), positions)
+            content = (normalized @ t["wv"][layer].T).view(tokens, kvh, d)
+            key = torch.cat((t["prefix_k"][layer], key))
+            content = torch.cat((t["prefix_v"][layer], content))
+            mixed = attention(query, key, content, allowed=allowed).reshape(tokens, qh * d)
+            h = h + (mixed @ t["wo"][layer].T) * gate
+            normalized, gate = pi05.ada_rms(h, F.linear(cond, t["ffn_norm_weight"][layer],
+                                                        t["ffn_norm_bias"][layer]))
+            gated = (F.gelu(normalized @ t["wg"][layer].T, approximate="tanh") *
+                     (normalized @ t["wu"][layer].T))
+            h = h + (gated @ t["wd"][layer].T) * gate
+        return pi05.ada_rms(h, F.linear(cond, t["final_norm_weight"], t["final_norm_bias"]))[0]
+
+    def step(t: Inputs) -> dict[str, torch.Tensor]:
+        positions, allowed = pi05.suffix_layout(case, t["prefix_mask"])
+        x = t["noise"]
+        for index in range(steps):
+            time = torch.full((1,), 1.0 + index * dt, dtype=torch.float32, device=x.device)
+            cond = pi05.time_condition(case, t, time)
+            h = F.linear(x, t["action_in_weight"], t["action_in_bias"]).to(torch.bfloat16)
+            h = expert(t, h, cond, positions, allowed)
+            x = x + dt * F.linear(h.float(), t["action_out_weight"], t["action_out_bias"])
+        return {"actions": x}
+
+    return step
+
+
+def _waypoint(case: Case, device) -> Step:
+    from .tasks import waypoint as wp
+
+    p = case.params
+    heads, kv_heads, d, frame = p["q_heads"], p["kv_heads"], p["head_dim"], p["frame_index"]
+    geo = wp.geometry(case)
+    table = wp._rope_tables(case, frame, device)
+    fusion = {layer: index for index, layer in enumerate(wp.control_layers(case))}
+    # The reference indexes the cache rings with Python lists, a host copy per
+    # layer; keep each layer's visible slots on the device instead.
+    visible = [torch.tensor(wp.visible_slots(case, layer, frame), dtype=torch.int64, device=device)
+               for layer in range(p["layers"])]
+
+    def forward(w: Inputs, latent, sigma, ctrl, *, kv_only=False):
+        cond = wp._noise_embedding(w, sigma, device)
+        ctrl_n = wp._rms(ctrl)
+        x = wp._patchify(case, w, latent)
+        tokens = x.shape[0]
+        ks, vs, v_first = [], [], None
+        for layer in range(p["layers"]):
+            attn_h = F.silu(cond + w["attn_cond_bias"][layer])
+            s0, b0, g0 = (attn_h @ w["attn_cond_w"][layer, i].T for i in range(3))
+            h = wp._rms(x) * (1 + s0) + b0
+            q = (h @ w["wq"][layer].T).view(tokens, heads, d)
+            k = (h @ w["wk"][layer].T).view(tokens, kv_heads, d)
+            v = (h @ w["wv"][layer].T).view(tokens, kv_heads, d)
+            if v_first is None:
+                v_first = v
+            v = torch.lerp(v, v_first, w["v_lamb"][layer])
+            q, k = wp._rope(wp._rms(q), table), wp._rope(wp._rms(k), table)
+            ks.append(k)
+            vs.append(v)
+            if kv_only and layer == p["layers"] - 1:
+                break
+            keys = torch.cat((w["k_cache"][layer].index_select(0, visible[layer])
+                              .reshape(-1, kv_heads, d), k))
+            values = torch.cat((w["v_cache"][layer].index_select(0, visible[layer])
+                                .reshape(-1, kv_heads, d), v))
+            attn = wp._attention(q, keys, values).reshape(tokens, heads * d)
+            x = (attn @ w["wo"][layer].T) * g0 + x
+            if layer in fusion:
+                i = fusion[layer]
+                fused = F.silu(wp._rms(x) @ w["fuse_x"][i].T + ctrl_n @ w["fuse_c"][i].T)
+                x = fused @ w["fuse_out"][i].T + x
+            mlp_h = F.silu(cond + w["mlp_cond_bias"][layer])
+            s1, b1, g1 = (mlp_h @ w["mlp_cond_w"][layer, i].T for i in range(3))
+            mlp = F.silu((wp._rms(x) * (1 + s1) + b1) @ w["fc1"][layer].T) @ w["fc2"][layer].T
+            x = mlp * g1 + x
+        k_out, v_out = torch.stack(ks), torch.stack(vs)
+        if kv_only:
+            return None, k_out, v_out
+        a, c = (F.silu(cond) @ w["out_norm_w"].T).chunk(2)
+        x = F.silu(wp._rms(x) * (1 + a) + c)
+        grid = x.T.reshape(1, p["hidden"], geo["grid_h"], geo["grid_w"])
+        out = F.conv_transpose2d(grid, w["unpatch_w"], w["unpatch_b"], stride=p["patch"])
+        return out[0], k_out, v_out
+
+    def step(t: Inputs) -> dict[str, torch.Tensor]:
+        ctrl = wp._control_embedding(t)
+        x = t["noise"]
+        for sigma, sigma_next in zip(wp.SIGMAS[:-1], wp.SIGMAS[1:]):
+            velocity, _, _ = forward(t, x, sigma, ctrl)
+            x = x + (sigma_next - sigma) * velocity
+        _, k_write, v_write = forward(t, x, wp.SIGMAS[-1], ctrl, kv_only=True)
+        return {"latent": x, "k_write": k_write, "v_write": v_write}
+
+    return step
+
+
 _BUILDERS = {"dense_step": _dense, "moe_step": _moe, "quant_step": _gemma,
-             "spec_target_step": _eagle3}
+             "spec_target_step": _eagle3, "tts_frame_step": _csm,
+             "vla_action_step": _pi05, "world_frame_step": _waypoint}
 
 
 def build(case: Case, device) -> Step:
-    """Return a capture-safe eager step for one ready P0 case."""
+    """Return a capture-safe eager step for one ready P0 or multimodal case."""
     if case.family not in _BUILDERS:
         raise NotImplementedError(f"no capture-safe baseline for {case.family}")
     return _BUILDERS[case.family](case, device)

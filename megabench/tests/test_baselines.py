@@ -6,11 +6,19 @@ import unittest
 
 import torch
 
-from ..baselines import SUPPORTED_FAMILIES, build
+from ..baselines import MULTIMODAL_FAMILIES, SUPPORTED_FAMILIES, build
 from ..harness.correctness import _compare
 from ..tasks.eagle3 import set_acceptance_scenario
 from ..workloads import make_inputs, oracle, reference
 from .test_suite import TINY_P0, TINY_SPEC
+
+
+def _multimodal_dev_cases():
+    from ..verify_csm_primary import development as csm_development
+    from .test_pi05 import tiny_pi05
+    from .test_waypoint import development as waypoint_development
+
+    return (csm_development(), tiny_pi05(), waypoint_development())
 
 
 def _assert_matches(test: unittest.TestCase, case, inputs) -> None:
@@ -41,6 +49,18 @@ class CaptureSafeBaselineTests(unittest.TestCase):
                 inputs = make_inputs(TINY_SPEC, 23)
                 set_acceptance_scenario(TINY_SPEC, inputs, accepted)
                 _assert_matches(self, TINY_SPEC, inputs)
+
+    def test_multimodal_baselines_are_bit_identical_to_the_reference(self) -> None:
+        cases = _multimodal_dev_cases()
+        self.assertEqual({case.family for case in cases}, set(MULTIMODAL_FAMILIES))
+        for case in cases:
+            with self.subTest(case=case.id), torch.inference_mode():
+                inputs = make_inputs(case, 5)
+                expected = reference(case, inputs)
+                actual = build(case, "cpu")(inputs)
+                self.assertEqual(set(actual), set(expected))
+                for name, want in expected.items():
+                    self.assertTrue(torch.equal(actual[name], want), f"{case.id}: {name}")
 
 
 if __name__ == "__main__":
