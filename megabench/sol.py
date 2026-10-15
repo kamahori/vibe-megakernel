@@ -1,8 +1,9 @@
 """Optimistic one-read HBM traffic floors for ready MegaBench model steps.
 
 This is a useful-byte bound, not a prediction of achievable kernel latency.
-It counts each needed weight once, the old KV values needed by the step, and
-required outputs. It omits scratch traffic, synchronization, and instruction
+It counts each needed weight once per dependent pass that uses it (once for
+the P0 decode steps), the old KV values needed by the step, and required
+outputs. It omits scratch traffic, synchronization, and instruction
 cost. P0 model weights are larger than cache, so weight streaming is a useful
 first-order bound for those cases.
 """
@@ -186,10 +187,13 @@ def _llama_layer_elements(hidden: int, qdim: int, kvdim: int, inter: int) -> int
 
 
 def _csm_work(case: Case) -> tuple[list[dict], list[dict], int]:
-    """One CSM frame: backbone decode, then 31 depth-decoder positions.
+    """One CSM frame: backbone decode, then 31 dependent depth-decoder passes.
 
-    The depth decoder re-reads its ~0.2 GB of weights at each of its 31
-    dependent positions; this one-read floor counts them once.
+    The depth decoder's ~0.23 GB of weights do not fit on chip, so each
+    dependent pass streams them again. Positions 0 (backbone state) and 1
+    (code 0) are both known after the backbone and share one two-token pass;
+    positions 2..31 each wait for the previous greedy code. Each codebook head
+    is used by exactly one position and counts once.
     """
     p = case.params
     hidden, books, vocab = p["hidden"], p["codebooks"], p["audio_vocab"]
@@ -200,11 +204,12 @@ def _csm_work(case: Case) -> tuple[list[dict], list[dict], int]:
     depth = (p["depth_layers"] * _llama_layer_elements(dhidden, dq, dkv, p["depth_intermediate"])
              + dhidden + dhidden * hidden)
     heads = (books - 1) * dhidden * vocab
+    depth_passes = books - 1
     bytes_ = [
         {"name": "backbone_weights", "bytes": backbone * BF16_BYTES, "detail": "layers and final norm"},
         {"name": "codebook0_head", "bytes": vocab * hidden * BF16_BYTES, "detail": "backbone lm_head"},
-        {"name": "depth_decoder_weights", "bytes": depth * BF16_BYTES,
-         "detail": "layers, final norm and input projector, counted once"},
+        {"name": "depth_decoder_weights", "bytes": depth_passes * depth * BF16_BYTES,
+         "detail": f"layers, final norm and input projector, re-read by each of {depth_passes} dependent passes"},
         {"name": "codebook_heads", "bytes": heads * BF16_BYTES, "detail": "one head per codebook 1..31"},
         {"name": "embedding_rows", "bytes": (2 * books - 1) * hidden * BF16_BYTES,
          "detail": "32 frame rows plus 31 depth-input rows"},
@@ -221,7 +226,12 @@ def _csm_work(case: Case) -> tuple[list[dict], list[dict], int]:
 
 
 def _waypoint_work(case: Case) -> tuple[list[dict], list[dict], int]:
-    """Four denoise passes and the sigma-0 cache pass over one frame."""
+    """Four denoise passes and the sigma-0 cache pass over one frame.
+
+    Each pass needs the previous pass's latent, so the ~2 GB of DiT weights
+    and the visible K/V stream once per pass. The cache pass skips the last
+    layer's output projection, MLP and attention, and the output patch layer.
+    """
     from .tasks.waypoint import NOISE_FOURIER_DIM, NOISE_HIDDEN_MULT, MOUSE_DIMS, SCROLL_DIMS
     from .tasks.waypoint import control_layers, visible_slots
 
@@ -237,13 +247,18 @@ def _waypoint_work(case: Case) -> tuple[list[dict], list[dict], int]:
     noise_hidden = NOISE_HIDDEN_MULT * d
     visible = [len(visible_slots(case, layer, p["frame_index"])) for layer in range(layers)]
     latent = p["latent_channels"] * p["latent_height"] * p["latent_width"]
+    passes = p["denoise_steps"]
+    skipped = qdim * d + 2 * inner * d + d * patch + patch
+    kv_elements = 2 * tokens * kvdim
     bytes_ = [
-        {"name": "dit_weights", "bytes": bf16_elements * BF16_BYTES,
-         "detail": "blocks, AdaLN condition heads, controller fusion and patch layers"},
+        {"name": "dit_weights", "bytes": ((passes + 1) * bf16_elements - skipped) * BF16_BYTES,
+         "detail": f"blocks, AdaLN condition heads, controller fusion and patch layers, "
+                   f"re-read by {passes} denoise passes and the cache pass"},
         {"name": "noise_mlp", "bytes": noise_hidden * (NOISE_FOURIER_DIM + d) * FP32_BYTES,
-         "detail": "FP32 sigma embedding MLP"},
-        {"name": "old_kv_cache_reads", "bytes": 2 * sum(visible) * tokens * kvdim * BF16_BYTES,
-         "detail": "visible local and dilated global frames, read once"},
+         "detail": "FP32 sigma embedding MLP, once for the fixed schedule"},
+        {"name": "old_kv_cache_reads",
+         "bytes": ((passes + 1) * sum(visible) - visible[-1]) * kv_elements * BF16_BYTES,
+         "detail": "visible local and dilated global frames, re-read by each pass"},
         {"name": "io", "bytes": 2 * latent * BF16_BYTES + 2 * layers * tokens * kvdim * BF16_BYTES
          + ctrl_in * BF16_BYTES, "detail": "noise, controller, latent and K/V writes"},
     ]
@@ -251,7 +266,6 @@ def _waypoint_work(case: Case) -> tuple[list[dict], list[dict], int]:
     full = 2 * tokens * (layers * linear + fused * 2 * d * d) + attention
     # The cache pass stops once the last layer's K and V exist.
     last = 2 * tokens * (2 * qdim * d + 2 * inner * d) + 4 * tokens * (visible[-1] + 1) * tokens * qdim
-    passes = p["denoise_steps"]
     flops = [{"name": "dit_passes", "dtype": "bf16", "flops": (passes + 1) * full - last,
               "detail": f"{passes} denoise passes and one cache pass over {tokens} tokens"}]
     return bytes_, flops, 0
@@ -261,7 +275,9 @@ def _pi05_work(case: Case) -> tuple[list[dict], list[dict], int]:
     """Ten flow-matching steps of the action expert over a cached prefix.
 
     Time conditioning depends only on the fixed schedule, so the FP32 adaRMS
-    weights can be read once for all steps; every weight counts once.
+    and time-MLP weights can be read once for all steps. Each Euler step needs
+    the previous step's actions, so the BF16 expert weights and the prefix K/V
+    (together ~0.64 GB, beyond on-chip capacity) are streamed once per step.
     """
     p = case.params
     w, layers, steps, horizon = p["expert_hidden"], p["layers"], p["denoise_steps"], p["horizon"]
@@ -270,12 +286,12 @@ def _pi05_work(case: Case) -> tuple[list[dict], list[dict], int]:
     fp32 = (2 * layers + 1) * 3 * w * (w + 1) + 2 * w * (w + 1) + 2 * act * w + w + act
     prefix = p["images"] * p["image_tokens"] + p["text_tokens"]
     bytes_ = [
-        {"name": "expert_weights", "bytes": layers * linear * BF16_BYTES,
-         "detail": "Gemma-300M attention and MLP projections"},
+        {"name": "expert_weights", "bytes": steps * layers * linear * BF16_BYTES,
+         "detail": f"Gemma-300M attention and MLP projections, re-read by each of {steps} dependent steps"},
         {"name": "fp32_conditioning_and_action_weights", "bytes": fp32 * FP32_BYTES,
          "detail": "adaRMS, time MLP and action projections"},
-        {"name": "prefix_kv_reads", "bytes": 2 * layers * prefix * kvdim * BF16_BYTES,
-         "detail": "cached PaliGemma prefix K and V, read once"},
+        {"name": "prefix_kv_reads", "bytes": steps * 2 * layers * prefix * kvdim * BF16_BYTES,
+         "detail": f"cached PaliGemma prefix K and V, re-read by each of {steps} steps"},
         {"name": "io", "bytes": 2 * horizon * act * FP32_BYTES + prefix, "detail": "noise, mask and actions"},
     ]
     attention = 4 * horizon * (prefix + horizon) * qdim * layers

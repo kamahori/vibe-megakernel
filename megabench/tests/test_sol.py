@@ -81,7 +81,7 @@ class SolTests(unittest.TestCase):
 
     def test_work_floors_take_the_binding_resource(self) -> None:
         expected = {"tts-frame-step-csm-1b-b1-s128": "hbm",
-                    "vla-action-step-pi05-b1": "tensor_core",
+                    "vla-action-step-pi05-b1": "hbm",
                     "world-frame-step-waypoint15-1b-f128": "tensor_core",
                     "megamoe-layer-deepseek-v4-pro-ep8-t512": "hbm",
                     "megamoe-layer-deepseek-v4-pro-ep8-t4096": "tensor_core"}

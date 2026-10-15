@@ -492,6 +492,8 @@ def main(argv: list[str] | None = None) -> int:
             "default_b200_bandwidth_source": DEFAULT_B200_BANDWIDTH_SOURCE,
             "assumptions": [
                 "Count each used weight and needed old KV element once, plus required outputs.",
+                "Dependent passes (CSM depth positions, pi0.5 Euler steps, Waypoint denoise passes) "
+                "re-read the weights and K/V they use, since those exceed on-chip capacity.",
                 "MoE counts only selected experts; speculative verification reuses weights across positions.",
                 "Peak bandwidth, perfect reuse, and no scratch, synchronization, or compute costs are assumed.",
                 "This is an HBM lower bound, not a prediction of achievable runtime.",
