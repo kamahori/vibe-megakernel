@@ -156,9 +156,12 @@ the floor, use `--case CASE_ID --result /path/to/evaluate.jsonl`, or pass
 assumption. Each agent workspace exposes the same command as
 `./sol_info --json` and accepts `--result` after a local check.
 
-The floor counts used weights once, needed old KV cache, and required outputs.
+The floor counts used weights, needed old KV cache, and required outputs.
 For MoE it counts selected experts; for EAGLE3 it assumes target weights are
-reused across the five verification positions. It excludes scratch traffic,
+reused across the five verification positions. Weights larger than L2 that
+dependent sequential steps re-apply are counted once per step: the CSM depth
+decoder 31 times per frame, the pi0.5 action expert once per flow step, and
+the Waypoint DiT once per denoise pass plus the cache pass. It excludes scratch traffic,
 compute time, and synchronization, so it is a lower bound rather than an
 achievable latency target. The TTS, VLA, world-model and MegaMoE cases have
 compute-heavy steps, so their floor is the largest of that HBM bound, dense

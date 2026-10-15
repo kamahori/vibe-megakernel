@@ -81,7 +81,7 @@ class SolTests(unittest.TestCase):
 
     def test_work_floors_take_the_binding_resource(self) -> None:
         expected = {"tts-frame-step-csm-1b-b1-s128": "hbm",
-                    "vla-action-step-pi05-b1": "tensor_core",
+                    "vla-action-step-pi05-b1": "hbm",
                     "world-frame-step-waypoint15-1b-f128": "tensor_core",
                     "megamoe-layer-deepseek-v4-pro-ep8-t512": "hbm",
                     "megamoe-layer-deepseek-v4-pro-ep8-t4096": "tensor_core"}
@@ -99,6 +99,24 @@ class SolTests(unittest.TestCase):
         p = megamoe.params
         self.assertEqual(row["tensor_flops"],
                          2 * p["tokens"] * p["topk"] * 3 * p["intermediate"] * p["hidden"])
+
+    def test_sequential_steps_reread_weights_larger_than_l2(self) -> None:
+        def parts(case_id: str, **params) -> dict:
+            case = select_cases("all", [case_id])[0]
+            case = Case(**(case.to_dict() | {"ready": True, "params": case.params | params}))
+            return {part["name"]: part["bytes"] for part in estimate_case(case)["components"]}
+
+        csm = select_cases("all", ["tts-frame-step-csm-1b-b1-s128"])[0].params
+        fewer = parts("tts-frame-step-csm-1b-b1-s128", codebooks=csm["codebooks"] - 1)
+        full = parts("tts-frame-step-csm-1b-b1-s128")
+        once = full["depth_decoder_weights"] // (csm["codebooks"] - 1)
+        self.assertEqual(full["depth_decoder_weights"] - fewer["depth_decoder_weights"], once)
+        self.assertEqual(full["depth_decoder_weights"], 31 * once)
+
+        pi05 = select_cases("all", ["vla-action-step-pi05-b1"])[0].params
+        one = parts("vla-action-step-pi05-b1", denoise_steps=1)
+        self.assertEqual(parts("vla-action-step-pi05-b1")["expert_weights"],
+                         pi05["denoise_steps"] * one["expert_weights"])
 
     def test_bandwidth_scales_floor_and_rejects_invalid_values(self) -> None:
         case = select_cases("p0")[0]
