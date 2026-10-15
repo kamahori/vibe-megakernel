@@ -16,7 +16,8 @@ from ..tasks.quantization import (pack_fp8_activation, pack_fp8_weight,
 
 
 def development(case):
-    return replace(case, params=case.params | {
+    # Synthetic weights: the dev geometry has no checkpoint to read.
+    return replace(case, checkpoint='', gate='band', params=case.params | {
         'hidden': 128, 'q_heads': 8, 'q_lora_rank': 128, 'kv_lora_rank': 128,
         'qk_nope_dim': 32, 'qk_rope_dim': 32, 'v_head_dim': 32,
         'intermediate': 256, 'dense_intermediate': 256, 'experts': 4, 'topk': 2,

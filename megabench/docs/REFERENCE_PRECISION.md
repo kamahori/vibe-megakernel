@@ -108,6 +108,13 @@ attention scale error measured 1.1-1.5x. Native FP8 frontier cases have
 much wider bands, because small perturbations flip power-of-two scales,
 sparse-index selections and routes.
 
+Cases with `Case.gate = "tilert"` (the real-weight DeepSeek-V3.2 cases) use a
+per-output gate instead of this band: cosine similarity and relative L2 against
+either the oracle or the BF16 reference for logits and the first four layers'
+cache writes, the near-tie rule for the greedy token, and reported (ungraded)
+metrics for later-layer cache writes, sparse indices and expert IDs. See
+[NON_P0_VALIDATION.md](NON_P0_VALIDATION.md#deepseek-v32-real-weights-and-tilert-style-gate).
+
 ## Validation and historical results
 
 Submission output keys and public logit dtype are unchanged. Value grading

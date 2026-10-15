@@ -31,6 +31,13 @@ class Case:
     noise_factor: float = 2.0
     ready: bool = False
     note: str = ""
+    # "repo@revision" of real weights the inputs are read from; empty means
+    # seeded synthetic weights.
+    checkpoint: str = ""
+    # Correctness rule: "band" bounds error by the BF16 reference's own error
+    # and requires integer outputs to match; "tilert" is the per-step output
+    # check of harness.correctness.tilert_metrics.
+    gate: str = "band"
 
     def __post_init__(self) -> None:
         if not self.id or not self.family or not self.model or not self.phase:
@@ -43,9 +50,20 @@ class Case:
             raise ValueError(f"invalid tolerance in {self.id}")
         if self.suite not in ("p0", "p1", "p2", "p3"):
             raise ValueError(f"invalid priority in {self.id}")
+        if self.gate not in GATES:
+            raise ValueError(f"invalid gate in {self.id}")
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        # Fields at their defaults are omitted, so adding them did not change
+        # the contracts recorded by earlier results.
+        values = asdict(self)
+        for name, default in (("checkpoint", ""), ("gate", "band")):
+            if values[name] == default:
+                del values[name]
+        return values
+
+
+GATES = ("band", "tilert")
 
 
 # Families whose cases time one layer rather than a whole model step.
@@ -57,9 +75,11 @@ DEEPSEEK_V32 = {"batch": 1, "context": 128, "layers": 61,
                 "qk_rope_dim": 64, "v_head_dim": 128, "intermediate": 2048,
                 "dense_intermediate": 18432, "first_dense": 3, "shared_experts": 1,
                 "vocab": 129280, "index_heads": 64, "index_dim": 128,
-                "index_topk": 2048, "router_groups": 8, "router_top_groups": 4}
-DEEPSEEK_NOTE = ("Synthetic FP8-weight MLA/DSA TP8 decode with TileRT 0.1.6 numerics "
-                 "(BF16 caches and indexer); eight-B200 verification pending.")
+                "index_topk": 2048, "router_groups": 8, "router_top_groups": 4,
+                "prompts": 4}
+DEEPSEEK_CHECKPOINT = "deepseek-ai/DeepSeek-V3.2@a7e62ac04ecb2c0a54d736dc46601c5606cf10a6"
+DEEPSEEK_NOTE = ("Real FP8 checkpoint MLA/DSA TP8 decode with TileRT 0.1.6 numerics (BF16 caches "
+                 "and indexer) over prefilled chat prompts; TileRT-style output gate.")
 
 CASES: tuple[Case, ...] = (
     Case("dense-step-qwen3-06b-b1-s128", "dense_step", "Qwen/Qwen3-0.6B",
@@ -153,7 +173,7 @@ CASES: tuple[Case, ...] = (
     Case("deepseek-v32-step", "deepseek_v32_step",
          "deepseek-ai/DeepSeek-V3.2", "decode", DEEPSEEK_V32,
          "frontier_moe", "p3", ready=True, gpus=8, tp=8, atol=0.003, rtol=0.003,
-         note=DEEPSEEK_NOTE),
+         note=DEEPSEEK_NOTE, checkpoint=DEEPSEEK_CHECKPOINT, gate="tilert"),
     Case("glm52-step", "glm52_step", "zai-org/GLM-5.2-FP8", "decode",
          {"batch": 1, "context": 128, "layers": 78,
           "experts": 256, "topk": 8, "hidden": 6144, "q_heads": 64,
@@ -212,7 +232,8 @@ CASES: tuple[Case, ...] = (
     *(Case(f"deepseek-v32-step-ctx{context // 1024}k", "deepseek_v32_step",
            "deepseek-ai/DeepSeek-V3.2", "decode", DEEPSEEK_V32 | {"context": context},
            "frontier_moe", "p3", ready=True, gpus=8, tp=8, atol=0.003, rtol=0.003,
-           note=DEEPSEEK_NOTE) for context in (4096, 32768)),
+           note=DEEPSEEK_NOTE, checkpoint=DEEPSEEK_CHECKPOINT, gate="tilert")
+      for context in (4096, 32768)),
     Case("tts-frame-step-csm-1b-b1-s128", "tts_frame_step", "sesame/csm-1b", "audio_frame",
          {"batch": 1, "context": 128, "layers": 16, "hidden": 2048, "q_heads": 32,
           "kv_heads": 8, "head_dim": 64, "intermediate": 8192, "text_vocab": 128256,
