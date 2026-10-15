@@ -100,9 +100,12 @@ whole decode step, and the rules below, are MegaBench's choice. They replace
 the element-wise BF16 band:
 
 - A floating output passes if its cosine similarity is at least
-  `TILERT_MIN_COSINE` and its relative L2 error at most
-  `TILERT_MAX_RELATIVE_L2`, measured against either the FP32 oracle or the
-  BF16 reference. Logit sums are reduced over the vocabulary shards.
+  `TILERT_MIN_COSINE` (0.98) and its relative L2 error at most
+  `TILERT_MAX_RELATIVE_L2` (0.20), measured against either the FP32 oracle or
+  the BF16 reference. Logit sums are reduced over the vocabulary shards.
+  TileRT 0.1.6 passes all 12 prompt windows. Its worst logits are cosine
+  0.990 / relative L2 0.148 (`-ctx32k`, seed 0), and the reference's own
+  worst drift from the oracle is 0.985 / 0.175 (`-ctx4k`, seed 0).
 - Cache writes (`kv_write`, `pe_write`, `index_k_write`) are graded over the
   first `TILERT_GRADED_LAYERS` (4) layers: the three dense layers and the
   first MoE layer. Metrics over all 61 layers are reported, not graded.

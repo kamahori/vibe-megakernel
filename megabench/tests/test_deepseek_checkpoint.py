@@ -309,7 +309,7 @@ class DeepSeekCheckpointTests(unittest.TestCase):
             _compare(expected, wrong, case, 'cpu', exact)
 
     def test_tilert_gate_reference_or_oracle(self):
-        from megabench.harness.correctness import TILERT_GRADED_LAYERS as graded
+        from megabench.harness.correctness import TILERT_GRADED_LAYERS as graded, TILERT_MIN_COSINE
         case = real(development())
         generator = torch.Generator().manual_seed(2)
         layers = graded + 2
@@ -324,13 +324,13 @@ class DeepSeekCheckpointTests(unittest.TestCase):
 
         # Matching either the reference or the oracle passes.
         details = _compare(expected, {name: value.clone() for name, value in expected.items()}, case, 'cpu', exact)
-        self.assertLess(details['logits']['cosine'], 0.99)
+        self.assertLess(details['logits']['cosine'], TILERT_MIN_COSINE)
         self.assertFalse(details['kv_write']['graded'])
         self.assertNotIn('pass', details['kv_write'])
         self.assertGreater(details[f'kv_write[:{graded}]']['cosine'], 0.999)
         oracle_like = {name: value.clone() for name, value in exact.items()}
         details = _compare(expected, oracle_like, case, 'cpu', exact)
-        self.assertLess(details['logits']['cosine_to_reference'], 0.99)
+        self.assertLess(details['logits']['cosine_to_reference'], TILERT_MIN_COSINE)
 
         # Late-layer cache writes are reported; early ones are graded.
         late = {name: value.clone() for name, value in expected.items()}
