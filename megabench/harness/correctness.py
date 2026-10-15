@@ -88,8 +88,14 @@ def _teacher_forced(case: Case, inputs: dict, expected: dict, exact: dict,
 # Routing and sparse-selection integers are reported, not graded, so any
 # implementation of the same math (sparse attention, other summation orders)
 # can pass.
-TILERT_MIN_COSINE = 0.99
-TILERT_MAX_RELATIVE_L2 = 0.15
+# Calibrated on TileRT 0.1.6 over the 12 real-weight prompt windows (Slurm
+# 7208-7210). Its worst window passes at cosine 0.990 / relative L2 0.148
+# (ctx32k seed 0, against the reference), and the reference's own logits drift
+# to 0.985 / 0.175 from the oracle on ctx4k seed 0. The two limits match
+# (relative L2 = sqrt(2 * (1 - cosine)) at equal norms) and leave about 2x
+# headroom in 1 - cosine over TileRT's worst window.
+TILERT_MIN_COSINE = 0.98
+TILERT_MAX_RELATIVE_L2 = 0.20
 # Cache writes are graded over the first layers only (DeepSeek-V3.2: three
 # dense layers and the first MoE layer); later layers are reported. Near-tie
 # sparse-index and expert flips compound with depth: on one 4K prompt the
