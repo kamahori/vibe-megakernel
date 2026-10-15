@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 from .cases import Case
 from .harness.benchmark import _measure
-from .harness.correctness import _compare
+from .harness.correctness import _compare, _teacher_forced
 from .tasks.common import attention, rms, rope
 from .tasks.references.qwen3 import _rms, _rot_half, rope_tables
 
@@ -466,7 +466,8 @@ def timing_baselines(case: Case, inputs: Inputs, device: str, warmup: int,
     """Time capture-safe eager, graph, compiled, and compiled+graph baselines.
 
     Each variant must pass the same comparison a candidate passes against
-    ``expected`` (BF16 reference) and ``exact`` (FP32 oracle) on ``inputs``.
+    ``expected`` (BF16 reference) and ``exact`` (FP32 oracle) on ``inputs``,
+    including teacher forcing of codebook frames.
     A variant that fails to build, capture, compile, or match is reported
     with its error and excluded from ``best``.
     """
@@ -511,7 +512,13 @@ def timing_baselines(case: Case, inputs: Inputs, device: str, warmup: int,
         try:
             fn, setup_ms = setup()
             entry["setup_ms"] = setup_ms
-            entry["correctness"] = _compare(expected, fn(inputs), case, device, exact)
+            actual = fn(inputs)
+            want, oracle_out = expected, exact
+            if case.family == "tts_frame_step":
+                # Grade codebook frames on the variant's own codes, as candidates are.
+                want, oracle_out = _teacher_forced(case, inputs, expected, exact, actual)
+                entry["teacher_forced"] = want is not expected
+            entry["correctness"] = _compare(want, actual, case, device, oracle_out)
             entry["timing"] = _measure(fn, inputs, device, warmup, reps)
             p50 = entry["timing"]["cuda_event_p50_ms"]
             if p50 < best_ms:
