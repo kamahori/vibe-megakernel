@@ -115,6 +115,22 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertEqual(json.loads(result.stdout)["cases"][0]["case_id"],
                              case.id)
 
+    def test_loadstream_kit_is_copied_and_announced(self) -> None:
+        case = select_cases("p0")[0]
+        with tempfile.TemporaryDirectory() as directory:
+            project = make_workspace(case.id, Path(directory) / "kit", agent="vibesys",
+                                     kit="loadstream")
+            kit = project / "loadstream_kit"
+            for name in ("include/loadstream/ls.cuh", "examples/mlp_chain/mlp_chain.cu",
+                         "skill/load-centric-megakernel/SKILL.md", "loadstream/timeline.py"):
+                self.assertTrue((kit / name).is_file(), name)
+            self.assertIn("loadstream_kit/", (project / "TASK.md").read_text())
+            history = subprocess.run(["git", "ls-files", "loadstream_kit"], cwd=project,
+                                     capture_output=True, text=True, check=True)
+            self.assertIn("loadstream_kit/include/loadstream/ring.cuh", history.stdout)
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(ValueError):
+            make_workspace(case.id, Path(directory) / "bad", kit="nope")
+
     def test_kernelagent_adapter_and_no_overwrite(self) -> None:
         case = select_cases("p0")[0]
         with tempfile.TemporaryDirectory() as directory:

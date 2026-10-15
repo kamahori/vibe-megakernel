@@ -182,10 +182,33 @@ def _write_kernelagent_task(project: Path, benchmark_root: Path,
         "        assert audit['status'] == 'within_budget', audit\n")
 
 
+KITS = {"loadstream": "megabench/kits/loadstream"}
+KIT_NOTES = {
+    "loadstream": (
+        "`loadstream_kit/` holds load-centric megakernel primitives (a TMA weight ring with a "
+        "run-ahead producer warp, event counters instead of grid barriers, deterministic GEMV and "
+        "small-M MMA taps, timeline stamps), a verified worked example "
+        "(`loadstream_kit/examples/mlp_chain/`), B200 calibration numbers "
+        "(`loadstream_kit/CALIBRATION.md`) and the `load-centric-megakernel` skill "
+        "(`loadstream_kit/skill/load-centric-megakernel/SKILL.md`). Read the skill before designing "
+        "the kernel. Using the kit is optional; anything you copy from it becomes part of your "
+        "submission and must be loaded from paths relative to `submission.py`.\n"),
+}
+
+
+def _copy_kit(project: Path, benchmark_root: Path, kit: str) -> None:
+    source = benchmark_root / KITS[kit]
+    shutil.copytree(source, project / f"{kit}_kit",
+                    ignore=shutil.ignore_patterns("__pycache__", ".cache", "*.so", "results*"))
+
+
 def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
-                   benchmark_root: Path = BENCHMARK_ROOT) -> Path:
+                   benchmark_root: Path = BENCHMARK_ROOT, kit: str | None = None,
+                   score: str = "speedup") -> Path:
     if agent not in ("vibesys", "kernelagent", "plain"):
         raise ValueError(f"unsupported agent: {agent}")
+    if kit is not None and kit not in KITS:
+        raise ValueError(f"unknown kit: {kit}")
     case = select_cases("all", [case_id])[0]
     if not case.ready or case.family not in REFERENCE_FILES:
         raise ValueError(f"case has no minimal reference bundle: {case_id}")
@@ -281,12 +304,15 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "; pass `--result PATH` for "
         "the gap to a checked CUDA-event result where a traffic model is available. "
         "The default bandwidth is 8 TB/s per B200. These commands load the trusted benchmark outside "
-        "this workspace; final grading is run separately.\n")
+        "this workspace; final grading is run separately.\n"
+        + (f"\n{KIT_NOTES[kit]}" if kit else ""))
     _write_tools(project, benchmark_root, case)
+    if kit:
+        _copy_kit(project, benchmark_root, kit)
     if agent == "vibesys":
         shutil.copy2(benchmark_root / "megabench/integrations/vibesys-agent.example.toml",
                      project / "agent.toml")
-        make_task(case_id, project, benchmark_root)
+        make_task(case_id, project, benchmark_root, score)
     elif agent == "kernelagent":
         _write_kernelagent_task(project, benchmark_root, case)
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=project, check=True)
@@ -306,9 +332,13 @@ def main() -> None:
                         default="vibesys")
     parser.add_argument("--benchmark-root", type=Path, default=BENCHMARK_ROOT,
                         help="trusted benchmark snapshot used by workspace tools")
+    parser.add_argument("--kit", choices=sorted(KITS),
+                        help="copy an agent kit (primitives, example, skill) into the workspace")
+    parser.add_argument("--score", choices=("speedup", "sol"), default="speedup",
+                        help="VibeSys progress score: speedup over eager, or fraction of the SOL floor")
     args = parser.parse_args()
     print(make_workspace(args.case, args.output, agent=args.agent,
-                         benchmark_root=args.benchmark_root))
+                         benchmark_root=args.benchmark_root, kit=args.kit, score=args.score))
 
 
 if __name__ == "__main__":

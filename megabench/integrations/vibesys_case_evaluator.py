@@ -22,7 +22,33 @@ def benchmark_output(case_id: str, result: dict, score: float) -> dict:
     return {"case": case_id, "progress_score": score, "result": compact}
 
 
-def main(case_id: str, argv: list[str] | None = None) -> int:
+def progress_score(case, result: dict, mode: str = "speedup") -> float:
+    """VibeSys selects rounds by this score; higher is better, 0 for failures.
+
+    ``speedup``: 1 + s/(1+s) for the speedup s over the best baseline. It
+    saturates at large s and inherits the eager baseline's timing noise.
+    ``sol``: 1 + floor/candidate, the fraction of the case's speed-of-light
+    floor (``megabench sol``) reached by the candidate's CUDA-event p50. It is
+    linear in the goal and independent of baseline timing; cases without a
+    floor fall back to ``speedup``.
+    """
+    if result.get("status") != "ok_provisional":
+        return 0.0
+    if mode == "sol":
+        from ..sol import estimate_case
+
+        floor = estimate_case(case)
+        floor_ms = floor.get("floor_ms", floor.get("hbm_floor_ms"))
+        candidate_ms = (result.get("candidate_timing") or {}).get("cuda_event_p50_ms")
+        if floor_ms and candidate_ms:
+            return 1.0 + floor_ms / candidate_ms
+    elif mode != "speedup":
+        raise ValueError(f"unknown score mode: {mode}")
+    speedup = result.get("speedup_vs_best_baseline_cuda_event")
+    return 1.0 + speedup / (1.0 + speedup)
+
+
+def main(case_id: str, argv: list[str] | None = None, score_mode: str = "speedup") -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("accuracy", "benchmark"))
     parser.add_argument("--submission", type=Path, required=True)
@@ -58,8 +84,7 @@ def main(case_id: str, argv: list[str] | None = None) -> int:
                                warmup=1, reps=3, graph_baseline=False)
     except Exception as exc:
         result = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"}
-    speedup = result.get("speedup_vs_best_baseline_cuda_event")
-    score = 1.0 + speedup / (1.0 + speedup) if result["status"] == "ok_provisional" else 0.0
+    score = progress_score(case, result, score_mode)
     output = benchmark_output(case_id, result, score)
     with args.output_json.open("x", encoding="utf-8") as file:
         json.dump(output, file)

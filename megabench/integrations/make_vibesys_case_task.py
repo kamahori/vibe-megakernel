@@ -17,7 +17,7 @@ TRUSTED = (*CONTRACT_FILES, "megabench/integrations/vibesys_case_evaluator.py")
 
 
 def make_task(case_id: str, root: Path,
-              benchmark_root: Path | None = None) -> Path:
+              benchmark_root: Path | None = None, score: str = "speedup") -> Path:
     case = select_cases("all", [case_id])[0]
     if not case.ready:
         raise ValueError(f"case is not ready: {case_id}")
@@ -40,7 +40,7 @@ def make_task(case_id: str, root: Path,
         # Multi-GPU cases evaluate through torch.multiprocessing.spawn, whose
         # children re-run this file as __mp_main__; only the parent evaluates.
         "if __name__ == '__main__':\n"
-        f"    raise SystemExit(main({case_id!r}, sys.argv[1:]))\n")
+        f"    raise SystemExit(main({case_id!r}, sys.argv[1:], score_mode={score!r}))\n")
     python = trusted_root / ".venv/bin/python"
     if not python.is_file():
         python = Path(sys.executable)
@@ -88,8 +88,9 @@ def main() -> None:
     parser.add_argument("--case", required=True)
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--benchmark-root", type=Path)
+    parser.add_argument("--score", choices=("speedup", "sol"), default="speedup")
     args = parser.parse_args()
-    print(make_task(args.case, args.root, args.benchmark_root))
+    print(make_task(args.case, args.root, args.benchmark_root, args.score))
 
 
 if __name__ == "__main__":
