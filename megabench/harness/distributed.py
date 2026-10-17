@@ -46,6 +46,22 @@ def fresh_inputs(case: Case, seed: int, device: str) -> dict:
     return values
 
 
+def full_logits(case: Case, group, expected: dict, exact: dict) -> tuple | None:
+    """Gather vocabulary-sharded logits so the greedy token gets the near-tie rule.
+
+    Reference logits are contiguous, equal vocabulary shards in TP-rank order.
+    """
+    want = expected.get("logits")
+    if case.tp == 1 or "next_token" not in expected or want is None or want.ndim != 1:
+        return None
+    gathered = []
+    for logits in (want, exact["logits"]):
+        parts = [torch.empty_like(logits) for _ in range(case.tp)]
+        dist.all_gather(parts, logits.contiguous(), group=group)
+        gathered.append(torch.cat(parts))
+    return tuple(gathered)
+
+
 def _rank_worker(rank: int, contract: dict, submission: str, device_kind: str,
                  first_device: int, trials: int, warmup: int, reps: int,
                  rendezvous: str, output_dir: str) -> None:
@@ -83,6 +99,7 @@ def _rank_worker(rank: int, contract: dict, submission: str, device_kind: str,
                 originals = {name: value.detach().to("cpu", copy=True) for name, value in inputs.items()}
                 expected = reference(case, inputs)
                 exact = oracle(case, inputs)
+                greedy_logits = full_logits(case, ctx.tp_group, expected, exact)
                 local_error, details = None, None
                 try:
                     first_start = time.perf_counter() if trial == 0 else None
@@ -91,7 +108,7 @@ def _rank_worker(rank: int, contract: dict, submission: str, device_kind: str,
                         torch.cuda.synchronize(device)
                     if first_start is not None:
                         result["first_call_ms_including_jit"] = (time.perf_counter()-first_start)*1000
-                    details = _compare(expected, actual, case, device, exact)
+                    details = _compare(expected, actual, case, device, exact, greedy_logits)
                     for name in inputs:
                         if not torch.equal(inputs[name].cpu(), originals[name]):
                             raise AssertionError(f"candidate mutated input {name}")
@@ -99,7 +116,7 @@ def _rank_worker(rank: int, contract: dict, submission: str, device_kind: str,
                     local_error = f"trial {trial}: {type(exc).__name__}: {exc}"
                 agree(local_error)
                 result["correctness"]["trials"].append({"seed": seed, "outputs": details})
-                del inputs, originals, expected, exact, actual
+                del inputs, originals, expected, exact, actual, greedy_logits
             perf_inputs = fresh_inputs(case, shared_seed(), device)
             dist.barrier()
             result["candidate_timing"] = _measure(candidate, perf_inputs, device, warmup, reps)

@@ -186,6 +186,23 @@ class OracleBandTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             _compare(expected, {'expert_ids': changed}, case, 'cpu', exact)
 
+    def test_sharded_greedy_token_uses_gathered_logits(self):
+        from dataclasses import replace
+        case = replace(TINY_DENSE, gpus=2, tp=2)
+        exact_full = torch.tensor([0.0, 1.0, 0.98, -3.0])
+        want_full = exact_full + torch.tensor([0.0, 0.0, 0.05, 0.0])
+        # Rank 0's shard; both references choose token 1, and token 2 is a near-tie.
+        expected = {'logits': want_full[:2], 'next_token': torch.tensor(1)}
+        exact = {'logits': exact_full[:2], 'next_token': torch.tensor(1)}
+        gathered = (want_full, exact_full)
+        near = expected | {'next_token': torch.tensor(2)}
+        with self.assertRaises(AssertionError):
+            _compare(expected, near, case, 'cpu', exact)
+        _compare(expected, near, case, 'cpu', exact, gathered)
+        for token in (0, 9):
+            with self.subTest(token=token), self.assertRaises(AssertionError):
+                _compare(expected, expected | {'next_token': torch.tensor(token)}, case, 'cpu', exact, gathered)
+
     def test_glm52_routing_outputs_are_not_graded(self):
         from dataclasses import replace
         case = replace(TINY_DENSE, family='glm52_step')

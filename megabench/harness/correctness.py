@@ -38,6 +38,8 @@ def _near_greedy(token, want_logits, exact_logits, case: Case) -> bool:
     """Accept a greedy token whose FP32 logit is within BF16 noise of the top."""
     error = (want_logits.double() - exact_logits.double()).square().mean().sqrt()
     exact_logits = exact_logits.double()
+    if not 0 <= token < exact_logits.numel():
+        return False
     return bool(exact_logits[token] >= exact_logits.max() - case.noise_factor * error)
 
 
@@ -91,13 +93,15 @@ def _teacher_forced(case: Case, inputs: dict, expected: dict, exact: dict,
 
 
 def _compare(expected: dict, actual: dict, case: Case, device: str,
-             exact: dict | None = None) -> dict:
+             exact: dict | None = None, greedy_logits: tuple | None = None) -> dict:
     """Check outputs against the reference, or within the BF16 band of ``exact``.
 
     Without ``exact`` the comparison uses fixed tolerances around ``expected``.
     With the FP32 oracle, each integer element must match the BF16 reference
     or the oracle. A greedy token may also be any token whose FP32 logit is
-    within the band of the top logit. ``UNGRADED_OUTPUTS`` are dropped first.
+    within the band of the top logit; with vocabulary-sharded logits, the
+    caller passes the gathered (reference, oracle) logits as ``greedy_logits``.
+    ``UNGRADED_OUTPUTS`` are dropped first.
     """
     import torch
 
@@ -132,9 +136,11 @@ def _compare(expected: dict, actual: dict, case: Case, device: str,
                              "oracle_mismatched_elements": int((got != oracle_value).sum().item()),
                              "unmatched_elements": int(neither.sum().item())}
             accepted = details[name]["unmatched_elements"] == 0
-            if (not accepted and name == "next_token" and case.tp == 1
+            if (not accepted and name == "next_token" and greedy_logits is None and case.tp == 1
                     and expected.get("logits") is not None and expected["logits"].ndim == 1):
-                accepted = _near_greedy(int(got), expected["logits"], exact["logits"], case)
+                greedy_logits = expected["logits"], exact["logits"]
+            if not accepted and name == "next_token" and greedy_logits is not None:
+                accepted = _near_greedy(int(got), *greedy_logits, case)
             details[name]["pass"] = accepted
             if not accepted:
                 raise AssertionError(f"{name}: {details[name]}")
