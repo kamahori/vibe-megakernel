@@ -250,12 +250,14 @@ class FrontierMathTests(unittest.TestCase):
                 self.assertLess(float(relative_l2), 0.05)
 
     def test_agent_workspace_output_contract_matches_reference(self):
+        from ..harness.correctness import UNGRADED_OUTPUTS
         from ..integrations.make_agent_workspace import OUTPUT_KEYS
         for original in select_cases('p3')[:2]:
             with self.subTest(case=original.id):
                 case = replace(development(original), gpus=1, tp=1)
                 outputs = frontier.reference(case, frontier.make_inputs(case, 5, 'cpu', rank=0), serial=True)
-                self.assertEqual(set(outputs), set(OUTPUT_KEYS[case.family]))
+                graded = set(outputs) - UNGRADED_OUTPUTS.get(case.family, frozenset())
+                self.assertEqual(graded, set(OUTPUT_KEYS[case.family]))
                 # Both follow TileRT's BF16 caches, without FP8 scales.
                 for name in ('kv_write', 'pe_write', 'index_k_write'):
                     self.assertEqual(outputs[name].dtype, torch.bfloat16)

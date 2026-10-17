@@ -46,6 +46,14 @@ def _near_greedy(token, want_logits, exact_logits, case: Case) -> bool:
 # submission's own codes, but only a few near-tie departures are accepted.
 MAX_CODEBOOK_DIVERGENCES = 4
 
+# Outputs the reference returns but grading ignores. GLM-5.2's routing choices
+# hinge on near-ties whose order and membership follow the reduction order, and
+# the BF16 reference and FP32 oracle disagree on them at full depth; exact
+# grading would demand bit-exact emulation of one of them. The logits and cache
+# writes already carry the effect of routing, and the TileRT probe is graded on
+# the same outputs. Submissions may return or omit these keys.
+UNGRADED_OUTPUTS = {"glm52_step": frozenset({"sparse_indices", "expert_ids"})}
+
 
 def _teacher_forced(case: Case, inputs: dict, expected: dict, exact: dict,
                     actual: dict) -> tuple[dict, dict]:
@@ -89,10 +97,15 @@ def _compare(expected: dict, actual: dict, case: Case, device: str,
     Without ``exact`` the comparison uses fixed tolerances around ``expected``.
     With the FP32 oracle, each integer element must match the BF16 reference
     or the oracle. A greedy token may also be any token whose FP32 logit is
-    within the band of the top logit.
+    within the band of the top logit. ``UNGRADED_OUTPUTS`` are dropped first.
     """
     import torch
 
+    ungraded = UNGRADED_OUTPUTS.get(case.family, frozenset())
+    if ungraded:
+        expected = {name: value for name, value in expected.items() if name not in ungraded}
+        if isinstance(actual, dict):
+            actual = {name: value for name, value in actual.items() if name not in ungraded}
     if not isinstance(actual, dict) or set(actual) != set(expected):
         raise AssertionError(f"output keys: expected {sorted(expected)}, got "
                              f"{sorted(actual) if isinstance(actual, dict) else type(actual)}")

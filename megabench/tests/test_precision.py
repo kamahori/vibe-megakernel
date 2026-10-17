@@ -186,6 +186,24 @@ class OracleBandTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             _compare(expected, {'expert_ids': changed}, case, 'cpu', exact)
 
+    def test_glm52_routing_outputs_are_not_graded(self):
+        from dataclasses import replace
+        case = replace(TINY_DENSE, family='glm52_step')
+        logits = torch.tensor([0.0, 1.0, -3.0])
+        routes = torch.tensor([[0, 1], [2, 3]])
+        exact = {'logits': logits, 'expert_ids': routes, 'sparse_indices': routes}
+        expected = {name: value.clone() for name, value in exact.items()}
+        swapped = routes.flip(-1)
+        details = _compare(expected, {'logits': logits, 'expert_ids': swapped,
+                                      'sparse_indices': swapped + 5}, case, 'cpu', exact)
+        self.assertEqual(set(details), {'logits'})
+        _compare(expected, {'logits': logits}, case, 'cpu', exact)
+        with self.assertRaises(AssertionError):
+            _compare(expected, {'logits': logits * 2}, case, 'cpu', exact)
+        with self.assertRaises(AssertionError):
+            _compare({'expert_ids': routes}, {'expert_ids': swapped}, TINY_DENSE, 'cpu',
+                     {'expert_ids': routes})
+
 
 if __name__ == '__main__':
     unittest.main()
