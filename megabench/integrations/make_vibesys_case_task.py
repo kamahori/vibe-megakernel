@@ -71,13 +71,18 @@ def make_task(case_id: str, root: Path,
               "glm53_flash_step": "glm53", "kimi_k3_layer": "kimi_layer",
               "tts_frame_step": "csm", "vla_action_step": "pi05",
               "world_frame_step": "waypoint", "megamoe_layer": "megamoe"}[case.family]
+    from ..harness.correctness import UNGRADED_OUTPUTS
+    ungraded = sorted(UNGRADED_OUTPUTS.get(case.family, ()))
+    optional = (f"The reference also returns {', '.join(f'`{name}`' for name in ungraded)}; "
+                "they are not graded and may be omitted. " if ungraded else "")
     (task / "OBJECTIVE.md").write_text(
         f"# One MegaBench case: {case_id}\n\n"
         f"Implement only `{case_id}`: {case.model}, {case.phase}, geometry "
         f"`{case.params}`. Read `{brief}` and `{reference}/{module}.py`, this case's "
         "PyTorch oracle. Edit only `submission.py` and candidate-owned helper "
         "files. Compute every required output from current inputs in at most "
-        "one GPU kernel launch per rank, including communication; preserve all inputs. Do not use prior candidate "
+        "one GPU kernel launch per rank, including communication; preserve all inputs. "
+        f"{optional}Do not use prior candidate "
         "code or other checkouts. The evaluator checks only this assigned "
         "case against a protected benchmark outside this workspace.\n")
     return task
