@@ -16,6 +16,9 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+# nki_op infers its schema from annotations resolved in module globals.
+import torch
+
 from .cases import select_cases
 from .harness.neuron import evaluate_neuron
 
@@ -31,7 +34,6 @@ def audit_selftest() -> int:
     import nki
     import nki.isa as nisa
     import nki.language as nl
-    import torch
     from torch_neuronx import nki_op
 
     from .harness.neuron import _audit
