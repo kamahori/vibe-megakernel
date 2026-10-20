@@ -8,7 +8,7 @@ its NeuronCore, runs the submission, and later times it and audits launches.
 
 Launch audit: a step must issue exactly one NKI kernel per rank and no other
 device work. NKI launches are counted at torch-neuronx's NKI dispatcher, which
-both ``nki_op`` and direct ``nki.jit`` calls go through; the torch profiler
+both ``nki_op`` and direct ``nki.jit`` calls go through (``NKIHOPCaller``); the torch profiler
 records compiled regions. A dispatch mode records ATen and collective ops that touch Neuron
 tensors; allocation and view ops issue no device work and are ignored.
 """
@@ -52,25 +52,25 @@ def _audit(candidate, inputs: dict, device: str, budget: int) -> dict:
     from torch.utils._python_dispatch import TorchDispatchMode
     from torch.utils._pytree import tree_flatten
 
-    from torch_neuronx.python_ops.torch_mlir.nki_op_impl import NKITorchMlirOpImpl
+    from torch_neuronx.nki_hop import NKIHOPCaller
 
-    # Every NKI launch from PyTorch, through nki_op or a direct nki.jit call,
-    # goes through this one dispatcher; count its calls during one step.
+    # Every eager NKI launch from PyTorch, through nki_op or a direct nki.jit
+    # call, goes through NKIHOPCaller; count its calls during one step.
     calls = [0]
-    dispatch = NKITorchMlirOpImpl.__call__
+    dispatch = NKIHOPCaller.__call__
 
     def counted(self, *args, **kwargs):
         calls[0] += 1
         return dispatch(self, *args, **kwargs)
 
     torch.neuron.synchronize()
-    NKITorchMlirOpImpl.__call__ = counted
+    NKIHOPCaller.__call__ = counted
     try:
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]) as prof:
             candidate(inputs)
             torch.neuron.synchronize()
     finally:
-        NKITorchMlirOpImpl.__call__ = dispatch
+        NKIHOPCaller.__call__ = dispatch
     names = [event.name for event in prof.events()]
     nki_kernels = calls[0]
     # Diagnostic only: one NKI call records two profiler events.
