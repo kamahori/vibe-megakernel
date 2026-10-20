@@ -277,9 +277,11 @@ CASES: tuple[Case, ...] = (
 # tasks/sharding.py and graded against the unchanged single-device reference.
 TRN2_TP4_NOTE = ("Whole Trainium2 chip as four TP ranks (one per logical NeuronCore); "
                  "graded against the single-device reference.")
+# The P0 MoE case is left out: its synthetic 48-layer stack is chaotic (the
+# BF16 reference is about 100% off the FP32 oracle on logits at full depth).
 CASES += tuple(replace(case, id=f"{case.id}-trn2-tp4", backend="neuron", gpus=4, tp=4,
                        note=TRN2_TP4_NOTE)
-               for case in CASES if case.suite == "p0" and case.ready)
+               for case in CASES if case.suite == "p0" and case.ready and case.family != "moe_step")
 
 # "cuda" covers NVIDIA and ROCm devices; "neuron" covers AWS Trainium.
 BACKENDS = ("cuda", "neuron")

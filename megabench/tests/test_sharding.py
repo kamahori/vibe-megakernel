@@ -19,7 +19,8 @@ class ShardingTests(unittest.TestCase):
         cuda = select_cases("p0")
         neuron = select_cases("p0", backend="neuron")
         self.assertTrue(cuda and all(case.backend == "cuda" for case in cuda))
-        self.assertEqual([case.id for case in neuron], [f"{case.id}-trn2-tp4" for case in cuda])
+        self.assertEqual([case.id for case in neuron],
+                         [f"{case.id}-trn2-tp4" for case in cuda if case.family != "moe_step"])
         for case in neuron:
             self.assertEqual((case.gpus, case.tp, case.max_gpu_launches), (4, 4, 1))
 
