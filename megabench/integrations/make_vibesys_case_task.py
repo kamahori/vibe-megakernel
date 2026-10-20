@@ -71,13 +71,22 @@ def make_task(case_id: str, root: Path,
               "glm53_flash_step": "glm53", "kimi_k3_layer": "kimi_layer",
               "tts_frame_step": "csm", "vla_action_step": "pi05",
               "world_frame_step": "waypoint", "megamoe_layer": "megamoe"}[case.family]
+    neuron = (
+        f"This case runs on one AWS Trainium2 chip as {case.gpus} ranks, one per logical NeuronCore "
+        "(device `neuron:<rank>`, torch-neuronx's native backend). Each rank receives its shard of "
+        "the inputs and returns its shard of the outputs, as `megabench/tasks/sharding.py` defines. "
+        + "Each rank's complete step must be one NKI kernel call (a `torch_neuronx.nki_op` or `nki.jit` "
+        "kernel) with no other device work: no eager PyTorch ops, `torch.compile` graphs or "
+        "`torch.distributed` collectives on Neuron tensors. Do cross-core communication inside the "
+        "kernel with `nki.collectives`. " if case.backend == "neuron" else "")
     (task / "OBJECTIVE.md").write_text(
         f"# One MegaBench case: {case_id}\n\n"
         f"Implement only `{case_id}`: {case.model}, {case.phase}, geometry "
         f"`{case.params}`. Read `{brief}` and `{reference}/{module}.py`, this case's "
         "PyTorch oracle. Edit only `submission.py` and candidate-owned helper "
         "files. Compute every required output from current inputs in at most "
-        "one GPU kernel launch per rank, including communication; preserve all inputs. Do not use prior candidate "
+        "one GPU kernel launch per rank, including communication; preserve all inputs. " + neuron +
+        "Do not use prior candidate "
         "code or other checkouts. The evaluator checks only this assigned "
         "case against a protected benchmark outside this workspace.\n")
     return task

@@ -26,12 +26,64 @@ def development(case):
     return replace(case, params=case.params | {"layers": 2})
 
 
+def audit_selftest() -> int:
+    """One NKI kernel per step passes the launch audit; any other device work fails it."""
+    import nki
+    import nki.isa as nisa
+    import nki.language as nl
+    import torch
+    from torch_neuronx import nki_op
+
+    from .harness.neuron import _audit
+
+    @nki.jit
+    def add(a, b):
+        a_sb = nl.ndarray(a.shape, dtype=a.dtype, buffer=nl.sbuf)
+        b_sb = nl.ndarray(b.shape, dtype=b.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=a_sb, src=a)
+        nisa.dma_copy(dst=b_sb, src=b)
+        c_sb = nl.ndarray(a.shape, dtype=a.dtype, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=c_sb, data1=a_sb, data2=b_sb, op=nl.add)
+        out = nl.ndarray(a.shape, dtype=a.dtype, buffer=nl.shared_hbm)
+        nisa.dma_copy(dst=out, src=c_sb)
+        return out
+
+    @nki_op("megabench_verify::add", mutates_args={})
+    def add_op(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return add(a, b)
+
+    compiled = torch.compile(lambda v: {"y": v["a"] + v["b"]}, backend="neuron", dynamic=False, fullgraph=True)
+    inputs = {"a": torch.randn(128, 512, device="neuron:0"), "b": torch.randn(128, 512, device="neuron:0")}
+    expected = {
+        "nki_op": (lambda v: {"y": add_op(v["a"], v["b"])}, "within_budget"),
+        "direct nki.jit": (lambda v: {"y": add(v["a"], v["b"])}, "within_budget"),
+        "two nki_op calls": (lambda v: {"y": add_op(add_op(v["a"], v["b"]), v["b"])}, "launch_budget_failed"),
+        "nki_op + eager add": (lambda v: {"y": add_op(v["a"], v["b"]) + 1}, "launch_budget_failed"),
+        "eager only": (lambda v: {"y": v["a"] + v["b"]}, "launch_budget_failed"),
+        "torch.compile": (compiled, "launch_budget_failed"),
+    }
+    failed = 0
+    for label, (run, want) in expected.items():
+        run(inputs)
+        result = _audit(run, inputs, "neuron:0", 1)
+        ok = result["status"] == want
+        failed += not ok
+        print(json.dumps({"audit": label, "status": result["status"], "expected": want, "ok": ok,
+                          "nki_kernel_calls": result["nki_kernel_calls"],
+                          "other_device_ops": result["other_device_ops"],
+                          "compiled_regions": result["compiled_regions"]}), flush=True)
+    return failed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", nargs="*")
     parser.add_argument("--full", action="store_true")
     parser.add_argument("--trials", type=int, default=2)
+    parser.add_argument("--audit-selftest", action="store_true")
     args = parser.parse_args()
+    if args.audit_selftest:
+        return 1 if audit_selftest() else 0
     cases = select_cases("p0", args.case, backend="neuron")
     failed = 0
     for case in cases:

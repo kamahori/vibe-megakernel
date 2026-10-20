@@ -21,8 +21,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from ..cases import Case, select_cases
-from ..sol import (DEFAULT_B200_BANDWIDTH_SOURCE,
+from ..cases import BACKENDS, Case, select_cases
+from ..sol import (DEFAULT_TRN2_BANDWIDTH_SOURCE, DEFAULT_TRN2_BANDWIDTH_TB_S,
+                   DEFAULT_B200_BANDWIDTH_SOURCE,
                    DEFAULT_B200_BANDWIDTH_TB_S, estimate_case)
 from ..workloads import make_inputs, reference
 from .benchmark import _audit_launches, _measure
@@ -386,9 +387,10 @@ def _output_path(value: str | None) -> Path:
     return Path(__file__).resolve().parents[1] / "runs" / f"{stamp}-{os.getpid()}.jsonl"
 
 
-def aggregate_sessions(paths: list[Path], suite: str, method: str) -> dict:
+def aggregate_sessions(paths: list[Path], suite: str, method: str,
+                       backend: str = "cuda") -> dict:
     """Combine one independently produced result per case for one method."""
-    expected = {case.id: case for case in select_cases(suite) if case.ready}
+    expected = {case.id: case for case in select_cases(suite, backend=backend) if case.ready}
     if not expected:
         raise ValueError(f"suite {suite} has no ready cases")
     results: dict[str, dict] = {}
@@ -440,13 +442,17 @@ def main(argv: list[str] | None = None) -> int:
     listing.add_argument("--suite", choices=("core", "p0", "p1", "p2", "p3", "planned", "all"),
                          default="all")
     listing.add_argument("--json", action="store_true")
+    for subparser in (listing,):
+        subparser.add_argument("--backend", choices=BACKENDS, default="cuda",
+                               help="cuda covers NVIDIA and ROCm; neuron covers Trainium")
     sol = sub.add_parser("sol", help="estimate optimistic HBM speed-of-light floors")
     sol.add_argument("--suite", choices=("core", "p0", "p1", "p2", "p3", "planned", "all"),
                      default="core")
     sol.add_argument("--case", help="show one case, regardless of suite")
+    sol.add_argument("--backend", choices=BACKENDS, default="cuda")
     sol.add_argument("--bandwidth-tb-s", type=float,
-                     default=DEFAULT_B200_BANDWIDTH_TB_S,
-                     help="assumed peak HBM TB/s per GPU (default: B200 8.0)")
+                     help="assumed peak HBM TB/s per GPU (default: B200 8.0; "
+                          "Trainium2 2.9 per chip with --backend neuron)")
     sol.add_argument("--measured-ms", type=float,
                      help="candidate CUDA-event median in ms; requires --case")
     sol.add_argument("--result", type=Path,
@@ -475,6 +481,7 @@ def main(argv: list[str] | None = None) -> int:
     aggregate = sub.add_parser("aggregate", help="combine independent case sessions")
     aggregate.add_argument("--suite", choices=("core", "p0", "p1", "p2", "p3"),
                            default="p0")
+    aggregate.add_argument("--backend", choices=BACKENDS, default="cuda")
     aggregate.add_argument("--method", required=True)
     aggregate.add_argument("--input", action="append", required=True)
     aggregate.add_argument("--output")
@@ -493,7 +500,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "_worker":
         return _worker(args)
     if args.command == "list":
-        cases = select_cases(args.suite)
+        cases = select_cases(args.suite, backend=args.backend)
         if args.json:
             print(json.dumps([case.to_dict() for case in cases], indent=2))
         else:
@@ -507,8 +514,12 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--measured-ms and --result require --case")
         if args.measured_ms is not None and args.result is not None:
             parser.error("use either --measured-ms or --result")
+        if args.bandwidth_tb_s is None:
+            args.bandwidth_tb_s = (DEFAULT_TRN2_BANDWIDTH_TB_S if args.backend == "neuron"
+                                   else DEFAULT_B200_BANDWIDTH_TB_S)
         try:
-            cases = select_cases("all", [args.case]) if args.case else select_cases(args.suite)
+            cases = (select_cases("all", [args.case]) if args.case else
+                     select_cases(args.suite, backend=args.backend))
             measured_ms = args.measured_ms
             if args.result is not None:
                 rows = [json.loads(line) for line in args.result.read_text().splitlines()
@@ -528,7 +539,8 @@ def main(argv: list[str] | None = None) -> int:
         report = {
             "method": "optimistic_one_read_hbm_floor",
             "assumed_bandwidth_tb_s_per_gpu": args.bandwidth_tb_s,
-            "default_b200_bandwidth_source": DEFAULT_B200_BANDWIDTH_SOURCE,
+            "default_bandwidth_source": (DEFAULT_TRN2_BANDWIDTH_SOURCE if args.backend == "neuron"
+                                         else DEFAULT_B200_BANDWIDTH_SOURCE),
             "assumptions": [
                 "Count each used weight and needed old KV element once, plus required outputs.",
                 "MoE counts only selected experts; speculative verification reuses weights across positions.",
@@ -562,7 +574,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "aggregate":
         try:
             summary = aggregate_sessions([Path(name) for name in args.input],
-                                         args.suite, args.method)
+                                         args.suite, args.method, args.backend)
         except (ValueError, OSError, KeyError) as exc:
             parser.error(str(exc))
         if args.output:

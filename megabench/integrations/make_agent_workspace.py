@@ -74,6 +74,8 @@ def _python(benchmark_root: Path) -> Path:
 def _write_reference(project: Path, benchmark_root: Path, case: Case) -> str:
     target = project / "reference/megabench"
     files = REFERENCE_FILES[case.family]
+    if case.backend == "neuron":
+        files = files + ("sharding.py",)
     package_files = ["__init__.py", "tasks/__init__.py"]
     if any(name.startswith("references/") for name in files):
         package_files.append("tasks/references/__init__.py")
@@ -224,6 +226,17 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         writes = ("kv_write", "pe_write") if attention_kind(case) == "mla" else ("recurrent_state", "conv_state")
         outputs = outputs[:1] + writes + outputs[1:]
     topology = (
+        f"The evaluator starts {case.gpus} rank processes, one per logical NeuronCore of one AWS "
+        "Trainium2 chip (device `neuron:<rank>`). `build(case)` receives `case['execution']`: rank, "
+        "world_size, tp_rank, device, backend and the live neuron tp_group. Each rank receives its "
+        "shard of the inputs and returns its shard of the outputs, as "
+        "`reference/megabench/tasks/sharding.py` defines; the harness reassembles them and grades "
+        "the single-device reference's outputs. "
+        + "Each rank's complete step must be one NKI kernel call (a `torch_neuronx.nki_op` or `nki.jit` "
+        "kernel) with no other device work: no eager PyTorch ops, `torch.compile` graphs or "
+        "`torch.distributed` collectives on Neuron tensors. Do cross-core communication inside the "
+        "kernel with `nki.collectives`. " + "\n\n"
+        if case.backend == "neuron" else
         f"The evaluator starts {case.gpus} rank processes with data-parallel attention and EP={case.ep}. "
         "`build(case)` receives `case['execution']`: rank, world_size, tp_rank, ep_rank, "
         "device, backend, and live tp_group/ep_group handles. Each rank decodes its own "
