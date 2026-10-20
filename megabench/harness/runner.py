@@ -64,6 +64,14 @@ def _contract_digest() -> str:
     return digest.hexdigest()
 
 
+def _version(package: str) -> str | None:
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        return version(package)
+    except PackageNotFoundError:
+        return None
+
+
 def _load_submission(path: Path, case: Case, *, execution: dict | None = None) -> Callable:
     spec = importlib.util.spec_from_file_location("megabench_candidate", path)
     if spec is None or spec.loader is None:
@@ -116,6 +124,11 @@ def evaluate_case(case: Case, submission: Path, *, device: str,
     }
     if not case.ready:
         return record | {"status": "not_implemented", "reason": case.note}
+    if case.backend == "neuron":
+        from .neuron import evaluate_neuron
+        record["hardware"]["device"] = "neuron"
+        record["hardware"]["torch_neuronx"] = _version("torch-neuronx")
+        return record | evaluate_neuron(case, submission, trials=trials, warmup=warmup, reps=reps)
     if torch.device(device).type == "cuda":
         if not torch.cuda.is_available():
             return record | {"status": "unavailable", "reason": "CUDA not visible"}
