@@ -37,8 +37,10 @@ def main(case_id: str, argv: list[str] | None = None) -> int:
 
         try:
             if case.gpus > 1:
+                # The Trainium eager baseline is slow and only the benchmark needs it.
                 result = evaluate_case(case, submission, device="cuda:0", trials=3,
-                                       warmup=0, reps=1, graph_baseline=False)
+                                       warmup=0, reps=1, graph_baseline=False,
+                                       neuron_baseline=False)
                 if result.get("correctness", {}).get("status") != "pass":
                     raise AssertionError(result.get("reason", result["status"]))
             else:

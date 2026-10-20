@@ -95,7 +95,8 @@ def _load_submission(path: Path, case: Case, *, execution: dict | None = None) -
 def evaluate_case(case: Case, submission: Path, *, device: str,
                   trials: int, warmup: int, reps: int,
                   graph_baseline: bool = True,
-                  compiled_baselines: bool = False) -> dict:
+                  compiled_baselines: bool = False,
+                  neuron_baseline: bool = True) -> dict:
     import torch
 
     record = {"case": case.to_dict(), "submission": str(submission),
@@ -129,7 +130,8 @@ def evaluate_case(case: Case, submission: Path, *, device: str,
         from .neuron import evaluate_neuron
         record["hardware"]["device"] = "neuron"
         record["hardware"]["torch_neuronx"] = _version("torch-neuronx")
-        return record | evaluate_neuron(case, submission, trials=trials, warmup=warmup, reps=reps)
+        return record | evaluate_neuron(case, submission, trials=trials, warmup=warmup, reps=reps,
+                                        baseline=neuron_baseline)
     if torch.device(device).type == "cuda":
         if not torch.cuda.is_available():
             return record | {"status": "unavailable", "reason": "CUDA not visible"}

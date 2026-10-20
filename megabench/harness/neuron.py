@@ -265,7 +265,9 @@ class _Ranks:
                 process.kill()
 
 
-def evaluate_neuron(case: Case, submission: Path, *, trials: int, warmup: int, reps: int) -> dict:
+def evaluate_neuron(case: Case, submission: Path, *, trials: int, warmup: int, reps: int,
+                    baseline: bool = True) -> dict:
+    """Grade, time and audit a submission; ``baseline`` also times the eager TP baseline."""
     from ..tasks.sharding import assemble, check_divisible
     from ..tasks.workloads import make_inputs, oracle, reference
     from .correctness import _compare
@@ -305,6 +307,8 @@ def evaluate_neuron(case: Case, submission: Path, *, trials: int, warmup: int, r
             correctness["trials"].append({"seed": seed, "scenario": scenario, "outputs": details})
         result["correctness"] = correctness
         try:
+            if not baseline:
+                raise RuntimeError("not requested")
             baseline_outputs = assemble([reply["outputs"] for reply in ranks.request("baseline", None)])
             result["baseline_correctness"] = _compare(expected, baseline_outputs, single, "cpu", exact)
             result["reference_timing"] = worst_rank_timing(
