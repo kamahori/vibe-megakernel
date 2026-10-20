@@ -56,8 +56,20 @@ def _audit(candidate, inputs: dict, device: str, budget: int) -> dict:
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]) as prof:
         candidate(inputs)
         torch.neuron.synchronize()
-    names = [event.name for event in prof.events()]
-    nki_kernels = names.count("nki_kernel_global")
+    events = prof.events()
+    names = [event.name for event in events]
+
+    def nested(event) -> bool:
+        parent = event.cpu_parent
+        while parent is not None:
+            if parent.name == "nki_kernel_global":
+                return True
+            parent = parent.cpu_parent
+        return False
+
+    # One NKI call records an outer and a nested nki_kernel_global event.
+    nki_kernels = sum(event.name == "nki_kernel_global" and not nested(event) for event in events)
+    nki_events = names.count("nki_kernel_global")
     compiled = sorted({name for name in names if name.startswith("Torch-Compiled Region")})
 
     class Recorder(TorchDispatchMode):
@@ -88,7 +100,8 @@ def _audit(candidate, inputs: dict, device: str, budget: int) -> dict:
     else:
         status = "within_budget" if nki_kernels >= 1 and launches <= budget else "launch_budget_failed"
     return {"status": status, "gpu_kernel_count": launches, "max_gpu_launches": budget,
-            "nki_kernel_calls": nki_kernels, "other_device_ops": device_ops[:32],
+            "nki_kernel_calls": nki_kernels, "nki_profiler_events": nki_events,
+            "other_device_ops": device_ops[:32],
             "other_device_op_count": len(device_ops), "custom_ops": sorted(set(custom_ops)),
             "compiled_regions": compiled, "dispatch_mode_error": dispatch_error,
             "review_required": True}

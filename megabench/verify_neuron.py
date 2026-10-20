@@ -72,6 +72,7 @@ def audit_selftest() -> int:
         failed += not ok
         print(json.dumps({"audit": label, "status": result["status"], "expected": want, "ok": ok,
                           "nki_kernel_calls": result["nki_kernel_calls"],
+                          "nki_profiler_events": result["nki_profiler_events"],
                           "other_device_ops": result["other_device_ops"],
                           "compiled_regions": result["compiled_regions"]}), flush=True)
     return failed
