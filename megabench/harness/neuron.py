@@ -15,6 +15,7 @@ tensors; allocation and view ops issue no device work and are ignored.
 
 from __future__ import annotations
 
+import gc
 import os
 import queue
 import secrets
@@ -165,7 +166,11 @@ def _rank_main(rank: int, contract: dict, submission: str, inbox, outbox) -> Non
                 for name, value in inputs.items():
                     if not torch.equal(value.cpu(), local[name]):
                         raise AssertionError(f"candidate mutated input {name}")
-                del full, local, outputs
+                # Release this rank's handles on the shared full inputs (including
+                # the request itself) before replying: the parent generates the
+                # next trial's inputs only after every rank replies.
+                del full, local, outputs, message
+                gc.collect()
                 outbox.put((rank, "trial", reply))
             elif kind == "baseline":
                 _, timing = message
@@ -321,6 +326,7 @@ def evaluate_neuron(case: Case, submission: Path, *, trials: int, warmup: int, r
             expected, exact = reference(single, values), oracle(single, values)
             replies = ranks.collect("trial")
             del values
+            gc.collect()
             if index == 0:
                 result["build_ms"] = max(reply.get("build_ms", 0.0) for reply in replies)
                 result["first_call_ms_including_jit"] = max(reply["call_ms_including_jit"] for reply in replies)
