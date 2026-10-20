@@ -7,9 +7,9 @@ return, reassembled as in ``tasks/sharding.py``. Each rank copies its shard to
 its NeuronCore, runs the submission, and later times it and audits launches.
 
 Launch audit: a step must issue exactly one NKI kernel per rank and no other
-device work. The torch profiler records each NKI call (through ``nki_op`` or a
-direct ``nki.jit`` call) as ``nki_kernel_global`` and records compiled
-regions. A dispatch mode records ATen and collective ops that touch Neuron
+device work. NKI launches are counted at torch-neuronx's NKI dispatcher, which
+both ``nki_op`` and direct ``nki.jit`` calls go through; the torch profiler
+records compiled regions. A dispatch mode records ATen and collective ops that touch Neuron
 tensors; allocation and view ops issue no device work and are ignored.
 """
 
@@ -52,23 +52,28 @@ def _audit(candidate, inputs: dict, device: str, budget: int) -> dict:
     from torch.utils._python_dispatch import TorchDispatchMode
     from torch.utils._pytree import tree_flatten
 
+    from torch_neuronx.python_ops.torch_mlir.nki_op_impl import NKITorchMlirOpImpl
+
+    # Every NKI launch from PyTorch, through nki_op or a direct nki.jit call,
+    # goes through this one dispatcher; count its calls during one step.
+    calls = [0]
+    dispatch = NKITorchMlirOpImpl.__call__
+
+    def counted(self, *args, **kwargs):
+        calls[0] += 1
+        return dispatch(self, *args, **kwargs)
+
     torch.neuron.synchronize()
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]) as prof:
-        candidate(inputs)
-        torch.neuron.synchronize()
-    events = prof.events()
-    names = [event.name for event in events]
-
-    def nested(event) -> bool:
-        parent = event.cpu_parent
-        while parent is not None:
-            if parent.name == "nki_kernel_global":
-                return True
-            parent = parent.cpu_parent
-        return False
-
-    # One NKI call records an outer and a nested nki_kernel_global event.
-    nki_kernels = sum(event.name == "nki_kernel_global" and not nested(event) for event in events)
+    NKITorchMlirOpImpl.__call__ = counted
+    try:
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]) as prof:
+            candidate(inputs)
+            torch.neuron.synchronize()
+    finally:
+        NKITorchMlirOpImpl.__call__ = dispatch
+    names = [event.name for event in prof.events()]
+    nki_kernels = calls[0]
+    # Diagnostic only: one NKI call records two profiler events.
     nki_events = names.count("nki_kernel_global")
     compiled = sorted({name for name in names if name.startswith("Torch-Compiled Region")})
 
