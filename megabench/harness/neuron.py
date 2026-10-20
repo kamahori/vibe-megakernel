@@ -200,6 +200,27 @@ def _rank_main(rank: int, contract: dict, submission: str, inbox, outbox) -> Non
     dist.destroy_process_group()
 
 
+def _diagnostics(expected: dict, actual: dict, exact: dict, case: Case) -> dict:
+    """Logit error and greedy-token margins for a failed trial."""
+    from .correctness import _band
+
+    out = {}
+    try:
+        if "logits" in actual and actual["logits"].shape == expected["logits"].shape:
+            out["logits"] = _band(expected["logits"], actual["logits"], exact["logits"], case)
+        if "next_token" in actual and expected["logits"].ndim == 1:
+            want, oracle = exact["logits"].double(), expected["logits"].double()
+            noise = (oracle - want).square().mean().sqrt().item()
+            token = int(actual["next_token"])
+            out["next_token"] = {"chosen": token, "reference": int(expected["next_token"]),
+                                 "oracle": int(want.argmax()),
+                                 "oracle_logit_gap_to_top": float(want.max() - want[token]),
+                                 "band": case.noise_factor * noise}
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
 class _Ranks:
     """Rank processes and their request/reply queues."""
 
@@ -303,7 +324,12 @@ def evaluate_neuron(case: Case, submission: Path, *, trials: int, warmup: int, r
             if index == 0:
                 result["build_ms"] = max(reply.get("build_ms", 0.0) for reply in replies)
                 result["first_call_ms_including_jit"] = max(reply["call_ms_including_jit"] for reply in replies)
-            details = _compare(expected, assemble([reply["outputs"] for reply in replies]), single, "cpu", exact)
+            actual = assemble([reply["outputs"] for reply in replies])
+            try:
+                details = _compare(expected, actual, single, "cpu", exact)
+            except AssertionError as exc:
+                raise AssertionError(f"trial {index} (seed {seed}): {exc}; "
+                                     f"diagnostics {_diagnostics(expected, actual, exact, single)}") from None
             correctness["trials"].append({"seed": seed, "scenario": scenario, "outputs": details})
         result["correctness"] = correctness
         try:
