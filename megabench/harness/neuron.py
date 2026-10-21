@@ -342,7 +342,12 @@ def evaluate_neuron(case: Case, submission: Path, *, trials: int, warmup: int, r
             if not baseline:
                 raise RuntimeError("not requested")
             baseline_outputs = assemble([reply["outputs"] for reply in ranks.request("baseline", None)])
-            result["baseline_correctness"] = _compare(expected, baseline_outputs, single, "cpu", exact)
+            # A near-tie can flip the eager baseline's greedy tokens; that is a
+            # diagnostic, not a reason to drop the timing baseline.
+            try:
+                result["baseline_correctness"] = _compare(expected, baseline_outputs, single, "cpu", exact)
+            except AssertionError as exc:
+                result["baseline_correctness"] = {"pass": False, "reason": str(exc)[:500]}
             result["reference_timing"] = worst_rank_timing(
                 [{"timing": reply["timing"]} for reply in ranks.request("baseline", (warmup, reps))], "timing")
             result["reference_timing"]["baseline"] = "eager PyTorch TP4 (megabench/baselines_neuron.py)"

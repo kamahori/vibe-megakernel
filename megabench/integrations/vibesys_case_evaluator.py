@@ -60,8 +60,12 @@ def main(case_id: str, argv: list[str] | None = None) -> int:
                                warmup=1, reps=3, graph_baseline=False)
     except Exception as exc:
         result = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"}
-    speedup = result.get("speedup_vs_best_baseline_cuda_event")
-    score = 1.0 + speedup / (1.0 + speedup) if result["status"] == "ok_provisional" else 0.0
+    speedup = result.get("speedup_vs_best_baseline_cuda_event") or result.get("speedup_vs_eager_host")
+    if result["status"] != "ok_provisional":
+        score = 0.0
+    else:
+        # A passing candidate without a timing baseline still outranks a failure.
+        score = 1.0 + speedup / (1.0 + speedup) if speedup else 1.0
     output = benchmark_output(case_id, result, score)
     with args.output_json.open("x", encoding="utf-8") as file:
         json.dump(output, file)
