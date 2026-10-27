@@ -126,6 +126,15 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case) -> None:
         common + f"exec {python} -m megabench.integrations.ncu_profile_case "
         f"--case {case_id} --submission {submission} \"$@\"\n")
     profile.chmod(0o755)
+    timeline = project / "timeline_candidate"
+    timeline.write_text(
+        common + "run_id=$(date -u +%Y%m%dT%H%M%S)-$$\n"
+        f"exec {python} -m megabench.integrations.timeline_profile_case "
+        f"--case {case_id} --submission {submission} "
+        "--output \"reports/timeline-$run_id\" \"$@\"\n")
+    timeline.chmod(0o755)
+    shutil.copy2(benchmark_root / "megabench/integrations/timeline_probe.cuh",
+                 project / "timeline_probe.cuh")
     sol = project / "sol_info"
     sol.write_text(
         common + f"exec {python} -m megabench sol --case {case_id} \"$@\"\n")
@@ -274,6 +283,13 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "kernel feedback. The capture command must set `TMPDIR=/tmp`, "
         "`TMP=/tmp`, and `TEMP=/tmp` inside the agent sandbox and pass "
         "`--profile-from-start off` to capture the warmed marker window. "
+        "Use `./timeline_candidate` for optional per-block phase timing: export "
+        "`build_timeline(case)` returning `(run, event_names)`, where `run(inputs)` "
+        "launches a build with probes from the workspace's `timeline_probe.cuh` "
+        "compiled with `-DMEGABENCH_TIMELINE` and returns the filled `uint64` buffer "
+        "(see the header for its layout and macros). It writes a "
+        "per-phase wall/slowest/mean/skew table and a Perfetto `trace.json` under "
+        "`reports/`; probes slow the kernel, so confirm changes with `./check_candidate`. "
         "Use `./sol_info --json` for an optimistic " +
         ("speed-of-light floor (the largest of the HBM, tensor-core and NVLink "
          "bounds) with byte and FLOP breakdowns" if case.family in WORK_MODELS

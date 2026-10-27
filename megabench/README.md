@@ -19,8 +19,9 @@ boundary; [`cases.py`](cases.py) is the active machine-readable catalog.
   modules preserve imports used by existing submissions and agent workspaces.
 - [`docs/`](docs/) holds the task catalog, the one-case agent brief, and the
   session protocol.
-- [`integrations/`](integrations/) holds the VibeSys adapter and NCU profiling
-  commands. [`make_agent_workspace.py`](make_agent_workspace.py) creates a small
+- [`integrations/`](integrations/) holds the VibeSys adapter, NCU profiling
+  commands, and the per-block phase timeline probes and decoder
+  (`timeline_probe.cuh`, `timeline.py`, `timeline_profile_case.py`). [`make_agent_workspace.py`](make_agent_workspace.py) creates a small
   workspace for one case and one agent session.
 - [`tests/`](tests/) contains the suite tests; [`examples/`](examples/) contains
   a reference submission.

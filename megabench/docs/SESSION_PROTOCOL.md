@@ -99,3 +99,35 @@ the shared environment. Expose the snapshot and shared environment through
 `TMPDIR=/tmp TMP=/tmp TEMP=/tmp`; the agent sandbox may reset inherited temp
 variables to `/raid/tmp`, which is absent inside it. Check
 `./check_candidate --help` from a fresh workspace before starting the agent.
+
+## Optional per-block phase timeline
+
+NCU averages counters over the whole grid, so it cannot say which phase of a
+persistent or grid-synchronized kernel, or which block, sets the critical path.
+Every workspace also has `./timeline_candidate` and a copy of
+`megabench/integrations/timeline_probe.cuh` for that question. The candidate
+opts in by exporting `build_timeline(case)` next to `build(case)`, returning
+`(run, event_names)`. `run(inputs)` launches a build with the header's probes
+compiled in (`-DMEGABENCH_TIMELINE`) and returns that call's zeroed-then-filled
+`uint64` buffer. Without the define, the probes compile to nothing, so the
+scored build is unchanged. FlashInfer's `include/flashinfer/profiler.cuh`
+writes the same buffer layout and may be used instead.
+
+The command warms the build up once, records the second call, and writes
+`timeline.u64`, `trace.json` (open it in `ui.perfetto.dev`, one track per
+block and group) and `summary.json` under `reports/timeline-*/`. It also prints
+one row per phase, with times summed over occurrences:
+
+- `wall`: earliest begin to latest end;
+- `slowest` and `mean`: per-block duration;
+- `begin_skew`: spread of block start times;
+- `imbalance`: slowest minus mean;
+- the block that most often finished last.
+
+`python -m megabench.integrations.timeline PATH --events a,b --event a`
+re-reads a saved buffer or trace without a GPU and prints one phase's
+per-occurrence skew. Probes cost a timer read and a store each and can shift
+where cost lands. Timestamps are `%globaltimer` nanoseconds, too coarse for
+phases under about 0.1 µs, and one capture must span less than about 2.1 s.
+Timelines locate a bottleneck. Correctness and latency still come only from
+`./check_candidate` and the final grading.
