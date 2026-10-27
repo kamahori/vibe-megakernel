@@ -66,6 +66,8 @@ class AgentWorkspaceTests(unittest.TestCase):
                     self.assertFalse((project / "reference/megabench/harness").exists())
                     self.assertTrue((project / "check_candidate").is_file())
                     self.assertTrue((project / "profile_candidate").is_file())
+                    self.assertTrue((project / "timeline_candidate").is_file())
+                    self.assertTrue((project / "timeline_probe.cuh").is_file())
                     self.assertTrue((project / "sol_info").is_file())
                     self.assertTrue((project / ".git").is_dir())
                     python_files = sorted((project / "reference/megabench/tasks").rglob("*.py"))
@@ -102,7 +104,8 @@ class AgentWorkspaceTests(unittest.TestCase):
                 [*config["accuracy"]["command"], "--help"],
                 cwd=project, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-            for executable in ("check_candidate", "profile_candidate", "sol_info"):
+            for executable in ("check_candidate", "profile_candidate", "timeline_candidate",
+                               "sol_info"):
                 with self.subTest(executable=executable):
                     result = subprocess.run(
                         [str(project / executable), "--help"],
