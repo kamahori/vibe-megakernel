@@ -107,7 +107,7 @@ def batched_step(cfg: Config, w: dict[str, torch.Tensor], tokens: torch.Tensor,
     """
     D, QH, KVH = cfg.head_dim, cfg.q_heads, cfg.kv_heads
     B = tokens.shape[0]
-    width = int(lens.max())
+    width = kcache.shape[2]  # static, so the step stays CUDA-graph capturable
     lens = lens.to(tokens.device).long()
     visible = torch.cat([torch.arange(width, device=tokens.device)[None] < lens[:, None],
                          torch.ones(B, 1, dtype=torch.bool, device=tokens.device)], dim=1)
