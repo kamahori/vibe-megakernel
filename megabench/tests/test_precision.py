@@ -187,5 +187,23 @@ class OracleBandTests(unittest.TestCase):
             _compare(expected, {'expert_ids': changed}, case, 'cpu', exact)
 
 
+    def test_greedy_token_margin_follows_the_logits_band(self):
+        case = TINY_DENSE
+        exact = torch.zeros(100)
+        exact[:3] = torch.tensor([1.0, 0.9, 0.85])
+        expected = exact.clone()
+        expected[50] += 0.1  # one peaked reference error, small RMS error
+        oracle_out = {'logits': exact, 'next_token': torch.tensor(0)}
+        reference_out = {'logits': expected, 'next_token': torch.tensor(0)}
+        # Token 2 is 0.15 below the top: past the RMS margin, inside the peak band.
+        _compare(reference_out, reference_out | {'next_token': torch.tensor(2)}, case, 'cpu', oracle_out)
+        with self.assertRaises(AssertionError):
+            _compare(reference_out, reference_out | {'next_token': torch.tensor(3)}, case, 'cpu', oracle_out)
+        batched_oracle = {'logits': torch.stack([exact, exact]), 'next_token': torch.tensor([0, 0])}
+        batched = {'logits': torch.stack([expected, expected]), 'next_token': torch.tensor([0, 0])}
+        _compare(batched, batched | {'next_token': torch.tensor([0, 2])}, case, 'cpu', batched_oracle)
+        with self.assertRaises(AssertionError):
+            _compare(batched, batched | {'next_token': torch.tensor([2, 3])}, case, 'cpu', batched_oracle)
+
 if __name__ == '__main__':
     unittest.main()

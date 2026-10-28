@@ -35,10 +35,22 @@ def _band(want, got, exact, case: Case) -> dict:
 
 
 def _near_greedy(token, want_logits, exact_logits, case: Case) -> bool:
-    """Accept a greedy token whose FP32 logit is within BF16 noise of the top."""
-    error = (want_logits.double() - exact_logits.double()).square().mean().sqrt()
+    """Accept a greedy token whose FP32 logit is within the logits band of the top.
+
+    The margin is the larger of the BF16 reference's RMS logit error and the
+    peak error that the logits band in ``_band`` accepts. Logits that pass the
+    band can change order within that margin, for example after a change of
+    summation order, so their greedy token must pass too.
+    """
+    import torch
+
     exact_logits = exact_logits.double()
-    return bool(exact_logits[token] >= exact_logits.max() - case.noise_factor * error)
+    error = want_logits.double() - exact_logits
+    rtol = case.bf16_rtol if want_logits.dtype == torch.bfloat16 else case.rtol
+    peak = (case.noise_factor * float(error.abs().max()) + case.atol
+            + rtol * float(exact_logits.abs().max()))
+    margin = max(case.noise_factor * float(error.square().mean().sqrt()), peak)
+    return bool(exact_logits[token] >= exact_logits.max() - margin)
 
 
 # Sequential codebook decoding conditions each code on the earlier ones, so a
@@ -261,9 +273,15 @@ def _compare(expected: dict, actual: dict, case: Case, device: str,
                              "oracle_mismatched_elements": int((got != oracle_value).sum().item()),
                              "unmatched_elements": int(neither.sum().item())}
             accepted = details[name]["unmatched_elements"] == 0
+            logits = expected.get("logits")
             if (not accepted and name == "next_token" and case.tp == 1
-                    and expected.get("logits") is not None and expected["logits"].ndim == 1):
-                accepted = _near_greedy(int(got), expected["logits"], exact["logits"], case)
+                    and logits is not None and logits.ndim == got.ndim + 1):
+                # One greedy token per logits row; check each unmatched row.
+                rows = logits.reshape(-1, logits.shape[-1])
+                exact_rows = exact["logits"].reshape(rows.shape)
+                tokens = got.reshape(-1)
+                accepted = all(_near_greedy(int(tokens[row]), rows[row], exact_rows[row], case)
+                               for row in neither.reshape(-1).nonzero().flatten().tolist())
             details[name]["pass"] = accepted
             if not accepted:
                 raise AssertionError(f"{name}: {details[name]}")
