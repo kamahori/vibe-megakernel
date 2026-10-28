@@ -16,9 +16,14 @@ VibeSys loads the skills natively; `.vibesys.toml` routes them to the `cuda` bac
 `kernel-writing` domain:
 
 ```
-vibesys ... --extra-skills <repo>/megabench/skills            # adds to the default kernel skills
-vibesys ... --skills-dir <repo>/megabench/skills/<name>       # one skill at a time
+vibesys ... --skills-dir <vibesys>/resources/skills/<name> ...  # each preset skill you want
+            --extra-skills <repo>/megabench/skills               # plus these skills
 ```
+
+Name the preset skills explicitly. `--extra-skills` alone keeps the whole preset catalog,
+which can include skills written from earlier runs. For an isolated run, use
+`python -m megabench.integrations.clean_vibesys_run`: it builds a pruned trusted snapshot,
+an empty agent `HOME`, a scrubbed environment and explicit skills, then checks the sandbox.
 
 `../integrations/vibesys-agent.example.toml` splits roles: orchestrator, profiler and judge
 inherit `[model]`/`[thinking]`, while `[agent.roles.implementer]` uses a cheaper model.

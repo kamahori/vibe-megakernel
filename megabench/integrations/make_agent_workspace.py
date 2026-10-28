@@ -216,7 +216,7 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
     project = output.resolve()
     project.mkdir(parents=True, exist_ok=False)
     (project / ".gitignore").write_text(
-        ".venv/\nreports/\n.cache/\n.torch_extensions/\n"
+        "/.venv\nreports/\n.cache/\n.torch_extensions/\n"
         "__pycache__/\n*.log\n*.ncu-rep\n/agent.toml\n")
     shared_venv = benchmark_root / ".venv"
     if shared_venv.is_dir():
