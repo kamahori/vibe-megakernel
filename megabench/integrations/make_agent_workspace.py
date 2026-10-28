@@ -135,6 +135,8 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case) -> None:
     timeline.chmod(0o755)
     shutil.copy2(benchmark_root / "megabench/integrations/timeline_probe.cuh",
                  project / "timeline_probe.cuh")
+    shutil.copytree(benchmark_root / "megabench/skills", project / "megakernel_skills",
+                    ignore=shutil.ignore_patterns("__pycache__"))
     sol = project / "sol_info"
     sol.write_text(
         common + f"exec {python} -m megabench sol --case {case_id} \"$@\"\n")
@@ -290,6 +292,11 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "(see the header for its layout and macros). It writes a "
         "per-phase wall/slowest/mean/skew table and a Perfetto `trace.json` under "
         "`reports/`; probes slow the kernel, so confirm changes with `./check_candidate`. "
+        "`megakernel_skills/` holds guidance for the method: split the kernel into "
+        "phases and time them (`megakernel-phase-profiling`), study the slowest or "
+        "furthest-from-floor phase in isolated microbenchmarks (`megakernel-microbench`; "
+        "these do not use rounds), and evaluate Blackwell tensor-core designs "
+        "(`blackwell-tensor-core-design`). "
         "Use `./sol_info --json` for an optimistic " +
         ("speed-of-light floor (the largest of the HBM, tensor-core and NVLink "
          "bounds) with byte and FLOP breakdowns" if case.family in WORK_MODELS

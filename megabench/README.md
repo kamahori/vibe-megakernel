@@ -21,7 +21,7 @@ boundary; [`cases.py`](cases.py) is the active machine-readable catalog.
   session protocol.
 - [`integrations/`](integrations/) holds the VibeSys adapter, NCU profiling
   commands, and the per-block phase timeline probes and decoder
-  (`timeline_probe.cuh`, `timeline.py`, `timeline_profile_case.py`). [`make_agent_workspace.py`](make_agent_workspace.py) creates a small
+  (`timeline_probe.cuh`, `timeline.py`, `timeline_profile_case.py`). Workspaces also get a copy of [`skills/`](skills/) as `megakernel_skills/`. [`make_agent_workspace.py`](make_agent_workspace.py) creates a small
   workspace for one case and one agent session.
 - [`tests/`](tests/) contains the suite tests; [`examples/`](examples/) contains
   a reference submission.
