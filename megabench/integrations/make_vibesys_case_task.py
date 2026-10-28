@@ -20,7 +20,9 @@ TRUSTED = (*CONTRACT_FILES, "megabench/integrations/vibesys_case_evaluator.py")
 
 
 def make_task(case_id: str, root: Path, benchmark_root: Path | None = None,
-              regimes: Path | None = None) -> Path:
+              regimes: Path | None = None, gate_launcher: tuple[str, ...] = ()) -> Path:
+    """Write the task; *gate_launcher* (for example srun and its arguments)
+    prefixes the accuracy and benchmark commands, so they run where it puts them."""
     case = select_cases("all", [case_id])[0]
     if regimes is not None:
         case = replace(case, regimes=load_regimes(regimes))
@@ -62,7 +64,8 @@ def make_task(case_id: str, root: Path, benchmark_root: Path | None = None,
     launcher = task / "evaluator.sh"
     launcher.write_text(
         "#!/bin/sh\nset -eu\n"
-        f"exec {shlex.quote(str(python))} \"$(dirname \"$0\")/evaluator.py\" \"$@\"\n")
+        "exec " + "".join(f"{shlex.quote(part)} " for part in gate_launcher)
+        + f"{shlex.quote(str(python))} \"$(dirname \"$0\")/evaluator.py\" \"$@\"\n")
     launcher.chmod(0o755)
     command = lambda mode: json.dumps([
         f".vibesys/tasks/{case_id}/evaluator.sh", mode,

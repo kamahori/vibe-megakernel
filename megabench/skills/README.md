@@ -24,6 +24,8 @@ Name the preset skills explicitly. `--extra-skills` alone keeps the whole preset
 which can include skills written from earlier runs. For an isolated run, use
 `python -m megabench.integrations.clean_vibesys_run`: it builds a pruned trusted snapshot,
 an empty agent `HOME`, a scrubbed environment and explicit skills, then checks the sandbox.
+VibeSys then runs on the host without GPUs. Each GPU use is one Slurm job: the gates run
+under `srun`, and the agent runs GPU commands with `./gpu_run`, in its own sandbox in the job.
 
 `../integrations/vibesys-agent.example.toml` splits roles: orchestrator, profiler and judge
 inherit `[model]`/`[thinking]`, while `[agent.roles.implementer]` uses a cheaper model.

@@ -7,13 +7,20 @@ The agent must see the task and nothing from earlier work. This script builds:
 - ``<case>/``: a fresh workspace built from ``trusted/``;
 - ``home/``: an empty ``HOME`` for the agent CLI, with web tools denied, so no
   user config, memory, skills, plugins or transcripts are visible;
-- ``launch.sh`` and ``job.sbatch``: start VibeSys with ``env -i`` (only the
-  listed variables pass), the API key read from ``--api-key-file`` at launch,
-  and explicit skills, so preset skills outside the list do not load.
+- ``launch.sh``: runs on the host, not in a Slurm job. It starts
+  ``gpu_broker`` and then VibeSys with ``env -i`` (only the listed variables
+  pass), the API key read from ``--api-key-file`` at launch, and explicit
+  skills, so preset skills outside the list do not load.
 
-It then runs a preflight inside the VibeSys sandbox: forbidden paths must be
-absent and the workspace and trusted root must be present. Submit
-``job.sbatch`` only after the preflight passes.
+VibeSys runs in a namespace without GPU devices. Each GPU use is a Slurm job:
+the accuracy and benchmark gates run under ``srun``, and the agent runs GPU
+commands through ``./gpu_run``, which ``gpu_broker`` starts as a job in the
+agent's own sandbox (``gpu_job.py``).
+
+It then runs a preflight inside the VibeSys sandbox: forbidden paths (also the
+GPU devices and the Slurm credential socket) must be absent and the workspace
+and trusted root must be present. Start ``launch.sh`` only after the preflight
+passes.
 """
 
 from __future__ import annotations
@@ -29,6 +36,8 @@ import tarfile
 import tempfile
 from pathlib import Path
 
+from ..cases import select_cases
+
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_SKILLS = ("kernel-correctness", "kernel-ncu-analysis", "kernel-performance")
 # Generic guidance stays; docs that report past runs or designs do not.
@@ -36,24 +45,11 @@ KEEP_DOCS = ("AGENT_TASK.md", "MODEL_STEP_TASKS.md", "REFERENCE_PRECISION.md",
              "SESSION_PROTOCOL.md")
 DROP_DIRS = ("probes", "submissions", "examples", "experiments", "runs", "archive")
 DENIED_TOOLS = ("WebFetch", "WebSearch")
-
-PREFLIGHT = r"""
-import json, os, subprocess, sys
-from pathlib import Path
-from vs_agent.host_resource_declarations import declare_agent_host_resources
-from vs_sandbox.api import build_host_sandbox
-spec = json.load(open(sys.argv[1]))
-env = spec["env"]
-res = declare_agent_host_resources(env, binary_path=spec["claude"], provider="claude")
-sb = build_host_sandbox(spec["project"], env=env, resources=res, log=lambda _: None,
-                        require_enforcement=True)
-lines = [f'for p in "$@"; do if [ -e "$p" ]; then echo "present $p"; else echo "absent $p"; fi; done']
-paths = spec["forbid"] + spec["require"]
-out = subprocess.run(sb.wrap(["/bin/bash", "-c", lines[0], "probe", *paths]),
-                     capture_output=True, text=True, timeout=120, env=env)
-seen = dict(line.split(" ", 1)[::-1] for line in out.stdout.split("\n") if line)
-print(json.dumps({"seen": seen, "stderr": out.stderr[-2000:]}))
-"""
+# VibeSys runs here: the host file system, but a /dev without GPU devices.
+NO_GPU = ("bwrap", "--dev-bind", "/", "/", "--dev", "/dev", "--unshare-user",
+          "--die-with-parent", "--")
+# Without these the sandbox can neither use a GPU nor submit a Slurm job.
+NO_GPU_PATHS = ("/dev/nvidiactl", "/dev/nvidia0", "/run/munge")
 
 
 def build_trusted(ref: str, trusted: Path, venv: Path) -> None:
@@ -87,39 +83,49 @@ def agent_env(args, run: Path, claude: Path, key: str) -> dict[str, str]:
         "TRITON_CACHE_DIR": str(project / ".cache/triton"),
         "VIBESYS_STATE_HOME": str(run / "state"),
         "VIBESYS_AGENT_SANDBOX_ALLOW": ":".join(
-            (str(run / "trusted"), str(args.venv.resolve()), str(args.cuda))),
+            (str(run / "trusted"), str(args.venv.resolve()), str(args.cuda), str(run / "gpu"))),
     }
 
 
-def write_launch(args, run: Path, env: dict[str, str]) -> None:
+def srun_command(args, gpus: int) -> list[str]:
+    return ["srun", f"--partition={args.gpu_partition}", f"--gres=gpu:{gpus}", "--nodes=1",
+            "--ntasks=1", f"--cpus-per-task={args.gpu_cpus}", f"--mem={args.gpu_mem}",
+            f"--time={args.gpu_time}", "--kill-on-bad-exit=1"]
+
+
+def write_launch(args, run: Path, env: dict[str, str], srun: list[str]) -> None:
     project = run / args.case
     vibesys_args = ["--project", str(project), "--config", str(project / "agent.toml"),
                     "--outer-loop", "agent", "--inner-loop", "multi-agent",
                     "--max-rounds", str(args.rounds), "--profiler", "ncu", "--local",
-                    "--headless", "--task", args.case]
+                    "--backend", "cuda", "--headless", "--task", args.case]
     for skill in args.skills:
         vibesys_args += ["--skills-dir", str(args.vibesys_skills / skill)]
     vibesys_args += ["--extra-skills", str(run / "trusted/megabench/skills")]
     fixed = {k: v for k, v in env.items() if k != "ANTHROPIC_API_KEY"}
     passed = " ".join(f"{k}={shlex.quote(v)}" for k, v in fixed.items())
+    q = lambda path: shlex.quote(str(path))
+    broker = [str(args.venv / "bin/python"), "-m", "megabench.integrations.gpu_broker", "serve",
+              "--socket", str(run / "gpu/broker.sock"), "--requests", str(run / "state/gpu"),
+              "--spec", str(run / "gpu-spec.json"), "--job-python", str(args.vibesys.parent / "python"),
+              "--job-script", str(run / "trusted/megabench/integrations/gpu_job.py"),
+              "--max-jobs", str(args.max_gpu_jobs), "--", *srun]
+    timeout = args.timeout_seconds or args.rounds * 3600
     (run / "launch.sh").write_text(
         "#!/bin/bash\nset -euo pipefail\n"
-        f"key=$(<{shlex.quote(str(args.api_key_file))})\n"
-        f"mkdir -p {shlex.quote(env['TORCH_EXTENSIONS_DIR'])} "
-        f"{shlex.quote(env['TRITON_CACHE_DIR'])} {shlex.quote(env['VIBESYS_STATE_HOME'])}\n"
-        f"cd {shlex.quote(str(project))}\n"
-        f"exec env -i {passed} CUDA_VISIBLE_DEVICES=\"${{CUDA_VISIBLE_DEVICES:-}}\" "
-        "ANTHROPIC_API_KEY=\"$key\" \\\n  timeout --signal=TERM --kill-after=60s "
-        f"{args.timeout_seconds}s {shlex.quote(str(args.vibesys))} "
+        f"key=$(<{q(args.api_key_file)})\n"
+        f"mkdir -p {q(env['TORCH_EXTENSIONS_DIR'])} "
+        f"{q(env['TRITON_CACHE_DIR'])} {q(env['VIBESYS_STATE_HOME'])}\n"
+        f"cd {q(project)}\n"
+        f"env -i {passed} PYTHONPATH={q(run / 'trusted')} "
+        + " ".join(map(shlex.quote, broker)) + f" >> {q(run / 'gpu-broker.log')} 2>&1 &\n"
+        "broker=$!\ntrap 'kill $broker 2>/dev/null || true' EXIT\n"
+        f"for _ in $(seq 100); do [ -S {q(run / 'gpu/broker.sock')} ] && break; sleep 0.1; done\n"
+        f"env -i {passed} ANTHROPIC_API_KEY=\"$key\" \\\n  "
+        + " ".join(NO_GPU) + " timeout --signal=TERM --kill-after=60s "
+        f"{timeout}s {q(args.vibesys)} "
         + " ".join(shlex.quote(a) for a in vibesys_args) + "\n")
     (run / "launch.sh").chmod(0o700)
-    (run / "job.sbatch").write_text(
-        "#!/bin/bash\n"
-        f"#SBATCH --partition={args.partition}\n#SBATCH --gres=gpu:1\n#SBATCH --nodes=1\n"
-        f"#SBATCH --ntasks=1\n#SBATCH --cpus-per-task=8\n#SBATCH --mem=128G\n"
-        f"#SBATCH --time={args.time}\n#SBATCH --chdir={run}\n"
-        f"#SBATCH --output={run}/job-%j.log\n"
-        f"exec {run}/launch.sh\n")
 
 
 def preflight(args, run: Path, env: dict[str, str], claude: Path) -> bool:
@@ -129,16 +135,14 @@ def preflight(args, run: Path, env: dict[str, str], claude: Path) -> bool:
     forbid = [str(home / ".claude"), str(home / ".claude.json"), *map(str, args.forbid)]
     forbid += [str(repo / name) for repo in sorted(repos) for name in ("megabench", "README.md")]
     forbid += [str(run / "trusted/megabench" / name) for name in DROP_DIRS]
+    forbid += [*NO_GPU_PATHS, str(run / "state"), str(args.api_key_file.resolve())]
     require = [str(run / args.case / "TASK.md"), str(run / "trusted/megabench/cases.py"),
-               str(args.venv / "bin/python")]
-    spec = run / "state/preflight.json"
-    spec.write_text(json.dumps({"env": env | {"ANTHROPIC_API_KEY": "unset-in-preflight"},
-                                "claude": str(claude), "project": str(run / args.case),
-                                "forbid": forbid, "require": require}))
+               str(args.venv.resolve() / "bin/python"), str(run / "gpu")]
     python = args.vibesys.parent / "python"
-    out = subprocess.run([str(python), "-c", PREFLIGHT, str(spec)], capture_output=True,
-                         text=True, check=False)
-    spec.unlink()
+    # The same sandbox that gpu_job.py builds in each GPU job, seen from VibeSys's namespace.
+    out = subprocess.run([*NO_GPU, str(python), str(run / "trusted/megabench/integrations/gpu_job.py"),
+                          "probe", str(run / "gpu-spec.json"), *forbid, *require],
+                         capture_output=True, text=True, check=False, env=env)
     if out.returncode:
         print(out.stderr[-3000:], file=sys.stderr)
         return False
@@ -168,9 +172,14 @@ def main() -> int:
     parser.add_argument("--ref", default="HEAD", help="git ref for the trusted snapshot")
     parser.add_argument("--venv", type=Path, default=REPO / ".venv")
     parser.add_argument("--cuda", type=Path, default=Path("/usr/local/cuda"))
-    parser.add_argument("--timeout-seconds", type=int, default=3300)
-    parser.add_argument("--partition", default="main")
-    parser.add_argument("--time", default="01:00:00")
+    parser.add_argument("--timeout-seconds", type=int,
+                        help="limit for the whole VibeSys run (default: one hour per round)")
+    parser.add_argument("--gpu-partition", default="main")
+    parser.add_argument("--gpu-time", default="00:30:00", help="time limit of each GPU job")
+    parser.add_argument("--gpu-cpus", type=int, default=8)
+    parser.add_argument("--gpu-mem", default="64G")
+    parser.add_argument("--max-gpu-jobs", type=int, default=1,
+                        help="GPU jobs from the agent queued or running at a time")
     parser.add_argument("--forbid", type=Path, action="append", default=[],
                         help="extra path that must be absent in the sandbox (repeat)")
     args = parser.parse_args()
@@ -192,10 +201,14 @@ def main() -> int:
 
     args.venv = args.venv.absolute()
     build_trusted(args.ref, run / "trusted", args.venv.resolve())
+    gpus = select_cases("all", [args.case])[0].gpus
+    srun = srun_command(args, gpus)
+    gate = ["env", "-u", "ANTHROPIC_API_KEY", *srun, "--job-name=vs-gate"]
     command = [str(run / "trusted/.venv/bin/python"), "-m",
                "megabench.integrations.make_agent_workspace", "--case", args.case,
                "--output", str(run / args.case), "--agent", "vibesys",
-               "--benchmark-root", str(run / "trusted")]
+               "--benchmark-root", str(run / "trusted"),
+               "--gpu-socket", str(run / "gpu/broker.sock"), "--gate-launcher", shlex.join(gate)]
     if args.regimes:
         command += ["--regimes", str(args.regimes.resolve())]
     subprocess.run(command, check=True, cwd=run / "trusted",
@@ -204,12 +217,18 @@ def main() -> int:
     settings.parent.mkdir(parents=True)
     settings.write_text(json.dumps({"permissions": {"deny": list(DENIED_TOOLS)}}, indent=2))
     (run / "state").mkdir()
+    (run / "gpu").mkdir(mode=0o700)
     env = agent_env(args, run, Path(claude), key="")
-    write_launch(args, run, env)
+    # The sandbox of each GPU job; it holds no key.
+    (run / "gpu-spec.json").write_text(json.dumps(
+        {"env": {k: v for k, v in env.items() if k != "ANTHROPIC_API_KEY"},
+         "claude": str(claude), "project": str(run / args.case)}))
+    write_launch(args, run, env, srun)
     if not preflight(args, run, env, Path(claude)):
-        print("preflight failed; do not submit", file=sys.stderr)
+        print("preflight failed; do not start the run", file=sys.stderr)
         return 1
-    print(f"preflight passed. Submit from a neutral directory: cd / && sbatch {run}/job.sbatch")
+    print("preflight passed. Start the run on this host (not in a Slurm job):\n"
+          f"  setsid nohup {run}/launch.sh > {run}/vibesys.log 2>&1 < /dev/null &")
     return 0
 
 

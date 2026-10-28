@@ -105,7 +105,8 @@ def _write_reference(project: Path, benchmark_root: Path, case: Case) -> str:
     return module
 
 
-def _write_tools(project: Path, benchmark_root: Path, case: Case) -> None:
+def _write_tools(project: Path, benchmark_root: Path, case: Case,
+                 gpu_socket: Path | None = None) -> None:
     python = shlex.quote(str(_python(benchmark_root)))
     trusted = shlex.quote(str(benchmark_root))
     submission = shlex.quote(str(project / "submission.py"))
@@ -114,10 +115,20 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case) -> None:
               f"export PYTHONPATH={trusted}\n"
               f"cd {shlex.quote(str(project))}\n")
     regimes_flag = "--regimes regimes.json " if case.regimes else ""
+    # With a GPU broker, the GPU commands run as Slurm jobs through ./gpu_run.
+    gpu = ""
+    if gpu_socket is not None:
+        gpu = f"{shlex.quote(str(project / 'gpu_run'))} "
+        gpu_run = project / "gpu_run"
+        gpu_run.write_text(
+            f"#!/bin/sh\nset -eu\nexport PYTHONPATH={trusted}\n"
+            f"exec {python} -m megabench.integrations.gpu_broker run "
+            f"--socket {shlex.quote(str(gpu_socket))} -- \"$@\"\n")
+        gpu_run.chmod(0o755)
     check = project / "check_candidate"
     check.write_text(
         common + "run_id=$(date -u +%Y%m%dT%H%M%S)-$$\n"
-        f"exec {python} -m megabench evaluate --case {case_id} "
+        f"exec {gpu}{python} -m megabench evaluate --case {case_id} "
         f"--submission {submission} --method local-check "
         "--session-id \"local-$run_id\" --device cuda:0 "
         "--trials 3 --warmup 1 --reps 3 --timeout 1200 "
@@ -125,13 +136,13 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case) -> None:
     check.chmod(0o755)
     profile = project / "profile_candidate"
     profile.write_text(
-        common + f"exec {python} -m megabench.integrations.ncu_profile_case "
+        common + f"exec {gpu}{python} -m megabench.integrations.ncu_profile_case "
         f"--case {case_id} --submission {submission} \"$@\"\n")
     profile.chmod(0o755)
     timeline = project / "timeline_candidate"
     timeline.write_text(
         common + "run_id=$(date -u +%Y%m%dT%H%M%S)-$$\n"
-        f"exec {python} -m megabench.integrations.timeline_profile_case "
+        f"exec {gpu}{python} -m megabench.integrations.timeline_profile_case "
         f"--case {case_id} --submission {submission} "
         "--output \"reports/timeline-$run_id\" \"$@\"\n")
     timeline.chmod(0o755)
@@ -202,7 +213,8 @@ def _write_kernelagent_task(project: Path, benchmark_root: Path,
 
 def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
                    benchmark_root: Path = BENCHMARK_ROOT,
-                   regimes: Path | None = None) -> Path:
+                   regimes: Path | None = None, gpu_socket: Path | None = None,
+                   gate_launcher: tuple[str, ...] = ()) -> Path:
     if agent not in ("vibesys", "kernelagent", "plain"):
         raise ValueError(f"unsupported agent: {agent}")
     case = select_cases("all", [case_id])[0]
@@ -322,13 +334,20 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "; pass `--result PATH` for "
         "the gap to a checked CUDA-event result where a traffic model is available. "
         "The default bandwidth is 8 TB/s per B200. These commands load the trusted benchmark outside "
-        "this workspace; final grading is run separately.\n")
-    _write_tools(project, benchmark_root, case)
+        "this workspace; final grading is run separately.\n"
+        + ("\nThis shell has no GPU. Run each GPU command, including microbenchmarks and "
+           "Nsight captures, as `./gpu_run <command>`: it runs the command in this sandbox "
+           "on one GPU as a separate Slurm job and can wait in the queue first. "
+           "`./check_candidate`, `./profile_candidate` and `./timeline_candidate` already "
+           "use it. Keep inputs and outputs inside this workspace, because the job does "
+           "not see this shell's `/tmp`.\n" if gpu_socket is not None else ""))
+    _write_tools(project, benchmark_root, case, gpu_socket)
     if agent == "vibesys":
         shutil.copy2(benchmark_root / "megabench/integrations/vibesys-agent.example.toml",
                      project / "agent.toml")
         make_task(case_id, project, benchmark_root,
-                  project / "regimes.json" if regimes is not None else None)
+                  project / "regimes.json" if regimes is not None else None,
+                  gate_launcher)
     elif agent == "kernelagent":
         _write_kernelagent_task(project, benchmark_root, case)
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=project, check=True)
@@ -350,9 +369,15 @@ def main() -> None:
                         help="trusted benchmark snapshot used by workspace tools")
     parser.add_argument("--regimes", type=Path,
                         help="regime set (JSON) baked into the case and scoring")
+    parser.add_argument("--gpu-socket", type=Path,
+                        help="gpu_broker socket: GPU commands run through ./gpu_run")
+    parser.add_argument("--gate-launcher", default="",
+                        help="command prefix for the VibeSys accuracy and benchmark gates")
     args = parser.parse_args()
     print(make_workspace(args.case, args.output, agent=args.agent,
-                         benchmark_root=args.benchmark_root, regimes=args.regimes))
+                         benchmark_root=args.benchmark_root, regimes=args.regimes,
+                         gpu_socket=args.gpu_socket,
+                         gate_launcher=tuple(shlex.split(args.gate_launcher))))
 
 
 if __name__ == "__main__":
