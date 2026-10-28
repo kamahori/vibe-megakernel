@@ -23,7 +23,7 @@ from pathlib import Path
 
 import numpy as np
 
-BATCHED_FAMILIES = frozenset({"dense_step"})  # families that accept batch > 1 and ragged contexts
+BATCHED_FAMILIES = frozenset({"dense_step", "quant_step"})  # families that accept batch > 1 and ragged contexts
 HEADER = [b"TIMESTAMP", b"ContextTokens", b"GeneratedTokens"]
 
 

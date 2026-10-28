@@ -12,7 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from ..cases import Case, load_regimes, select_cases
-from ..sol import WORK_MODELS
+from ..sol import work_model
 from .make_vibesys_case_task import make_task
 
 
@@ -317,7 +317,7 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "production trace (see the `megakernel-regimes` skill). "
         "Use `./sol_info --json` for an optimistic " +
         ("speed-of-light floor (the largest of the HBM, tensor-core and NVLink "
-         "bounds) with byte and FLOP breakdowns" if case.family in WORK_MODELS
+         "bounds) with byte and FLOP breakdowns" if work_model(case)
          else "HBM speed-of-light floor and byte breakdown") +
         "; pass `--result PATH` for "
         "the gap to a checked CUDA-event result where a traffic model is available. "

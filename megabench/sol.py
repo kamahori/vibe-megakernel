@@ -33,14 +33,15 @@ def estimate_case(case: Case, bandwidth_tb_s: float = DEFAULT_B200_BANDWIDTH_TB_
     result: dict = {"case_id": case.id, "status": "estimated"}
     if not case.ready:
         return result | {"status": "unavailable", "reason": case.note}
-    if case.family in WORK_MODELS:
+    if work_model(case):
         return _work_floor(case, result, bandwidth_tb_s, measured_ms)
     if case.family not in {"dense_step", "moe_step", "quant_step",
                            "spec_target_step"}:
         return result | {"status": "unavailable",
                          "reason": f"no traffic model for {case.family}"}
     p = case.params
-    batched = case.family == "dense_step" and (p["batch"] != 1 or bool(case.contexts))
+    batched = (case.family in ("dense_step", "quant_step")
+               and (p["batch"] != 1 or bool(case.contexts)))
     if p["batch"] != 1 and not batched:
         return result | {"status": "unavailable",
                          "reason": "traffic model currently supports batch one"}
@@ -78,8 +79,9 @@ def estimate_case(case: Case, bandwidth_tb_s: float = DEFAULT_B200_BANDWIDTH_TB_
         add("tied_embedding_and_head", vocab * hidden * BF16_BYTES,
             "full BF16 vocabulary head, including the token embedding row")
         local_layers = layers - layers // 6
-        local_tokens = min(context, max(0, p["local_window"] - 1))
-        cache_positions = local_layers * local_tokens + (layers // 6) * context
+        lengths = case.contexts or (context,) * sequences
+        local_tokens = sum(min(n, max(0, p["local_window"] - 1)) for n in lengths)
+        cache_positions = local_layers * local_tokens + (layers // 6) * sum(lengths)
     else:
         add("attention_projection_weights", projection_elements * BF16_BYTES,
             "Q/K/V/output projection weights, read once")
@@ -311,14 +313,67 @@ def _pi05_work(case: Case) -> tuple[list[dict], list[dict], int]:
     return bytes_, flops, 0
 
 
+def _quant_prefill_work(case: Case) -> tuple[list[dict], list[dict], int]:
+    """One quantized Gemma 3 prefill chunk of ``tokens`` new positions.
+
+    Weights are read once and decoded to BF16 for the tensor cores. Each
+    query attends causally, and sliding-window layers see at most
+    ``local_window`` positions. Only the last position computes logits.
+    """
+    p = case.params
+    count, context, bits, window = p["tokens"], p["context"], p["bits"], p["local_window"]
+    layers, hidden, head_dim = p["layers"], p["hidden"], p["head_dim"]
+    qdim, kdim = p["q_heads"] * head_dim, p["kv_heads"] * head_dim
+    inter, vocab = p["intermediate"], p["vocab"]
+    if bits not in (4, 8):
+        raise ValueError(f"unsupported quantization width {bits}: {case.id}")
+    weights = layers * (2 * qdim * hidden + 2 * kdim * hidden + 3 * inter * hidden)
+    local_layers, global_layers = layers - layers // 6, layers // 6
+    prior = local_layers * min(context, max(0, window - 1)) + global_layers * context
+    bytes_ = [
+        {"name": "quantized_projection_and_mlp_weights", "bytes": weights * bits // 8,
+         "detail": f"all seven projection stacks, packed {bits}-bit weights, read once"},
+        {"name": "quantization_scales",
+         "bytes": layers * (qdim + 2 * kdim + 2 * hidden + 2 * inter) * FP32_BYTES,
+         "detail": "one FP32 scale per projection output row"},
+        {"name": "normalization_weights",
+         "bytes": (layers * (4 * hidden + 2 * head_dim) + hidden) * BF16_BYTES,
+         "detail": "four layer norms, Q/K norms, and final norm in BF16"},
+        {"name": "tied_embedding_and_head", "bytes": (vocab + count) * hidden * BF16_BYTES,
+         "detail": "full BF16 vocabulary head for the last position, plus the input rows"},
+        {"name": "old_kv_cache_reads", "bytes": 2 * prior * kdim * BF16_BYTES,
+         "detail": "cached K and V that any new position can see, read once"},
+        {"name": "new_kv_writes", "bytes": 2 * layers * count * kdim * BF16_BYTES,
+         "detail": "K and V of every new position"},
+    ]
+    visible_global = count * context + count * (count + 1) // 2
+    visible_local = sum(min(context + i + 1, window) for i in range(count))
+    attention = 4 * qdim * (local_layers * visible_local + global_layers * visible_global)
+    flops = [
+        {"name": "projections_and_mlp", "dtype": "bf16", "flops": 2 * count * weights,
+         "detail": f"{count} positions through every projection"},
+        {"name": "attention", "dtype": "bf16", "flops": attention,
+         "detail": "QK and PV over the causal and sliding-window masks"},
+        {"name": "lm_head", "dtype": "bf16", "flops": 2 * vocab * hidden,
+         "detail": "logits of the last position"},
+    ]
+    return bytes_, flops, 0
+
+
 WORK_MODELS = {"megamoe_layer": _megamoe_work, "vla_action_step": _pi05_work, "tts_frame_step": _csm_work,
                "world_frame_step": _waypoint_work}
+
+
+def work_model(case: Case):
+    if case.family == "quant_step" and case.params.get("tokens", 1) > 1:
+        return _quant_prefill_work
+    return WORK_MODELS.get(case.family)
 
 
 def _work_floor(case: Case, result: dict, bandwidth_tb_s: float,
                 measured_ms: float | None) -> dict:
     """Floor = the largest of the HBM, tensor-core, and NVLink time bounds."""
-    components, flops, link_bytes = WORK_MODELS[case.family](case)
+    components, flops, link_bytes = work_model(case)(case)
     minimum_bytes = sum(item["bytes"] for item in components)
     hbm_ms = minimum_bytes / (bandwidth_tb_s * 1e12) * 1e3
     compute_ms = sum(item["flops"] / (B200_DENSE_TFLOPS[item["dtype"]] * 1e12)
