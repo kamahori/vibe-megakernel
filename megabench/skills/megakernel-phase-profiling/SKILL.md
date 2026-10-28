@@ -43,7 +43,7 @@ For each sync point, separate three numbers:
 - work time: the CTA is doing the phase;
 - wait time: from arrive to release;
 - imbalance: the last arriver compared with a typical arriver.
-A long wait usually means someone else is late. Find who, not just how long.
+A long wait can mean that another CTA is late. Find which one, not just how long.
 
 ## 3. Do not disturb production (non-intrusive rule)
 

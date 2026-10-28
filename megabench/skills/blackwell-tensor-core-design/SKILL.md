@@ -1,85 +1,129 @@
 ---
 name: blackwell-tensor-core-design
-description: Use when planning or reviewing a megakernel phase that is matrix-multiply-shaped or attention-shaped on Blackwell (sm_100a), to consider tcgen05, TMEM, TMA and warp-specialized designs and to reshape the problem to fit them before choosing an engine by measurement.
+description: Use when planning or reviewing a megakernel phase that is matrix-multiply-shaped or attention-shaped on Blackwell (sm_100a), to put tcgen05, TMEM, TMA, warp-specialized and work-scheduling designs into the candidate set and to decide among them by measurement.
 ---
 
 # Blackwell tensor-core design
 
-Use this skill to widen the design space. Blackwell has hardware that SIMT FMA and warp-level `mma.sync` do not use. Agents often skip it because it is harder to write. Do not skip it without evidence.
+Use this skill to widen the design space. It lists options and the questions that decide
+between them. It does not tell you which option wins. Treat every property below as a
+hypothesis about your kernel on your device. Confirm it with a small experiment
+(`megakernel-microbench`) before you build a design on it.
 
-The rule: for each matrix-multiply-shaped or attention-shaped phase, build and measure a tcgen05 candidate before you dismiss it. Decide by measurement, per phase, with `megakernel-microbench`.
+Agents often stay with SIMT FMA or warp-level `mma.sync` because the Blackwell path is
+harder to write. Do not drop the Blackwell path without evidence from your own
+measurements. Do not adopt it without evidence either.
 
-## What the Blackwell path offers
+## Learn the hardware from first principles
 
-- tcgen05 MMA is issued asynchronously by a single thread. The other threads in the CTA are free to do other work.
-- Accumulators live in Tensor Memory (TMEM), not in registers. This frees registers for other work and reduces spills.
-- Operands come from shared memory through descriptors (and, for some forms, from TMEM). The descriptor encodes layout and swizzle.
-- Completion is tracked with an mbarrier, using the tcgen05 commit operation.
-- The epilogue reads accumulators from TMEM into registers with `tcgen05.ld`. Double-buffer the TMEM accumulators so the epilogue of one tile overlaps the MMA of the next.
-- Instruction shape (M, N, K), data type, and `cta_group` (one CTA, or a pair of CTAs) are choices. Make them on purpose.
+Before you design around a feature, measure the feature in isolation. Examples:
 
-## Operand ingress with TMA
+- Issue cost and latency of one MMA, for each instruction shape and data type you consider.
+- Throughput of the MMA as tile size and pipeline depth change.
+- Cost of moving accumulators from Tensor Memory (TMEM) to registers.
+- Bandwidth and latency of TMA copies against per-thread loads, for your tile shapes,
+  for cold and warm cache, and with other CTAs that compete for bandwidth.
+- Cost of an mbarrier hand-off between warps, and of a fence between the generic and
+  async proxies.
+- Cost of each synchronization or scheduling primitive you plan to use.
 
-- TMA (`cp.async.bulk.tensor`) moves tiles from global to shared memory without per-thread load instructions.
-- Use a multi-stage ring of shared-memory buffers. Each stage has a "full" mbarrier (expect-tx bytes, then complete-tx by the copy) and an "empty" mbarrier released by the consumer.
-- Consider multicast across a cluster and L2 cache hints when several CTAs read the same data or when data is read once.
-- For streamed weights, prefer bulk async copies over per-thread loads unless measurement says otherwise.
-- Tensor maps (descriptors) are built on the host or at build time. Plan where they live and how the kernel reads them.
+Write each result in your notes with the conditions of the test. Use the results, not
+general claims, to choose a design.
 
-## Warp specialization
+## Options to evaluate
 
-- Split the CTA into roles: a producer warp (TMA), an MMA-issuer warp (one elected thread), and epilogue or consumer warps.
-- Connect roles with mbarrier hand-offs. Track the phase (parity) bit for every ring and every reuse.
-- Use register reallocation between roles (`setmaxnreg`) to give consumer warps more registers and shrink the producer and issuer.
-- In a megakernel, roles can persist across phases. A producer can prefetch the next phase weights while consumers finish the current one. Test whether this overlap helps.
+Each item names an option and the questions that decide it.
 
-## Reshape the problem to fit the tile
+### tcgen05 MMA with TMEM accumulators
+- The MMA is issued by one thread and completes asynchronously. Accumulators can live in
+  TMEM instead of registers.
+- Questions: Does this lower register pressure or spills in your phase? Does it let other
+  warps do useful work during the MMA? What is the setup cost (allocation, descriptors,
+  barrier init, pipeline fill) relative to the phase time?
+- Double-buffered TMEM accumulators can overlap the epilogue of one tile with the MMA of
+  the next. Measure whether the overlap appears in your phase.
 
-tcgen05 tile shapes are large. Small or skinny problems need work to fill them.
+### Operand ingress: TMA, per-thread loads, or a mix
+- TMA (`cp.async.bulk.tensor`) moves tiles with descriptors and mbarrier transaction
+  counts. Per-thread loads give more control per element.
+- Questions: Which one reaches more of the bandwidth floor for your tile shapes? How deep
+  must the ring be to hide latency, and does that depth fit the shared-memory budget?
+  Do multicast or cache hints change the result?
 
-- Swap A and B (compute the transpose) when the row or token dimension is small, so the large dimension maps to the MMA M and the small one maps to N.
-- Pad or group small dimensions to reach a legal N. Count the wasted work and compare it with the savings.
-- Split K, or split along sequence or KV length, to create enough parallel tiles. Add a merge step, and weigh its cost.
-- Fuse neighbor operations into the epilogue: scaling, activation, residual add, quantization, or the next reduction.
-- Pre-arrange weight layouts and swizzles at build time so TMA and descriptors read them directly.
-- Pick data types for operands and accumulators deliberately. Check which types the instruction accepts and what accuracy the task needs.
-- Choose `cta_group`: one CTA is simpler and fits small tiles. A CTA pair gives a larger tile and shares operand traffic, but it needs paired scheduling and cluster launch.
+### Warp specialization
+- Roles are possible: a producer for copies, an MMA issuer, and epilogue or consumer warps,
+  joined by mbarriers. Register reallocation between roles (`setmaxnreg`) is possible.
+- Questions: Does a role split shorten the phase, or only add hand-off cost? Which role is
+  on the critical path? In a megakernel, can a role run ahead into the next phase, and
+  does that help?
 
-## Constraints to plan for
+### Problem shape
+- Small or skinny problems may not fill a tensor-core tile. Options:
+  - swap the operands (compute the transpose) so that the large dimension maps to M;
+  - pad or group small dimensions;
+  - split K, or split along the sequence or KV length, with a merge step;
+  - fuse neighbor operations into the epilogue;
+  - arrange weight layouts and swizzles at build time.
+- Questions: How much work does padding waste? What does the merge step cost? Which legal
+  instruction shapes and data types fit your problem, according to the PTX documentation?
 
-- TMEM must be allocated (`tcgen05.alloc`), relinquished, and deallocated (`tcgen05.dealloc`) correctly. The column budget is shared across all phases that use it.
-- A kernel uses one `cta_group` choice for all its tcgen05 instructions. Decide early.
-- Initialize mbarriers once. Track phase and parity across reuse. A wrong parity causes hangs or silent races.
-- Shared memory holds the rings and also the data of the other phases. Budget the total, including alignment for swizzled layouts.
-- Use the right fences: tcgen05 fences around synchronization with the MMA and TMEM operations, and proxy fences when generic-proxy writes to shared memory must be seen by the async proxy (TMA or MMA descriptors).
-- Register caps follow from the launch geometry (threads per CTA, CTAs per SM). Check them against the roles you want.
-- Persistent kernels with grid-wide synchronization need all CTAs resident. TMEM and shared memory use affect residency.
-- Check how TMEM and rings are handed over between phases, and what state must be reset.
+### CTA grouping
+- An MMA can run on one CTA or on a pair of CTAs (`cta_group`).
+- Questions: Does a pair reduce operand traffic enough to pay for paired scheduling and
+  cluster launch? Read the PTX documentation for the rules on mixing `cta_group` values in
+  one kernel, and design for those rules from the start.
 
-## When tcgen05 may lose
+## Work scheduling: static or dynamic
 
-- Very small phases, or phases bound by loading data, where tensor-core throughput is not the limit.
-- Setup cost (TMEM allocation, descriptor setup, barrier init, pipeline fill) is a large share of the phase time.
-- Padding waste is large because a dimension is too small for the tile.
-- An extra merge pass or an extra layout step costs more than the MMA saves.
-- Losing neighbor-phase overlap that a simpler design had.
+Decide how work units reach CTAs. Do not assume a static split is enough.
 
-A megakernel may use different engines for different phases, and different engines for different problem-size ranges. Decide per phase and per size range. Record when and why a tcgen05 design won or lost, with the conditions.
+- Static: each CTA gets a fixed set of units from its index. It has no runtime cost, but
+  it cannot react to uneven work or to late CTAs.
+- Dynamic: CTAs take units from a queue at run time. Examples are an atomic counter in
+  global memory, per-phase work lists, or hardware-assisted scheduling such as cluster
+  launch control, if your toolchain supports it.
+- Hybrid: a static first share, then dynamic stealing for the remaining units.
+
+Questions:
+- How uneven are the units? Use the phase timeline (`megakernel-phase-profiling`) to see
+  the spread of per-CTA finish times.
+- What does one dequeue cost, and how does it scale with the number of CTAs that compete?
+  Measure it.
+- Does dynamic order change cache reuse or the overlap with the next phase?
+- Does the scheme stay correct across grid-wide synchronization and across phases?
+
+Build both schemes in a microbenchmark of the phase. Keep the one that wins end to end.
+
+## Constraints to check
+
+Read the PTX documentation and confirm each rule with a small test:
+
+- TMEM allocation, relinquish, and deallocation, and how the column budget is shared
+  across phases.
+- mbarrier initialization, phase and parity tracking across reuse, and what happens on
+  a wrong parity.
+- The fences that are necessary between MMA, TMEM, TMA, and generic memory operations.
+- The shared-memory budget for rings and for the data of other phases, with alignment
+  for swizzled layouts.
+- Register limits for your launch geometry, and residency for any grid-wide
+  synchronization.
+- The state that one phase must reset or hand over to the next.
 
 ## Verify before integrating
 
-- Write a numerics unit test of the tcgen05 path against a simple reference (a plain GPU or CPU matmul). Test the layouts and the swizzles with distinctive data, not only random data.
-- Check the SASS with `cuobjdump -sass` for the expected tensor-core MMA instructions (opcodes of the form `UTC*MMA`; the middle letters vary with the data type) and for TMA loads (`UTMALDG`). If they are missing, the compiler or your code took another path.
-- Check `-res-usage` (for example `cuobjdump -res-usage` or `--resource-usage`) for registers, shared memory, and spills.
-- Then measure with `megakernel-microbench`, calibrated against the current phase.
+- Write a numerics unit test of each new path against a simple reference. Use
+  distinctive data so that layout and swizzle errors show.
+- Read the SASS (`cuobjdump -sass`) and the resource use (`cuobjdump -res-usage`).
+  Confirm that the instructions you expect are present and that no spills appear.
+- Measure with `megakernel-microbench`, calibrated against the current phase.
+- A megakernel can use different engines and schedules for different phases and for
+  different problem-size ranges. Record when and why each choice won or lost, with the
+  conditions, so later rounds can reuse the evidence.
 
 ## Reference sources
 
-If available in your environment, consult:
-
-- The CUDA PTX ISA documentation: tcgen05, `cp.async.bulk.tensor`, and mbarrier sections.
-- CUTLASS and CuTe sm100 examples.
-- DeepGEMM.
-- FlashInfer and FlashAttention Blackwell kernels.
-
-Do not assume a path. Search the environment first. If a mnemonic or operand form is uncertain, check it against the PTX documentation or an example rather than guessing.
+If available in your environment, consult the CUDA PTX ISA documentation (tcgen05,
+`cp.async.bulk.tensor`, mbarrier), CUTLASS and CuTe sm100 examples, DeepGEMM, and
+FlashInfer or FlashAttention Blackwell kernels. Search the environment first. Do not
+assume a path. When an instruction form is uncertain, check the documentation or an
+example instead of a guess.
