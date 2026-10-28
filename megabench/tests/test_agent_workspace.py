@@ -107,6 +107,14 @@ class AgentWorkspaceTests(unittest.TestCase):
                 self.assertTrue(str(front["description"]).strip())
                 self.assertIn(path.name, ruled)
 
+    def test_vibesys_example_config_uses_claude_with_implementer_role(self) -> None:
+        config = tomllib.loads(
+            (MEGABENCH / "integrations/vibesys-agent.example.toml").read_text())
+        self.assertEqual(config["agent"]["cli_provider"], "claude")
+        role = config["agent"]["roles"]["implementer"]
+        self.assertTrue(role["model"])
+        self.assertTrue(role["reasoning_effort"])
+
     def test_vibesys_task_uses_trusted_python_and_single_case(self) -> None:
         case = select_cases("p0")[0]
         with tempfile.TemporaryDirectory() as directory:

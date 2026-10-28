@@ -1,5 +1,7 @@
+# Orchestrator, profiler and judge inherit [model] and [thinking];
+# only the implementer role is overridden.
 [model]
-name = "gpt-6-sol"
+name = "claude-opus-5-5"
 
 [thinking]
 level = "medium"
@@ -7,7 +9,11 @@ level = "medium"
 [agent]
 backend = "cli"
 driver = "agentshim"
-cli_provider = "codex"
+cli_provider = "claude"
+
+[agent.roles.implementer]
+model = "claude-sonnet-5-5"
+reasoning_effort = "medium"
 
 [backend]
 name = "cuda"
