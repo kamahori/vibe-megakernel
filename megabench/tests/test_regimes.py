@@ -18,6 +18,7 @@ from unittest.mock import patch
 from ..cases import select_cases
 from ..harness import runner
 from ..integrations import vibesys_case_evaluator as evaluator
+from ..integrations.make_agent_workspace import make_workspace
 from ..integrations.make_vibesys_case_task import make_task
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -208,6 +209,60 @@ class EvaluatorTests(unittest.TestCase):
         output = evaluator.benchmark_output("c", {"status": "ok", "regimes": rows}, 1.5)
         self.assertTrue(all("contexts" not in row for row in output["result"]["regimes"]))
         self.assertLess(len(json.dumps(output)), 100_000)
+
+
+class WorkspaceTests(unittest.TestCase):
+    def test_task_pins_the_regime_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            regimes = write_regimes(directory)
+            task = make_task(CASE_ID, Path(directory) / "p", ROOT, regimes)
+            self.assertEqual((task / "regimes.json").read_bytes(), regimes.read_bytes())
+            self.assertIn("regimes", (task / "OBJECTIVE.md").read_text())
+            argv = sys.argv
+            sys.argv = [str(task / "evaluator.py")]
+            try:
+                namespace = runpy.run_path(str(task / "evaluator.py"), run_name="__mp_main__")
+                self.assertIn("main", namespace)
+                (task / "regimes.json").write_text("{}")
+                with self.assertRaisesRegex(RuntimeError, "regime set changed"):
+                    runpy.run_path(str(task / "evaluator.py"), run_name="__mp_main__")
+            finally:
+                sys.argv = argv
+
+    def test_task_without_regimes_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            task = make_task(CASE_ID, Path(directory) / "p", ROOT)
+            self.assertFalse((task / "regimes.json").exists())
+            self.assertNotIn("regimes", (task / "OBJECTIVE.md").read_text())
+            self.assertNotIn("regimes_path", (task / "evaluator.py").read_text())
+
+    def test_workspace_bakes_and_commits_regimes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            regimes = write_regimes(directory)
+            project = make_workspace(CASE_ID, Path(directory) / "ws", regimes=regimes)
+            self.assertEqual((project / "regimes.json").read_bytes(), regimes.read_bytes())
+            tracked = subprocess.run(["git", "ls-files"], cwd=project, text=True,
+                                     capture_output=True, check=True).stdout.split()
+            self.assertIn("regimes.json", tracked)
+            self.assertIn(f".vibesys/tasks/{CASE_ID}/regimes.json", tracked)
+            case = json.loads((project / "case.json").read_text())
+            self.assertEqual([r["id"] for r in case["regimes"]], ["short", "long"])
+            self.assertIn("CASE = Case(", (project / "reference/megabench/cases.py").read_text())
+            self.assertIn("regimes", (project / "reference/megabench/cases.py").read_text().split(
+                "CASE = Case(")[1])
+            self.assertIn("`./trace_regimes`", (project / "TASK.md").read_text())
+            self.assertIn("--regimes regimes.json", (project / "check_candidate").read_text())
+            wrapper = project / "trace_regimes"
+            self.assertTrue(os.access(wrapper, os.X_OK))
+            self.assertIn(f"megabench.integrations.trace_regimes --case {CASE_ID}",
+                          wrapper.read_text())
+
+    def test_workspace_without_regimes_has_no_regime_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = make_workspace(CASE_ID, Path(directory) / "ws", agent="plain")
+            self.assertFalse((project / "regimes.json").exists())
+            self.assertNotIn("--regimes", (project / "check_candidate").read_text())
+            self.assertTrue((project / "trace_regimes").exists())
 
 
 if __name__ == "__main__":

@@ -8,9 +8,10 @@ import shlex
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
-from ..cases import Case, select_cases
+from ..cases import Case, load_regimes, select_cases
 from ..sol import WORK_MODELS
 from .make_vibesys_case_task import make_task
 
@@ -112,6 +113,7 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case) -> None:
     common = ("#!/bin/sh\nset -eu\n"
               f"export PYTHONPATH={trusted}\n"
               f"cd {shlex.quote(str(project))}\n")
+    regimes_flag = "--regimes regimes.json " if case.regimes else ""
     check = project / "check_candidate"
     check.write_text(
         common + "run_id=$(date -u +%Y%m%dT%H%M%S)-$$\n"
@@ -119,7 +121,7 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case) -> None:
         f"--submission {submission} --method local-check "
         "--session-id \"local-$run_id\" --device cuda:0 "
         "--trials 3 --warmup 1 --reps 3 --timeout 1200 "
-        "--output \"reports/check-$run_id.jsonl\" \"$@\"\n")
+        + regimes_flag + "--output \"reports/check-$run_id.jsonl\" \"$@\"\n")
     check.chmod(0o755)
     profile = project / "profile_candidate"
     profile.write_text(
@@ -139,8 +141,13 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case) -> None:
                     ignore=shutil.ignore_patterns("__pycache__"))
     sol = project / "sol_info"
     sol.write_text(
-        common + f"exec {python} -m megabench sol --case {case_id} \"$@\"\n")
+        common + f"exec {python} -m megabench sol --case {case_id} {regimes_flag}\"$@\"\n")
     sol.chmod(0o755)
+    trace = project / "trace_regimes"
+    trace.write_text(
+        common + f"exec {python} -m megabench.integrations.trace_regimes "
+        f"--case {case_id} \"$@\"\n")
+    trace.chmod(0o755)
 
 
 def _write_kernelagent_task(project: Path, benchmark_root: Path,
@@ -194,12 +201,17 @@ def _write_kernelagent_task(project: Path, benchmark_root: Path,
 
 
 def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
-                   benchmark_root: Path = BENCHMARK_ROOT) -> Path:
+                   benchmark_root: Path = BENCHMARK_ROOT,
+                   regimes: Path | None = None) -> Path:
     if agent not in ("vibesys", "kernelagent", "plain"):
         raise ValueError(f"unsupported agent: {agent}")
     case = select_cases("all", [case_id])[0]
     if not case.ready or case.family not in REFERENCE_FILES:
         raise ValueError(f"case has no minimal reference bundle: {case_id}")
+    if regimes is not None:
+        case = replace(case, regimes=load_regimes(regimes))
+        if agent == "kernelagent":
+            raise ValueError("regimes are not supported for the kernelagent workspace")
     benchmark_root = benchmark_root.resolve()
     project = output.resolve()
     project.mkdir(parents=True, exist_ok=False)
@@ -219,6 +231,8 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
     )
     (project / "submission.py").write_text(submission_source)
     module = _write_reference(project, benchmark_root, case)
+    if regimes is not None:
+        shutil.copyfile(regimes, project / "regimes.json")
     (project / "case.json").write_text(json.dumps(case.to_dict(), indent=2) + "\n")
     interface = (
         "Write `kernel.py` with `kernel_function(inputs: dict) -> dict`. "
@@ -297,6 +311,10 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "furthest-from-floor phase in isolated microbenchmarks (`megakernel-microbench`; "
         "these do not use rounds), and evaluate Blackwell tensor-core designs "
         "(`blackwell-tensor-core-design`). "
+        "When `regimes.json` (or the case) lists regimes, the score is the weighted "
+        "result over all regimes, each shape is built and checked separately, and a "
+        "submission may specialize per regime; `./trace_regimes` derives regimes from a "
+        "production trace (see the `megakernel-regimes` skill). "
         "Use `./sol_info --json` for an optimistic " +
         ("speed-of-light floor (the largest of the HBM, tensor-core and NVLink "
          "bounds) with byte and FLOP breakdowns" if case.family in WORK_MODELS
@@ -309,7 +327,8 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
     if agent == "vibesys":
         shutil.copy2(benchmark_root / "megabench/integrations/vibesys-agent.example.toml",
                      project / "agent.toml")
-        make_task(case_id, project, benchmark_root)
+        make_task(case_id, project, benchmark_root,
+                  project / "regimes.json" if regimes is not None else None)
     elif agent == "kernelagent":
         _write_kernelagent_task(project, benchmark_root, case)
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=project, check=True)
@@ -329,9 +348,11 @@ def main() -> None:
                         default="vibesys")
     parser.add_argument("--benchmark-root", type=Path, default=BENCHMARK_ROOT,
                         help="trusted benchmark snapshot used by workspace tools")
+    parser.add_argument("--regimes", type=Path,
+                        help="regime set (JSON) baked into the case and scoring")
     args = parser.parse_args()
     print(make_workspace(args.case, args.output, agent=args.agent,
-                         benchmark_root=args.benchmark_root))
+                         benchmark_root=args.benchmark_root, regimes=args.regimes))
 
 
 if __name__ == "__main__":

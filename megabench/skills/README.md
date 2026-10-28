@@ -7,6 +7,8 @@ Method guidance for megakernel work, one skill per directory:
 - `megakernel-microbench`: study the slowest or furthest-from-floor phase in isolated
   microbenchmarks; these do not use rounds.
 - `blackwell-tensor-core-design`: evaluate Blackwell tensor-core designs.
+- `megakernel-regimes`: decide whether to specialize the kernel per batch size or KV length, using
+  trace-derived regimes (`./trace_regimes`).
 
 `make_agent_workspace.py` copies this directory into every workspace as `megakernel_skills/`.
 

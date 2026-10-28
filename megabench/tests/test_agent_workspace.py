@@ -23,7 +23,7 @@ from .test_glm53 import development as glm53_development
 
 
 MODULE_BY_FAMILY = TASK_MODULES
-SKILLS = ("megakernel-phase-profiling", "megakernel-microbench",
+SKILLS = ("megakernel-phase-profiling", "megakernel-microbench", "megakernel-regimes",
           "blackwell-tensor-core-design")
 MEGABENCH = Path(__file__).resolve().parents[1]
 
