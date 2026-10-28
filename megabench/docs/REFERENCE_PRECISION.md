@@ -97,7 +97,10 @@ For each floating output, with errors measured against the oracle:
 
 Each integer element must equal the BF16 reference or the oracle. A greedy
 token on an unsharded vocabulary may also be any token whose oracle logit is
-within `noise_factor` x the reference's RMS logit error of the oracle maximum.
+within a margin of the oracle maximum. The margin is the larger of
+`noise_factor` x the reference's RMS logit error and the max absolute error
+bound above for the logits, so logits that pass the band cannot fail on their
+greedy token. Batched logits are checked one row at a time.
 
 Over four seeds on the full dense case, alternative BF16 schedules (SDPA
 attention, FP32-weighted RMSNorm, exact matmul accumulation) had 0.84-1.22x

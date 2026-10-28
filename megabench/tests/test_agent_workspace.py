@@ -23,6 +23,9 @@ from .test_glm53 import development as glm53_development
 
 
 MODULE_BY_FAMILY = TASK_MODULES
+SKILLS = ("megakernel-phase-profiling", "megakernel-microbench", "megakernel-regimes",
+          "blackwell-tensor-core-design")
+MEGABENCH = Path(__file__).resolve().parents[1]
 
 
 class AgentWorkspaceTests(unittest.TestCase):
@@ -68,6 +71,12 @@ class AgentWorkspaceTests(unittest.TestCase):
                     self.assertTrue((project / "profile_candidate").is_file())
                     self.assertTrue((project / "timeline_candidate").is_file())
                     self.assertTrue((project / "timeline_probe.cuh").is_file())
+                    for skill in SKILLS:
+                        self.assertTrue(
+                            (project / "megakernel_skills" / skill / "SKILL.md").is_file())
+                    self.assertTrue((project / "megakernel_skills/megakernel-phase-profiling"
+                                     / "scripts/codegen_gate.py").is_file())
+                    self.assertIn("megakernel_skills/", (project / "TASK.md").read_text())
                     self.assertTrue((project / "sol_info").is_file())
                     self.assertTrue((project / ".git").is_dir())
                     python_files = sorted((project / "reference/megabench/tasks").rglob("*.py"))
@@ -82,6 +91,29 @@ class AgentWorkspaceTests(unittest.TestCase):
                          f"assert CASE.id == {case.id!r}"],
                         cwd=project, env=environment, capture_output=True, text=True)
                     self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_skills_have_frontmatter_and_vibesys_rules(self) -> None:
+        root = MEGABENCH / "skills"
+        rules = tomllib.loads((root / ".vibesys.toml").read_text())["rule"]
+        ruled = {rule["path"] for rule in rules}
+        found = sorted(path.parent for path in root.glob("*/SKILL.md"))
+        self.assertEqual({path.name for path in found}, set(SKILLS))
+        for path in found:
+            with self.subTest(skill=path.name):
+                text = (path / "SKILL.md").read_text()
+                self.assertTrue(text.startswith("---\n"))
+                front = dict(line.split(": ", 1) for line in text.split("---\n", 2)[1].splitlines())
+                self.assertEqual(front["name"], path.name)
+                self.assertTrue(str(front["description"]).strip())
+                self.assertIn(path.name, ruled)
+
+    def test_vibesys_example_config_uses_claude_with_implementer_role(self) -> None:
+        config = tomllib.loads(
+            (MEGABENCH / "integrations/vibesys-agent.example.toml").read_text())
+        self.assertEqual(config["agent"]["cli_provider"], "claude")
+        role = config["agent"]["roles"]["implementer"]
+        self.assertTrue(role["model"])
+        self.assertTrue(role["reasoning_effort"])
 
     def test_vibesys_task_uses_trusted_python_and_single_case(self) -> None:
         case = select_cases("p0")[0]

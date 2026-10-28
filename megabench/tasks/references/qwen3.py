@@ -94,3 +94,53 @@ class RefDecoder:
         logits = g("embed") @ _rms(x, g("fnorm"), cfg.eps)
         self.pos += 1
         return logits.float()
+
+
+def batched_step(cfg: Config, w: dict[str, torch.Tensor], tokens: torch.Tensor,
+                 kcache: torch.Tensor, vcache: torch.Tensor, lens: torch.Tensor,
+                 cos: torch.Tensor, sin: torch.Tensor):
+    """One decode step for B sequences with ragged cache lengths.
+
+    kcache/vcache are [L, B, S, KVH, D]; sequence b attends cache positions
+    below lens[b] and its own new key at position lens[b]. The caches are not
+    modified. Returns logits[B, vocab] fp32 and the new k/v [L, B, KVH, D].
+    """
+    D, QH, KVH = cfg.head_dim, cfg.q_heads, cfg.kv_heads
+    B = tokens.shape[0]
+    width = kcache.shape[2]  # static, so the step stays CUDA-graph capturable
+    lens = lens.to(tokens.device).long()
+    visible = torch.cat([torch.arange(width, device=tokens.device)[None] < lens[:, None],
+                         torch.ones(B, 1, dtype=torch.bool, device=tokens.device)], dim=1)
+    visible = visible[:, None, None, :]  # [B, 1, 1, T]
+    c, s = cos[lens][:, None], sin[lens][:, None]  # [B, 1, D]
+    x = w["embed"][tokens]  # [B, H]
+    k_new, v_new = [], []
+
+    for l in range(cfg.layers):
+        xn = _rms(x, w["ln1"][l], cfg.eps)
+        q = (xn @ w["wq"][l].T).view(B, QH, D)
+        k = (xn @ w["wk"][l].T).view(B, KVH, D)
+        v = (xn @ w["wv"][l].T).view(B, KVH, D)
+        q = _rms(q, w["qn"][l], cfg.eps)
+        k = _rms(k, w["kn"][l], cfg.eps)
+        q = q * c.to(q.dtype) + _rot_half(q) * s.to(q.dtype)
+        k = k * c.to(k.dtype) + _rot_half(k) * s.to(k.dtype)
+        k_new.append(k)
+        v_new.append(v)
+
+        keys = torch.cat([kcache[l, :, :width], k[:, None]], dim=1)  # [B, T, KVH, D]
+        vals = torch.cat([vcache[l, :, :width], v[:, None]], dim=1)
+        qg = q.view(B, KVH, QH // KVH, D)
+        scores = (qg @ keys.permute(0, 2, 3, 1)) * D ** -0.5  # [B, KVH, G, T]
+        scores = scores.masked_fill(~visible, -torch.inf)
+        probs = torch.nn.functional.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+        o = (probs @ vals.permute(0, 2, 1, 3)).reshape(B, QH * D)
+        x = x + o @ w["wo"][l].T
+
+        xn = _rms(x, w["ln2"][l], cfg.eps)
+        gate = xn @ w["wg"][l].T
+        up = xn @ w["wu"][l].T
+        x = x + (torch.nn.functional.silu(gate) * up) @ w["wd"][l].T
+
+    logits = _rms(x, w["fnorm"], cfg.eps) @ w["embed"].T
+    return logits.float(), torch.stack(k_new, 0), torch.stack(v_new, 0)

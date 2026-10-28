@@ -104,7 +104,7 @@ variables to `/raid/tmp`, which is absent inside it. Check
 
 NCU averages counters over the whole grid, so it cannot say which phase of a
 persistent or grid-synchronized kernel, or which block, sets the critical path.
-Every workspace also has `./timeline_candidate` and a copy of
+Every workspace also has `./timeline_candidate`, a `megakernel_skills/` copy of `megabench/skills/`, and a copy of
 `megabench/integrations/timeline_probe.cuh` for that question. The candidate
 opts in by exporting `build_timeline(case)` next to `build(case)`, returning
 `(run, event_names)`. `run(inputs)` launches a build with the header's probes

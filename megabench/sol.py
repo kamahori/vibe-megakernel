@@ -40,7 +40,8 @@ def estimate_case(case: Case, bandwidth_tb_s: float = DEFAULT_B200_BANDWIDTH_TB_
         return result | {"status": "unavailable",
                          "reason": f"no traffic model for {case.family}"}
     p = case.params
-    if p["batch"] != 1:
+    batched = case.family == "dense_step" and (p["batch"] != 1 or bool(case.contexts))
+    if p["batch"] != 1 and not batched:
         return result | {"status": "unavailable",
                          "reason": "traffic model currently supports batch one"}
 
@@ -48,6 +49,8 @@ def estimate_case(case: Case, bandwidth_tb_s: float = DEFAULT_B200_BANDWIDTH_TB_
     qdim, kdim = p["q_heads"] * head_dim, p["kv_heads"] * head_dim
     inter, vocab, context = p["intermediate"], p["vocab"], p["context"]
     steps = p["draft_depth"] + 1 if case.family == "spec_target_step" else 1
+    sequences = p["batch"]
+    cached = sum(case.contexts) if case.contexts else sequences * context
     projection_elements = layers * (
         qdim * hidden + 2 * kdim * hidden + hidden * qdim)
     mlp_elements = layers * 3 * inter * hidden
@@ -80,7 +83,7 @@ def estimate_case(case: Case, bandwidth_tb_s: float = DEFAULT_B200_BANDWIDTH_TB_
     else:
         add("attention_projection_weights", projection_elements * BF16_BYTES,
             "Q/K/V/output projection weights, read once")
-        cache_positions = layers * context
+        cache_positions = layers * cached
         if case.family == "moe_step":
             experts, topk = p["experts"], p["topk"]
             if topk > experts:
@@ -117,9 +120,9 @@ def estimate_case(case: Case, bandwidth_tb_s: float = DEFAULT_B200_BANDWIDTH_TB_
 
     add("old_kv_cache_reads", 2 * cache_positions * kdim * BF16_BYTES,
         "one read of the needed old K and V positions")
-    add("logits_writes", steps * vocab * FP32_BYTES,
+    add("logits_writes", sequences * steps * vocab * FP32_BYTES,
         "all required FP32 logits")
-    add("new_kv_writes", 2 * layers * steps * kdim * BF16_BYTES,
+    add("new_kv_writes", 2 * layers * sequences * steps * kdim * BF16_BYTES,
         "required BF16 K and V outputs, including masked speculative slots")
     if case.family == "spec_target_step":
         depth = p["draft_depth"]
@@ -128,7 +131,7 @@ def estimate_case(case: Case, bandwidth_tb_s: float = DEFAULT_B200_BANDWIDTH_TB_
             "input token/drafts, accepted/committed/cache scalars, "
             "committed tokens, and three target features")
     else:
-        add("token_io", 2 * INT64_BYTES, "input and next-token IDs")
+        add("token_io", 2 * sequences * INT64_BYTES, "input and next-token IDs")
 
     minimum_bytes = sum(item["bytes"] for item in components)
     floor_ms = minimum_bytes / (bandwidth_tb_s * 1e12) * 1e3

@@ -6,19 +6,24 @@ import argparse
 import hashlib
 import json
 import shlex
+import shutil
 import sys
 from pathlib import Path
 
-from ..cases import select_cases
+from dataclasses import replace
+
+from ..cases import load_regimes, select_cases
 from ..harness.runner import CONTRACT_FILES
 
 
 TRUSTED = (*CONTRACT_FILES, "megabench/integrations/vibesys_case_evaluator.py")
 
 
-def make_task(case_id: str, root: Path,
-              benchmark_root: Path | None = None) -> Path:
+def make_task(case_id: str, root: Path, benchmark_root: Path | None = None,
+              regimes: Path | None = None) -> Path:
     case = select_cases("all", [case_id])[0]
+    if regimes is not None:
+        case = replace(case, regimes=load_regimes(regimes))
     if not case.ready:
         raise ValueError(f"case is not ready: {case_id}")
     root = root.resolve()
@@ -31,6 +36,16 @@ def make_task(case_id: str, root: Path,
         f"if hashlib.sha256((ROOT / {name!r}).read_bytes()).hexdigest() != {digest!r}:\n"
         f"    raise RuntimeError('trusted benchmark changed: {name}')"
         for name, digest in hashes.items())
+    regimes_arg = ""
+    if regimes is not None:
+        # The regime set decides the score, so its hash is pinned like the trusted files.
+        shutil.copyfile(regimes, task / "regimes.json")
+        digest = hashlib.sha256((task / "regimes.json").read_bytes()).hexdigest()
+        checks += (
+            "\nREGIMES = Path(__file__).with_name('regimes.json')\n"
+            f"if hashlib.sha256(REGIMES.read_bytes()).hexdigest() != {digest!r}:\n"
+            "    raise RuntimeError('trusted regime set changed')")
+        regimes_arg = ", regimes_path=REGIMES"
     (task / "evaluator.py").write_text(
         "from pathlib import Path\nimport hashlib\nimport sys\n"
         f"ROOT = Path({str(trusted_root)!r})\n"
@@ -40,7 +55,7 @@ def make_task(case_id: str, root: Path,
         # Multi-GPU cases evaluate through torch.multiprocessing.spawn, whose
         # children re-run this file as __mp_main__; only the parent evaluates.
         "if __name__ == '__main__':\n"
-        f"    raise SystemExit(main({case_id!r}, sys.argv[1:]))\n")
+        f"    raise SystemExit(main({case_id!r}, sys.argv[1:]{regimes_arg}))\n")
     python = trusted_root / ".venv/bin/python"
     if not python.is_file():
         python = Path(sys.executable)
@@ -79,7 +94,10 @@ def make_task(case_id: str, root: Path,
         "files. Compute every required output from current inputs in at most "
         "one GPU kernel launch per rank, including communication; preserve all inputs. Do not use prior candidate "
         "code or other checkouts. The evaluator checks only this assigned "
-        "case against a protected benchmark outside this workspace.\n")
+        "case against a protected benchmark outside this workspace.\n" +
+        ("The case lists several regimes (see `regimes.json`): each shape is built "
+         "and checked separately, the score is the weighted result over all of "
+         "them, and the submission may specialize per regime.\n" if case.regimes else ""))
     return task
 
 
@@ -88,8 +106,9 @@ def main() -> None:
     parser.add_argument("--case", required=True)
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--benchmark-root", type=Path)
+    parser.add_argument("--regimes", type=Path)
     args = parser.parse_args()
-    print(make_task(args.case, args.root, args.benchmark_root))
+    print(make_task(args.case, args.root, args.benchmark_root, args.regimes))
 
 
 if __name__ == "__main__":

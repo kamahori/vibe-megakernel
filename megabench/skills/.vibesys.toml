@@ -1,0 +1,19 @@
+[[rule]]
+path = "megakernel-phase-profiling"
+backends = ["cuda"]
+domains = ["kernel-writing"]
+
+[[rule]]
+path = "megakernel-microbench"
+backends = ["cuda"]
+domains = ["kernel-writing"]
+
+[[rule]]
+path = "blackwell-tensor-core-design"
+backends = ["cuda"]
+domains = ["kernel-writing"]
+
+[[rule]]
+path = "megakernel-regimes"
+backends = ["cuda"]
+domains = ["kernel-writing"]
