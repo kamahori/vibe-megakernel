@@ -6,7 +6,10 @@ stay visible without entering a score.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+import json
+import math
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -38,6 +41,11 @@ class Case:
     # and requires integer outputs to match; "tilert" is the per-step output
     # check of harness.correctness.tilert_metrics.
     gate: str = "band"
+    # Per-sequence KV lengths already cached (batched decode); empty means
+    # every sequence holds params["context"] positions.
+    contexts: tuple[int, ...] = ()
+    # Weighted shapes a result is scored over; see regime_cases.
+    regimes: tuple[dict, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.id or not self.family or not self.model or not self.phase:
@@ -52,15 +60,67 @@ class Case:
             raise ValueError(f"invalid priority in {self.id}")
         if self.gate not in GATES:
             raise ValueError(f"invalid gate in {self.id}")
+        object.__setattr__(self, "contexts", tuple(self.contexts))
+        if self.contexts:
+            if "batch" not in self.params or "context" not in self.params:
+                raise ValueError(f"contexts need batch and context params in {self.id}")
+            if len(self.contexts) != self.params["batch"]:
+                raise ValueError(f"contexts length != batch in {self.id}")
+            if any(isinstance(c, bool) or not isinstance(c, int)
+                   or not 1 <= c <= self.params["context"] for c in self.contexts):
+                raise ValueError(f"contexts must be ints in [1, context] in {self.id}")
+        object.__setattr__(self, "regimes", tuple(_regime(r, self.id) for r in self.regimes))
+        ids = [r["id"] for r in self.regimes]
+        if len(set(ids)) != len(ids):
+            raise ValueError(f"duplicate regime ids in {self.id}")
+        for regime in self.regimes:
+            if not set(regime["params"]) <= set(self.params):
+                raise ValueError(f"regime {regime['id']} has unknown params in {self.id}")
+        self.regime_cases()
 
     def to_dict(self) -> dict:
         # Fields at their defaults are omitted, so adding them did not change
         # the contracts recorded by earlier results.
         values = asdict(self)
-        for name, default in (("checkpoint", ""), ("gate", "band")):
+        for name, default in (("checkpoint", ""), ("gate", "band"),
+                              ("contexts", ()), ("regimes", ())):
             if values[name] == default:
                 del values[name]
+        if "contexts" in values:
+            values["contexts"] = list(values["contexts"])
+        if "regimes" in values:
+            values["regimes"] = [
+                {k: list(v) if k == "contexts" else v for k, v in r.items()}
+                for r in values["regimes"]]
         return values
+
+    def regime_cases(self) -> list[tuple[dict, "Case"]]:
+        return [(r, replace(self, params=self.params | r["params"],
+                            contexts=tuple(r.get("contexts", ())), regimes=()))
+                for r in self.regimes]
+
+
+def _regime(raw: dict, case_id: str) -> dict:
+    if not isinstance(raw, dict) or not isinstance(raw.get("id"), str) or not raw["id"]:
+        raise ValueError(f"regime needs a string id in {case_id}")
+    weight = raw.get("weight")
+    if (isinstance(weight, bool) or not isinstance(weight, (int, float))
+            or not math.isfinite(weight) or weight <= 0):
+        raise ValueError(f"regime {raw['id']} needs a positive finite weight in {case_id}")
+    params = dict(raw.get("params", {}))
+    if any(isinstance(v, bool) or not isinstance(v, int) or v < 1 for v in params.values()):
+        raise ValueError(f"regime {raw['id']} params must be ints >= 1 in {case_id}")
+    out = {"id": raw["id"], "weight": float(weight), "params": params}
+    if "contexts" in raw:
+        out["contexts"] = tuple(raw["contexts"])
+    return out
+
+
+def load_regimes(path) -> tuple[dict, ...]:
+    data = json.loads(Path(path).read_text())
+    if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("regimes"), list):
+        raise ValueError(f"{path}: expected {{'version': 1, 'regimes': [...]}}")
+    return tuple(_regime(r, str(path)) for r in data["regimes"])
 
 
 GATES = ("band", "tilert")

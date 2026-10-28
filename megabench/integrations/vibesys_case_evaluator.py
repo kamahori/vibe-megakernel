@@ -6,7 +6,9 @@ import argparse
 import json
 from pathlib import Path
 
-from ..cases import select_cases
+from dataclasses import replace
+
+from ..cases import load_regimes, select_cases
 from ..harness.correctness import check_trials
 from ..harness.runner import _load_submission, evaluate_case
 
@@ -19,16 +21,22 @@ def benchmark_output(case_id: str, result: dict, score: float) -> dict:
     ``correctness`` and ``launch_audit``, so the result file omits the copies.
     """
     compact = {key: value for key, value in result.items() if key != "ranks"}
+    if "regimes" in compact:  # the per-sequence contexts are already in result["case"]
+        compact["regimes"] = [{key: value for key, value in row.items() if key != "contexts"}
+                              for row in compact["regimes"]]
     return {"case": case_id, "progress_score": score, "result": compact}
 
 
-def main(case_id: str, argv: list[str] | None = None) -> int:
+def main(case_id: str, argv: list[str] | None = None,
+         regimes_path: Path | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("accuracy", "benchmark"))
     parser.add_argument("--submission", type=Path, required=True)
     parser.add_argument("--output-json", type=Path)
     args = parser.parse_args(argv)
     case = select_cases("all", [case_id])[0]
+    if regimes_path is not None:
+        case = replace(case, regimes=load_regimes(regimes_path))
     submission = args.submission.resolve()
     if not submission.is_file():
         parser.error(f"missing submission: {submission}")
@@ -42,9 +50,12 @@ def main(case_id: str, argv: list[str] | None = None) -> int:
                 if result.get("correctness", {}).get("status") != "pass":
                     raise AssertionError(result.get("reason", result["status"]))
             else:
-                candidate = _load_submission(submission, case)
-                with torch.inference_mode():
-                    check_trials(case, candidate, "cuda:0", 3)
+                # Each regime shape is built and checked on its own.
+                for shape in ([sub for _, sub in case.regime_cases()]
+                              if case.regimes else [case]):
+                    candidate = _load_submission(submission, shape)
+                    with torch.inference_mode():
+                        check_trials(shape, candidate, "cuda:0", 3)
         except Exception as exc:
             print(json.dumps({"case": case_id, "status": "fail",
                               "reason": f"{type(exc).__name__}: {exc}"}))
