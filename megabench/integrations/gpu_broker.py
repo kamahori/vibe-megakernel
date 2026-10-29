@@ -28,7 +28,7 @@ import time
 import uuid
 from pathlib import Path
 
-SECRET_ENV = ("ANTHROPIC_API_KEY",)
+SECRET_ENV = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
 _HEADER = struct.Struct("!Q")
 
 

@@ -9,7 +9,9 @@ The agent must see the task and nothing from earlier work. This script builds:
   user config, memory, skills, plugins or transcripts are visible;
 - ``launch.sh``: runs on the host, not in a Slurm job. It starts
   ``gpu_broker`` and then VibeSys with ``env -i`` (only the listed variables
-  pass), the API key read from ``--api-key-file`` at launch, and explicit
+  pass), the agent credential read at launch (an API key from
+  ``--api-key-file``, or a ``claude setup-token`` subscription token from
+  ``--oauth-token-file``), and explicit
   skills, so preset skills outside the list do not load.
 
 VibeSys runs in a namespace without GPU devices. Each GPU use is a Slurm job:
@@ -69,6 +71,17 @@ def build_trusted(ref: str, trusted: Path, venv: Path) -> None:
     (trusted / ".venv").symlink_to(venv)
 
 
+# Variables that carry the agent credential; GPU jobs and gates drop both.
+CREDENTIAL_ENV = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+
+
+def credential(args) -> tuple[Path, str]:
+    """The credential file and the variable the Claude CLI reads it from."""
+    if args.oauth_token_file:
+        return args.oauth_token_file, "CLAUDE_CODE_OAUTH_TOKEN"
+    return args.api_key_file, "ANTHROPIC_API_KEY"
+
+
 def agent_env(args, run: Path, claude: Path, key: str) -> dict[str, str]:
     """The complete environment VibeSys and the agent see; nothing else passes."""
     project = run / args.case
@@ -77,7 +90,7 @@ def agent_env(args, run: Path, claude: Path, key: str) -> dict[str, str]:
         "LOGNAME": os.environ.get("USER", "agent"), "LANG": "C.UTF-8", "TERM": "dumb",
         "PATH": ":".join((str(args.venv.resolve() / "bin"), str(claude.parent), str(args.cuda / "bin"),
                           "/usr/local/bin", "/usr/bin", "/bin")),
-        "ANTHROPIC_API_KEY": key, "TMPDIR": "/tmp", "TMP": "/tmp", "TEMP": "/tmp",
+        credential(args)[1]: key, "TMPDIR": "/tmp", "TMP": "/tmp", "TEMP": "/tmp",
         "NCU_PATH": str(args.cuda / "bin/ncu"),
         "TORCH_EXTENSIONS_DIR": str(project / ".torch_extensions"),
         "TRITON_CACHE_DIR": str(project / ".cache/triton"),
@@ -102,7 +115,8 @@ def write_launch(args, run: Path, env: dict[str, str], srun: list[str]) -> None:
     for skill in args.skills:
         vibesys_args += ["--skills-dir", str(args.vibesys_skills / skill)]
     vibesys_args += ["--extra-skills", str(run / "trusted/megabench/skills")]
-    fixed = {k: v for k, v in env.items() if k != "ANTHROPIC_API_KEY"}
+    fixed = {k: v for k, v in env.items() if k not in CREDENTIAL_ENV}
+    key_file, key_env = credential(args)
     passed = " ".join(f"{k}={shlex.quote(v)}" for k, v in fixed.items())
     q = lambda path: shlex.quote(str(path))
     broker = [str(args.venv / "bin/python"), "-m", "megabench.integrations.gpu_broker", "serve",
@@ -113,7 +127,7 @@ def write_launch(args, run: Path, env: dict[str, str], srun: list[str]) -> None:
     timeout = args.timeout_seconds or args.rounds * 3600
     (run / "launch.sh").write_text(
         "#!/bin/bash\nset -euo pipefail\n"
-        f"key=$(<{q(args.api_key_file)})\n"
+        f"key=$(<{q(key_file)})\n"
         f"mkdir -p {q(env['TORCH_EXTENSIONS_DIR'])} "
         f"{q(env['TRITON_CACHE_DIR'])} {q(env['VIBESYS_STATE_HOME'])}\n"
         f"cd {q(project)}\n"
@@ -121,7 +135,7 @@ def write_launch(args, run: Path, env: dict[str, str], srun: list[str]) -> None:
         + " ".join(map(shlex.quote, broker)) + f" >> {q(run / 'gpu-broker.log')} 2>&1 &\n"
         "broker=$!\ntrap 'kill $broker 2>/dev/null || true' EXIT\n"
         f"for _ in $(seq 100); do [ -S {q(run / 'gpu/broker.sock')} ] && break; sleep 0.1; done\n"
-        f"env -i {passed} ANTHROPIC_API_KEY=\"$key\" \\\n  "
+        f"env -i {passed} {key_env}=\"$key\" \\\n  "
         + " ".join(NO_GPU) + " timeout --signal=TERM --kill-after=60s "
         f"{timeout}s {q(args.vibesys)} "
         + " ".join(shlex.quote(a) for a in vibesys_args) + "\n")
@@ -135,7 +149,7 @@ def preflight(args, run: Path, env: dict[str, str], claude: Path) -> bool:
     forbid = [str(home / ".claude"), str(home / ".claude.json"), *map(str, args.forbid)]
     forbid += [str(repo / name) for repo in sorted(repos) for name in ("megabench", "README.md")]
     forbid += [str(run / "trusted/megabench" / name) for name in DROP_DIRS]
-    forbid += [*NO_GPU_PATHS, str(run / "state"), str(args.api_key_file.resolve())]
+    forbid += [*NO_GPU_PATHS, str(run / "state"), str(credential(args)[0].resolve())]
     require = [str(run / args.case / "TASK.md"), str(run / "trusted/megabench/cases.py"),
                str(args.venv.resolve() / "bin/python"), str(run / "gpu")]
     python = args.vibesys.parent / "python"
@@ -161,8 +175,12 @@ def main() -> int:
     parser.add_argument("--case", required=True)
     parser.add_argument("--run-dir", type=Path, required=True,
                         help="new directory, outside any directory of earlier work")
-    parser.add_argument("--api-key-file", type=Path, required=True,
+    secret = parser.add_mutually_exclusive_group(required=True)
+    secret.add_argument("--api-key-file", type=Path,
                         help="file with the API key for the agent account; read at launch")
+    secret.add_argument("--oauth-token-file", type=Path,
+                        help="file with a `claude setup-token` token for the agent's "
+                             "subscription account; read at launch")
     parser.add_argument("--vibesys", type=Path, required=True, help="vibesys executable")
     parser.add_argument("--vibesys-skills", type=Path, required=True,
                         help="VibeSys preset skills root (resources/skills)")
@@ -187,9 +205,9 @@ def main() -> int:
     run = args.run_dir.resolve()
     if run.exists():
         parser.error(f"{run} exists; use a new directory for each run")
-    key_file = args.api_key_file.resolve()
+    key_file = credential(args)[0].resolve()
     if not key_file.is_file() or key_file.stat().st_mode & 0o077:
-        parser.error("--api-key-file must be a file readable only by its owner (chmod 600)")
+        parser.error("the credential file must be readable only by its owner (chmod 600)")
     if key_file.is_relative_to(run):
         parser.error("keep the key file outside the run directory")
     claude = shutil.which("claude")
@@ -205,7 +223,7 @@ def main() -> int:
     srun = srun_command(args, gpus)
     # Gates keep cached baseline timings in state/, which the agent cannot see;
     # the shared HOME would let the agent edit them.
-    gate = ["env", "-u", "ANTHROPIC_API_KEY",
+    gate = ["env", *(f"-u{name}" for name in CREDENTIAL_ENV),
             f"MEGABENCH_BASELINE_CACHE={run / 'state/baseline-cache'}", *srun, "--job-name=vs-gate"]
     command = [str(run / "trusted/.venv/bin/python"), "-m",
                "megabench.integrations.make_agent_workspace", "--case", args.case,
@@ -224,7 +242,7 @@ def main() -> int:
     env = agent_env(args, run, Path(claude), key="")
     # The sandbox of each GPU job; it holds no key.
     (run / "gpu-spec.json").write_text(json.dumps(
-        {"env": {k: v for k, v in env.items() if k != "ANTHROPIC_API_KEY"},
+        {"env": {k: v for k, v in env.items() if k not in CREDENTIAL_ENV},
          "claude": str(claude), "project": str(run / args.case)}))
     write_launch(args, run, env, srun)
     if not preflight(args, run, env, Path(claude)):
