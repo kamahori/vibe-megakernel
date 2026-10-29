@@ -203,7 +203,10 @@ def main() -> int:
     build_trusted(args.ref, run / "trusted", args.venv.resolve())
     gpus = select_cases("all", [args.case])[0].gpus
     srun = srun_command(args, gpus)
-    gate = ["env", "-u", "ANTHROPIC_API_KEY", *srun, "--job-name=vs-gate"]
+    # Gates keep cached baseline timings in state/, which the agent cannot see;
+    # the shared HOME would let the agent edit them.
+    gate = ["env", "-u", "ANTHROPIC_API_KEY",
+            f"MEGABENCH_BASELINE_CACHE={run / 'state/baseline-cache'}", *srun, "--job-name=vs-gate"]
     command = [str(run / "trusted/.venv/bin/python"), "-m",
                "megabench.integrations.make_agent_workspace", "--case", args.case,
                "--output", str(run / args.case), "--agent", "vibesys",
