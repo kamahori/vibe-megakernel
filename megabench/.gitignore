@@ -10,3 +10,4 @@ P0_TRIAL.md
 *.log
 *.jsonl
 *.ncu-rep
+!primdb/seed.jsonl
