@@ -8,7 +8,9 @@ tagged P1, P2, ... It writes them to progress/microbench/items/<round>.md.
 progress/microbench/answers/<round>.md exist, the answers name every item tag, and
 progress/engine-map.md mentions the round (its status was reviewed this round), and each question
 that progress/microbench/open.md carries open from an earlier round was measured this round (rows
-that `./primdb add` stamped with the round) or closed with row ids; one may be deferred. Without a
+that `./primdb add` stamped with the round) or closed with row ids; one may be deferred. The
+carried question that has gone longest without a matched measurement (rows added with
+`--question Q<n> --conditions matched`) needs one this round. Without a
 plan there is nothing to check. ./check_candidate runs `check` first and stops on a failure.
 """
 
@@ -109,19 +111,49 @@ def _section(text: str, tag: str) -> str:
     return text[match.end():match.end() + end.start()] if end else text[match.end():]
 
 
-def rows_of_round(workspace: Path, round_name: str) -> set[str]:
-    """Ids of the rows that `./primdb add` stamped with this round."""
+def local_sources(workspace: Path) -> list[tuple[str, dict]]:
+    """(id, source) of each row that `./primdb add` put in the workspace."""
     path = workspace / MICROBENCH / "primdb_local.jsonl"
-    ids = set()
+    out = []
     if path.is_file():
         for line in path.read_text().splitlines():
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if row.get("source", {}).get("round") == round_name:
-                ids.add(row.get("id"))
-    return ids
+            out.append((row.get("id"), row.get("source", {})))
+    return out
+
+
+def rows_of_round(workspace: Path, round_name: str) -> set[str]:
+    """Ids of the rows that `./primdb add` stamped with this round."""
+    return {i for i, s in local_sources(workspace) if s.get("round") == round_name}
+
+
+def stalest_unmatched(workspace: Path, round_name: str) -> dict | None:
+    """The carried open question that has gone longest without a matched measurement.
+
+    A matched measurement is a row added with `./primdb add --question Q<n> --conditions matched`,
+    or an earlier answers section for the question whose confidence says "under matching".
+    Questions with none count from the round they were opened; ties go to the ledger order
+    (largest estimate first).
+    """
+    last = {}
+    for _, s in local_sources(workspace):
+        if s.get("conditions") == "matched" and s.get("round", "") < round_name:
+            tag = s.get("question")
+            last[tag] = max(last.get(tag, ""), s.get("round", ""))
+    for path in (workspace / MICROBENCH / "answers").glob("round-*.md"):
+        if path.stem >= round_name:
+            continue
+        text = path.read_text()
+        for entry in ledger(workspace):
+            if re.search(r"(?im)confidence\W[^\n]*\bunder matching\b", _section(text, entry["tag"])):
+                last[entry["tag"]] = max(last.get(entry["tag"], ""), path.stem)
+    carried = [e for e in ledger(workspace) if e["status"] == "open" and e["opened"] < round_name]
+    if not carried:
+        return None
+    return min(carried, key=lambda e: last.get(e["tag"], e["opened"]))
 
 
 def check_ledger(workspace: Path, round_name: str, answers: str) -> list[str]:
@@ -130,7 +162,8 @@ def check_ledger(workspace: Path, round_name: str, answers: str) -> list[str]:
     The answers file has a section for each carried question that cites at least one row added
     this round; or the ledger closes or refutes the question with row ids. One carried question
     per round may instead be deferred, with `deferred:` and the reason in its section, but not
-    the same question in two rounds in a row.
+    the same question in two rounds in a row. The carried question that has gone longest without
+    a matched measurement must get one this round, unless it is the deferred one.
     """
     problems = []
     new_rows = rows_of_round(workspace, round_name)
@@ -158,6 +191,16 @@ def check_ledger(workspace: Path, round_name: str, answers: str) -> list[str]:
             f"open question {entry['tag']} (opened {entry['opened']}) has no rows measured in "
             f"{round_name}: give it a section in the answers that cites rows added this round "
             "with ./primdb add, or close or refute it in the ledger with row ids")
+    stale = stalest_unmatched(workspace, round_name)
+    if stale and stale["tag"] not in deferred:
+        matched = {i for i, s in local_sources(workspace) if s.get("round") == round_name
+                   and s.get("question") == stale["tag"] and s.get("conditions") == "matched"}
+        if not matched & set(ROW_ID.findall(_section(answers, stale["tag"]))):
+            problems.append(
+                f"open question {stale['tag']} has gone longest without a matched measurement: "
+                f"build the measurement its `settles it` line names, add the rows with "
+                f"./primdb add --question {stale['tag']} --conditions matched, and cite them in "
+                "its section (or defer it, once)")
     if len(deferred) > 1:
         problems.append(f"only one carried open question may be deferred per round, not "
                         f"{', '.join(deferred)}")

@@ -75,6 +75,11 @@ the data and what it shows, with its conditions.
    this round; `./check_candidate` refuses to run otherwise. You may defer one carried question
    per round, and not the same one two rounds in a row: write `deferred:` and the reason in its
    section.
+   Rows from other conditions keep a question alive but do not settle it. Each round, the carried
+   question that has gone longest without a matched measurement gets one: build the measurement
+   its `settles it` line names, and add its rows with
+   `./primdb add --question Q<n> --conditions matched <file>` (`--conditions other` for rows
+   that only hint). `./check_candidate` names that question when it is due.
 
 ## Comparing engines and designs
 
@@ -121,6 +126,10 @@ Open an entry for each answer whose confidence is not "measured under matching c
 for each comparison a plan or answer leaves unsettled. Change `open` to `closed` or `refuted` only
 with the row ids that settle it. Keep closed entries. Keep the entries ordered by estimate, the
 largest first.
+
+An estimate for a design that has no matched rows yet is a range. Its top assumes the design
+removes every phase, reduction and barrier that it could remove, priced with the measured costs
+of those phases and barriers; show that arithmetic. Narrow the range only with matched rows.
 
 ## Engine-map status entry
 

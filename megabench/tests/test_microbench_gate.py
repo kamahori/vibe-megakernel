@@ -76,12 +76,13 @@ class GateTests(unittest.TestCase):
             answers = "P1\n## Q1\nstill estimated\n"
             (mb / "answers/round-0003.md").write_text(answers)
             problems = check(ws)
-            self.assertEqual(len(problems), 1, problems)
-            self.assertIn("Q1", problems[0])
+            self.assertIn("Q1 (opened round-0001) has no rows", problems[0])
             # A row measured in an earlier round does not count; one stamped with this round does.
             local = mb / "primdb_local.jsonl"
             local.write_text(json.dumps({"id": "aaaaaaaaaa", "source": {"round": "round-0002"}}) + "\n"
-                             + json.dumps({"id": "bbbbbbbbbb", "source": {"round": "round-0003"}}) + "\n")
+                             + json.dumps({"id": "bbbbbbbbbb", "source": {"round": "round-0003",
+                                                                    "question": "Q1",
+                                                                    "conditions": "matched"}}) + "\n")
             (mb / "answers/round-0003.md").write_text("P1\n## Q1\nrow aaaaaaaaaa\n")
             self.assertIn("Q1", check(ws)[0])
             (mb / "answers/round-0003.md").write_text("P1\n## Q1\nrow bbbbbbbbbb\n## Q2\n")
@@ -96,6 +97,48 @@ class GateTests(unittest.TestCase):
             (mb / "open.md").write_text("## Q1 · closed · opened round-0001\n- by reasoning\n")
             self.assertIn("without row ids", check(ws)[0])
             (mb / "open.md").write_text("## Q1 · refuted · opened round-0001\n- cccccccccc\n")
+            self.assertEqual(check(ws), [])
+
+    def test_stalest_question_needs_a_matched_measurement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            mb = ws / "progress/microbench"
+            (ws / "progress/plans").mkdir(parents=True)
+            (ws / "progress/plans/round-0003.json").write_text(json.dumps({"reasoning": "Go."}))
+            for kind in ("requests", "answers"):
+                (mb / kind).mkdir(parents=True)
+                (mb / kind / "round-0003.md").write_text("- q\n")
+            (ws / "progress/engine-map.md").write_text("### round-0003\n")
+            (mb / "open.md").write_text("## Q1 · open · opened round-0001\n\n"
+                                        "## Q2 · open · opened round-0001\n")
+
+            def rows(*specs):
+                (mb / "primdb_local.jsonl").write_text("".join(
+                    json.dumps({"id": i, "source": {"round": r, "question": q, "conditions": c}})
+                    + "\n" for i, r, q, c in specs))
+
+            # Q1 had a matched row in round 2; Q2 never did, so Q2 is due.
+            rows(("aaaaaaaaaa", "round-0002", "Q1", "matched"),
+                 ("bbbbbbbbbb", "round-0003", "Q1", "other"),
+                 ("cccccccccc", "round-0003", "Q2", "other"))
+            (mb / "answers/round-0003.md").write_text("P1\n## Q1\nbbbbbbbbbb\n## Q2\ncccccccccc\n")
+            problems = check(ws)
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn("Q2 has gone longest", problems[0])
+            rows(("aaaaaaaaaa", "round-0002", "Q1", "matched"),
+                 ("bbbbbbbbbb", "round-0003", "Q1", "other"),
+                 ("cccccccccc", "round-0003", "Q2", "matched"))
+            self.assertEqual(check(ws), [])
+            # An earlier answer measured under matching conditions also counts.
+            rows(("bbbbbbbbbb", "round-0003", "Q1", "other"), ("cccccccccc", "round-0003", "Q2", "other"))
+            (mb / "answers/round-0002.md").write_text("## Q2\n- Confidence: measured under matching conditions.\n")
+            self.assertIn("Q1 has gone longest", check(ws)[0])
+            (mb / "answers/round-0002.md").unlink()
+            rows(("aaaaaaaaaa", "round-0002", "Q1", "matched"),
+                 ("bbbbbbbbbb", "round-0003", "Q1", "other"),
+                 ("cccccccccc", "round-0003", "Q2", "matched"))
+            # Deferring the due question is the round's one deferral.
+            (mb / "answers/round-0003.md").write_text("P1\n## Q1\nbbbbbbbbbb\n## Q2\ndeferred: x\n")
             self.assertEqual(check(ws), [])
 
     def test_open_questions_become_a_plan_claim(self) -> None:

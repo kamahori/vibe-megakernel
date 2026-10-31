@@ -135,6 +135,9 @@ def cmd_add(args, rows, out) -> int:
     stamp = {"s.file": args.file or "stdin"}
     if _round():
         stamp["s.round"] = _round()
+    if args.question:
+        stamp["s.question"] = args.question
+        stamp["s.conditions"] = args.conditions
     new = []
     with src:
         for line in src:
@@ -166,6 +169,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("id")
     s = sub.add_parser("add")
     s.add_argument("file", nargs="?")
+    s.add_argument("--question", help="the ledger question (Q<n>) these rows measure")
+    s.add_argument("--conditions", choices=("matched", "other"), default="other",
+                   help="matched: the conditions that the question's `settles it` line names")
     return p
 
 
