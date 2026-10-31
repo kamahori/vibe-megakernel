@@ -129,10 +129,14 @@ def check_ledger(workspace: Path, round_name: str, answers: str) -> list[str]:
 
     The answers file has a section for each carried question that cites at least one row added
     this round; or the ledger closes or refutes the question with row ids. One carried question
-    per round may instead be deferred, with `deferred:` and the reason in its section.
+    per round may instead be deferred, with `deferred:` and the reason in its section, but not
+    the same question in two rounds in a row.
     """
     problems = []
     new_rows = rows_of_round(workspace, round_name)
+    earlier = sorted(p for p in (workspace / MICROBENCH / "answers").glob("round-*.md")
+                     if p.stem < round_name)
+    previous = earlier[-1].read_text() if earlier else ""
     deferred = []
     for entry in ledger(workspace):
         if entry["status"] != "open":
@@ -145,6 +149,9 @@ def check_ledger(workspace: Path, round_name: str, answers: str) -> list[str]:
         if new_rows & set(ROW_ID.findall(section)):
             continue
         if re.search(r"(?im)^\W*deferred:\s*\S", section):
+            if re.search(r"(?im)^\W*deferred:\s*\S", _section(previous, entry["tag"])):
+                problems.append(f"open question {entry['tag']} was deferred in the previous "
+                                f"round too; measure it in {round_name}")
             deferred.append(entry["tag"])
             continue
         problems.append(

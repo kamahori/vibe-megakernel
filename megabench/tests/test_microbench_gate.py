@@ -89,6 +89,10 @@ class GateTests(unittest.TestCase):
             # One carried question may be deferred; closing needs rows.
             (mb / "answers/round-0003.md").write_text("P1\n## Q1\ndeferred: Q2 first\n")
             self.assertEqual(check(ws), [])
+            # Not the same question two rounds in a row.
+            (mb / "answers/round-0002.md").write_text("## Q1\ndeferred: later\n")
+            self.assertIn("deferred in the previous round", check(ws)[0])
+            (mb / "answers/round-0002.md").unlink()
             (mb / "open.md").write_text("## Q1 · closed · opened round-0001\n- by reasoning\n")
             self.assertIn("without row ids", check(ws)[0])
             (mb / "open.md").write_text("## Q1 · refuted · opened round-0001\n- cccccccccc\n")

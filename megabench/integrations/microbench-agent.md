@@ -73,7 +73,8 @@ the data and what it shows, with its conditions.
 6. Measure the open question with the largest estimated effect in the ledger, even when no
    request names it. Each question carried open from an earlier round needs rows measured in
    this round; `./check_candidate` refuses to run otherwise. You may defer one carried question
-   per round: write `deferred:` and the reason in its section.
+   per round, and not the same one two rounds in a row: write `deferred:` and the reason in its
+   section.
 
 ## Comparing engines and designs
 
