@@ -30,6 +30,40 @@ Before you design around a feature, measure the feature in isolation. Examples:
 Write each result in your notes with the conditions of the test. Use the results, not
 general claims, to choose a design.
 
+## Look up measured costs first (`./primdb`)
+
+The workspace has `./primdb`, a database of measured costs on this device. It covers
+primitive instructions (tcgen05 MMA by kind and shape, warp-level `mma.sync`, SIMT
+arithmetic, TMEM loads and stores, tcgen05 setup and commit costs), weight dequantization
+rates, synchronization, work distribution, and whole GEMMs measured standalone and as one
+phase of a persistent kernel. Each row records its conditions, how it was measured, and
+whether its output was checked.
+
+- `./primdb list` shows the families, their parameter ranges and their metrics.
+- `./primdb q <family|primitive> k=v ...` filters the rows; `k=a,b` and `k=lo..hi` work, and
+  `--near k=v` ranks the rows by distance to a shape that was not measured.
+- `./primdb compare gemm M=.. N=.. K=..` ranks the measured engines for the nearest GEMM shape.
+- `./primdb explain <id>` shows one row in full.
+- `./engine_map M=.. N=.. K=..` lists every legal instruction mapping of one matrix-multiply
+  phase (tcgen05 cta_group 1 and 2, normal and swap-AB; mma.sync; SIMT) with the useful fraction
+  after padding, the measured rate, and the nearest measured phase rows. The workspace has the
+  map for the traced phases of its case in `progress/engine-map.md`.
+
+Method:
+- Before you accept or reject an engine, a tile shape or a data path for a phase, write down
+  the instruction shapes and data types that the phase would issue. Then query the rows for
+  those shapes.
+- Turn the rows into a per-phase estimate: instructions per work unit × cycles per
+  instruction, against the bytes that the phase must move at the rate the rows show. The
+  larger of the two terms tells you which engine choice matters.
+- Consider the swap-AB and padded shapes too. Compare the cost per useful FMA, not the cost
+  per instruction.
+- Put the row ids and numbers that you used into your plan or your notes on rejected
+  alternatives. If a rejection does not cite numbers, it is a guess.
+- If no row matches your conditions (shape, data type, occupancy, cache state), measure the
+  point with `megakernel-microbench` before you rely on it. A row from a different shape or
+  occupancy is a hint, not a result.
+
 ## Options to evaluate
 
 Each item names an option and the questions that decide it.
