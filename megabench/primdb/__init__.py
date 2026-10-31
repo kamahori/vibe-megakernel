@@ -189,10 +189,11 @@ def compare_gemm(rows: list[dict], want: dict[str, float], filters: dict | None 
             notes.append(f"{family}: nearest measured shape {got} (asked {want})")
     by_engine: dict = {}
     for r in pool:
-        key = (r["family"], r["params"].get("engine"), r["params"].get("M"),
-               r["params"].get("N"), r["params"].get("K"), r["cond"].get("l2"))
+        key = (r["family"], r["params"].get("engine"), r["params"].get("tuned", True),
+               r["params"].get("M"), r["params"].get("N"), r["params"].get("K"), r["cond"].get("l2"))
         if key not in by_engine or r["metrics"]["us"] < by_engine[key]["metrics"]["us"]:
             by_engine[key] = r
     ranked = sorted(by_engine.values(),
-                    key=lambda r: (r["family"], r["cond"].get("l2", ""), r["metrics"]["us"]))
+                    key=lambda r: (r["family"], r["cond"].get("l2", ""),
+                                   r["params"].get("tuned", True) is False, r["metrics"]["us"]))
     return notes, ranked

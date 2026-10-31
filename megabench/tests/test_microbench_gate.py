@@ -60,6 +60,51 @@ class GateTests(unittest.TestCase):
             (mb / "answers/round-0002.md").write_text(" ".join(f"P{i}" for i in range(1, n + 1)))
             self.assertEqual(check(ws), [])
 
+    def test_ledger_needs_rows_measured_in_the_round(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            mb = ws / "progress/microbench"
+            (ws / "progress/plans").mkdir(parents=True)
+            (ws / "progress/plans/round-0003.json").write_text(json.dumps({"reasoning": "Go."}))
+            for kind in ("requests", "answers"):
+                (mb / kind).mkdir(parents=True)
+                (mb / kind / "round-0003.md").write_text("- q\n")
+            (ws / "progress/engine-map.md").write_text("### round-0003\n")
+            (mb / "open.md").write_text(
+                "# Open questions\n\n## Q1 · open · opened round-0001\n- settle: matched pair\n\n"
+                "## Q2 · open · opened round-0003\n- settle: new this round\n")
+            answers = "P1\n## Q1\nstill estimated\n"
+            (mb / "answers/round-0003.md").write_text(answers)
+            problems = check(ws)
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn("Q1", problems[0])
+            # A row measured in an earlier round does not count; one stamped with this round does.
+            local = mb / "primdb_local.jsonl"
+            local.write_text(json.dumps({"id": "aaaaaaaaaa", "source": {"round": "round-0002"}}) + "\n"
+                             + json.dumps({"id": "bbbbbbbbbb", "source": {"round": "round-0003"}}) + "\n")
+            (mb / "answers/round-0003.md").write_text("P1\n## Q1\nrow aaaaaaaaaa\n")
+            self.assertIn("Q1", check(ws)[0])
+            (mb / "answers/round-0003.md").write_text("P1\n## Q1\nrow bbbbbbbbbb\n## Q2\n")
+            self.assertEqual(check(ws), [])
+            # One carried question may be deferred; closing needs rows.
+            (mb / "answers/round-0003.md").write_text("P1\n## Q1\ndeferred: Q2 first\n")
+            self.assertEqual(check(ws), [])
+            (mb / "open.md").write_text("## Q1 · closed · opened round-0001\n- by reasoning\n")
+            self.assertIn("without row ids", check(ws)[0])
+            (mb / "open.md").write_text("## Q1 · refuted · opened round-0001\n- cccccccccc\n")
+            self.assertEqual(check(ws), [])
+
+    def test_open_questions_become_a_plan_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            (ws / "progress/plans").mkdir(parents=True)
+            (ws / "progress/plans/round-0002.json").write_text(json.dumps({"reasoning": "Go."}))
+            (ws / "progress/microbench").mkdir(parents=True)
+            (ws / "progress/microbench/open.md").write_text("## Q4 · open · opened round-0001\n")
+            check(ws)
+            items = (ws / "progress/microbench/items/round-0002.md").read_text()
+            self.assertIn("- P1: The plan chose its target over the open questions Q4", items)
+
 
 class EngineMapTests(unittest.TestCase):
     def setUp(self) -> None:

@@ -121,7 +121,17 @@ ENGINE_MAP_TASK = (
     "another shape.\n\n"
     "A plan that rejects an engine, an instruction shape or a data path cites engine-map or "
     "`./primdb` row ids for the costs it compares. A rejection without rows is an open question: "
-    "the microbench phase of the round measures it, and the result goes into the engine map.\n")
+    "the microbench phase of the round measures it, and the result goes into the engine map.\n\n"
+    "Compare engines as whole designs. Each engine allows its own decomposition of a phase "
+    "(where the accumulator lives, whether a CTA owns an output tile over the full reduction or "
+    "the reduction is split and reduced in a separate pass, which neighbouring phase runs in its "
+    "epilogue, how many grid barriers remain). A comparison that swaps the instruction inside "
+    "one engine's decomposition, or that compares rows under different conditions, does not "
+    "settle the choice. The share of profile samples in a phase's math does not either.\n\n"
+    "`progress/microbench/open.md` is the ledger of questions that measurements have not "
+    "settled yet, each with an estimated end-to-end effect. When you plan a round, read it with "
+    "the engine-map status. If the plan's target is not the open question with the largest "
+    "estimate, the plan says why, with rows for both estimates.\n")
 
 MICROBENCH_TASK = (
     "\n## Microbench phase (mandatory, each round)\n\n"
@@ -137,16 +147,19 @@ MICROBENCH_TASK = (
     "that would settle it.\n"
     "3. Give the request file to the `microbench` subagent (Agent tool, "
     "`subagent_type: microbench`). It answers your items and each plan claim P1, P2, ... from "
-    "`./primdb` first and runs a microbenchmark only when the rows do not answer an item. It "
-    "writes `progress/microbench/answers/<round>.md`, adds new measurements to the database, and "
-    "adds a status entry for the round to `progress/engine-map.md`.\n"
+    "`./primdb` rows that match the conditions and from microbenchmarks, and it measures the "
+    "largest question still open in `progress/microbench/open.md`. It writes "
+    "`progress/microbench/answers/<round>.md`, adds new measurements to the database, updates "
+    "the ledger, and adds a status entry for the round to `progress/engine-map.md`.\n"
     "4. Read the answers, then implement the plan. In your notes, cite the answers that changed "
     "or confirmed a design choice. If an answer contradicts a premise of the plan, still "
     "implement the plan, and report the contradiction with its row ids in your evidence and "
     "next step.\n\n"
     "`./check_candidate` refuses to run until the request and answer files exist for the "
-    "current round, the answers name every plan claim P1, P2, ..., and the engine map has a "
-    "status entry for the round. If a new question comes up during the round, append it to the "
+    "current round, the answers name every plan claim P1, P2, ..., the engine map has a "
+    "status entry for the round, and each ledger question carried open from an earlier round "
+    "has rows measured this round (one may be deferred with a reason). If a new question comes "
+    "up during the round, append it to the "
     "request file and give it to the subagent again. Keep these files under `progress/`: a "
     "revert to an earlier round keeps them.\n")
 
@@ -155,7 +168,15 @@ ROADMAP_ENGINES = (
     "- [open] For each dominant phase, choose the engine, the instruction shape and the data path "
     "from measured rows (`progress/engine-map.md`, `./primdb`), not from general claims. The item "
     "stays open while the engine map shows a phase that runs slower than a measured engine at its "
-    "shape by more than run-to-run noise, or a rejection that cites no rows.\n")
+    "shape by more than run-to-run noise, or a rejection that cites no rows.\n"
+    "- [open] Work through `progress/microbench/open.md` in order of estimated effect; a plan "
+    "that targets something else says why, with rows.\n")
+
+LEDGER = (
+    "# Open questions\n\n"
+    "Questions that measurements have not settled under matching conditions, the largest "
+    "estimated end-to-end effect first. Kept by the microbench phase; see the `microbench` "
+    "subagent for the entry format. An entry closes only with the row ids that settle it.\n")
 
 
 def _engine_map(project: Path, benchmark_root: Path, case: Case) -> str:
@@ -437,6 +458,7 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
     _write_tools(project, benchmark_root, case, gpu_socket)
     if agent == "vibesys":
         (project / "progress/microbench").mkdir(parents=True, exist_ok=True)
+        (project / "progress/microbench/open.md").write_text(LEDGER)
         (project / "progress/engine-map.md").write_text(_engine_map(project, benchmark_root, case))
         (project / "roadmap").mkdir(exist_ok=True)
         (project / "roadmap/engine-selection.md").write_text(ROADMAP_ENGINES)

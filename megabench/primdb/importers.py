@@ -419,12 +419,21 @@ def b8_terms(analyze: Path, results: Path) -> list[dict]:
     return rows
 
 
+# Benches whose kernels are simple, not tuned: their times bound the engine's cost from above.
+UNTUNED = {"gemm_small_tc"}
+UNTUNED_NOTE = ("a lower bound on what tcgen05 reaches here; ",
+                "its time is an upper bound on what a tuned tcgen05 kernel takes at this shape; ")
+
+
 def primbench(out: Path) -> list[dict]:
     """Rows printed by the primbench families (already in p./m./c. form)."""
     job = out.name
     rows = []
     for path in sorted(out.glob("*.jsonl")):
         for line in _json_lines(path):
+            if path.stem in UNTUNED:
+                line = {**line, "p.tuned": False,
+                        "note": line.get("note", "").replace(*UNTUNED_NOTE)}
             rows.append(normalize(line, **{"s.bench": f"megabench/primbench/{ {'tc_overhead': 'tc_mma'}.get(path.stem, path.stem) }.cu",
                                            "s.file": str(path), "s.job": job, "s.timer": "clock64"}))
     return rows

@@ -124,14 +124,23 @@ def cmd_explain(args, rows, out) -> int:
     return 0
 
 
+def _round() -> str | None:
+    """The VibeSys round a new row belongs to: the newest plan in the workspace, if any."""
+    plans = sorted(Path("progress/plans").glob("round-*.json"))
+    return plans[-1].stem if plans else None
+
+
 def cmd_add(args, rows, out) -> int:
     src = open(args.file) if args.file else sys.stdin
+    stamp = {"s.file": args.file or "stdin"}
+    if _round():
+        stamp["s.round"] = _round()
     new = []
     with src:
         for line in src:
             line = line.strip()
             if line.startswith("{"):
-                new.append(normalize(json.loads(line), **{"s.file": args.file or "stdin"}))
+                new.append(normalize(json.loads(line), **stamp))
     n = append(new, Path(args.local) if args.local else None)
     print(f"appended {n} rows to {args.local or local_path()}", file=out)
     return 0

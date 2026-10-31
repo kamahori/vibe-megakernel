@@ -54,15 +54,26 @@ Method:
   the instruction shapes and data types that the phase would issue. Then query the rows for
   those shapes.
 - Turn the rows into a per-phase estimate: instructions per work unit × cycles per
-  instruction, against the bytes that the phase must move at the rate the rows show. The
-  larger of the two terms tells you which engine choice matters.
+  instruction, against the bytes that the phase must move at the rate the rows show.
 - Consider the swap-AB and padded shapes too. Compare the cost per useful FMA, not the cost
   per instruction.
+- An engine choice is a design choice, not only a math rate. Each engine allows its own
+  decomposition: where the accumulator lives and how much it holds, how many operand bytes a
+  CTA can keep in flight (registers or a shared-memory stage ring) and so how many CTAs the
+  phase needs to reach the memory rate, whether a CTA (or a CTA pair) can own an output tile
+  over the full reduction or the reduction must be split across
+  CTAs, whether a split reduction needs its own pass and barrier, and whether the next
+  elementwise phase can run in the epilogue. Compare whole designs, each in its own
+  decomposition, measured at the real shape in a persistent kernel. A cost that one design
+  removes is not engine-independent.
+- The share of profile samples in the math of a phase does not bound what an engine change is
+  worth; the phases, reductions and barriers that the other design removes count too.
 - Put the row ids and numbers that you used into your plan or your notes on rejected
   alternatives. If a rejection does not cite numbers, it is a guess.
 - If no row matches your conditions (shape, data type, occupancy, cache state), measure the
   point with `megakernel-microbench` before you rely on it. A row from a different shape or
-  occupancy is a hint, not a result.
+  occupancy is a hint, not a result. A row with `tuned: false` is an upper bound on that
+  engine's time, not its cost.
 
 ## Options to evaluate
 

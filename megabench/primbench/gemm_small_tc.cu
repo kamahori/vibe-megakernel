@@ -374,7 +374,7 @@ int main(int argc, char** argv) {
                 .i("c.smem", (long long)c.smem)
                 .t("verified", sane).i("n_reps", (long long)reps[i].size()).f("cv", cv(reps[i]))
                 .s("s.bench", "primbench/gemm_small_tc.cu").s("s.timer", "cudaEvent_graph")
-                .s("note", std::string("Y[M][N] = X[M][K] W[N][K]^T, M = tokens padded to N=16/32/64 of the MMA; tcgen05.mma kind::f16 swap-AB (W rows = MMA M 128). " "Simple stage handshake, not tuned (no warp specialization, no overlap of the epilogue): a lower bound on what tcgen05 reaches here; compare primitive gemm.cutlass_tcgen05 for a tuned kernel. ") +
+                .s("note", std::string("Y[M][N] = X[M][K] W[N][K]^T, M = tokens padded to N=16/32/64 of the MMA; tcgen05.mma kind::f16 swap-AB (W rows = MMA M 128). " "Simple stage handshake, not tuned (no warp specialization, no overlap of the epilogue): its time is an upper bound on what a tuned tcgen05 kernel takes at this shape; compare primitive gemm.cutlass_tcgen05 for a tuned kernel. ") +
                                (wt == WI8 ? "int8 W with per-row fp32 scale in the fp32 epilogue; int8 -> bf16 by PRMT+2^23 FADD into swizzled smem before the MMA (kind::i8 not used). " : "") +
                                "partition / ks / reduction: see gemm_small_tc.cu header (CTA = contiguous range of the flattened k-iteration space). "
                                "us = CUDA-graph average over back-to-back launches (includes the inter-kernel gap, ~1-2 us; the atomic reduction adds a second kernel). " +

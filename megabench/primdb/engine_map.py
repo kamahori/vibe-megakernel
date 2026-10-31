@@ -156,7 +156,9 @@ def section(rows: list[dict], phase: dict, label: str = "") -> str:
             p = r["params"]
             lines.append(f"- {r['id']} {r['family']} engine={p.get('engine')} M={p.get('M')} "
                          f"N={p.get('N')} K={p.get('K')} l2={r['cond'].get('l2')} "
-                         f"us={r['metrics']['us']:.4g}")
+                         f"us={r['metrics']['us']:.4g}"
+                         + (" (untuned kernel: an upper bound on this engine's time)"
+                            if p.get("tuned") is False else ""))
     lines.append("")
     return "\n".join(lines)
 

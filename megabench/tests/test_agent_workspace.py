@@ -160,6 +160,8 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertIn("progress/engine-map.md", (project / "TASK.md").read_text())
             self.assertIn("## Status", (project / "progress/engine-map.md").read_text())
             self.assertTrue((project / "roadmap/engine-selection.md").is_file())
+            self.assertIn("# Open questions", (project / "progress/microbench/open.md").read_text())
+            self.assertIn("progress/microbench/open.md", (project / "TASK.md").read_text())
             # The microbench gate: a round with a plan needs its requests and answers, an
             # answer per plan claim, and an engine-map status entry for the round.
             (project / "progress/plans").mkdir(parents=True, exist_ok=True)
