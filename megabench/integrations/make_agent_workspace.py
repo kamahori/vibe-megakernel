@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -105,6 +106,76 @@ def _write_reference(project: Path, benchmark_root: Path, case: Case) -> str:
     return module
 
 
+# The microbench phase is mandatory: before the implementer checks a candidate for the
+# current VibeSys round, the round's requests and answers must exist, the answers must
+# address each claim of the plan that rules a design out, and the engine map must carry a
+# status for the round (megabench.integrations.microbench_gate).
+ENGINE_MAP_TASK = (
+    "\n## Engine map (read it before you choose or reject an engine)\n\n"
+    "`progress/engine-map.md` lists each matrix-multiply phase of this case with every legal "
+    "instruction mapping (tcgen05 with cta_group 1 or 2, normal or swap-AB; mma.sync; SIMT), "
+    "the fraction of useful work after padding, the measured rate and row id from `./primdb`, "
+    "and the measured GEMM or attention rows nearest the phase shape. Its status section records, "
+    "each round, the engine that each dominant phase uses, the time it takes, and the gap to the "
+    "best measured engine at that shape. `./engine_map M=.. N=.. K=..` prints the same table for "
+    "another shape.\n\n"
+    "A plan that rejects an engine, an instruction shape or a data path cites engine-map or "
+    "`./primdb` row ids for the costs it compares. A rejection without rows is an open question: "
+    "the microbench phase of the round measures it, and the result goes into the engine map.\n")
+
+MICROBENCH_TASK = (
+    "\n## Microbench phase (mandatory, each round)\n\n"
+    "Before you write code for a round, do these steps. `<round>` is the name of the newest "
+    "`progress/plans/round-*.json`.\n\n"
+    "1. Run `./microbench_items`. It lists the claims of the plan that reject an alternative "
+    "or rule a design out, as P1, P2, ... in `progress/microbench/items/<round>.md`.\n"
+    "2. Write `progress/microbench/requests/<round>.md`. List what you need to know before you "
+    "implement the plan: questions on the cost of a primitive, a shape or a data path; the "
+    "assumptions that the plan depends on; the points where you are not sure how to implement "
+    "an idea; and any performance regression from an earlier round that a microbenchmark could "
+    "explain. Make each item specific: the shape, the data type, the occupancy and the metric "
+    "that would settle it.\n"
+    "3. Give the request file to the `microbench` subagent (Agent tool, "
+    "`subagent_type: microbench`). It answers your items and each plan claim P1, P2, ... from "
+    "`./primdb` first and runs a microbenchmark only when the rows do not answer an item. It "
+    "writes `progress/microbench/answers/<round>.md`, adds new measurements to the database, and "
+    "adds a status entry for the round to `progress/engine-map.md`.\n"
+    "4. Read the answers, then implement the plan. In your notes, cite the answers that changed "
+    "or confirmed a design choice. If an answer contradicts a premise of the plan, still "
+    "implement the plan, and report the contradiction with its row ids in your evidence and "
+    "next step.\n\n"
+    "`./check_candidate` refuses to run until the request and answer files exist for the "
+    "current round, the answers name every plan claim P1, P2, ..., and the engine map has a "
+    "status entry for the round. If a new question comes up during the round, append it to the "
+    "request file and give it to the subagent again. Keep these files under `progress/`: a "
+    "revert to an earlier round keeps them.\n")
+
+ROADMAP_ENGINES = (
+    "# Engine selection per phase\n\n"
+    "- [open] For each dominant phase, choose the engine, the instruction shape and the data path "
+    "from measured rows (`progress/engine-map.md`, `./primdb`), not from general claims. The item "
+    "stays open while the engine map shows a phase that runs slower than a measured engine at its "
+    "shape by more than run-to-run noise, or a rejection that cites no rows.\n")
+
+
+def _engine_map(project: Path, benchmark_root: Path, case: Case) -> str:
+    """The seeded engine map of the case, or a stub when its phases were not traced."""
+    result = subprocess.run(
+        [str(_python(benchmark_root)), "-m", "megabench.primdb.engine_map", "--case", case.id],
+        cwd=project, capture_output=True, text=True,
+        env={**os.environ, "PYTHONPATH": str(benchmark_root)})
+    body = result.stdout if result.returncode == 0 else (
+        f"# Engine map: {case.id}\n\nThe phases of this case were not traced. Read the "
+        "reference, list its matrix multiplies, and add a section per phase with "
+        "`./engine_map M=.. N=.. K=..`.\n")
+    return body + (
+        "\n## Status\n\n"
+        "One entry per round, added by the microbench phase: `### round-NNNN`, then per dominant "
+        "phase the current engine and instruction shape, its measured time (timeline or profile), "
+        "the best measured engine at its shape with row ids, the gap, and open, closed or "
+        "refuted (with rows).\n")
+
+
 def _write_tools(project: Path, benchmark_root: Path, case: Case,
                  gpu_socket: Path | None = None) -> None:
     python = shlex.quote(str(_python(benchmark_root)))
@@ -127,7 +198,8 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case,
         gpu_run.chmod(0o755)
     check = project / "check_candidate"
     check.write_text(
-        common + "run_id=$(date -u +%Y%m%dT%H%M%S)-$$\n"
+        common + f"{python} -m megabench.integrations.microbench_gate check || exit 3\n"
+        "run_id=$(date -u +%Y%m%dT%H%M%S)-$$\n"
         f"exec {gpu}{python} -m megabench evaluate --case {case_id} "
         f"--submission {submission} --method local-check "
         "--session-id \"local-$run_id\" --device cuda:0 "
@@ -154,6 +226,22 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case,
     sol.write_text(
         common + f"exec {python} -m megabench sol --case {case_id} {regimes_flag}\"$@\"\n")
     sol.chmod(0o755)
+    local = shlex.quote(str(project / "progress/microbench/primdb_local.jsonl"))
+    for name, module, args in (("primdb", "megabench.primdb", ""),
+                               ("engine_map", "megabench.primdb.engine_map", ""),
+                               ("microbench_items", "megabench.integrations.microbench_gate",
+                                "items ")):
+        tool = project / name
+        tool.write_text(common + f"export PRIMDB_LOCAL={local}\n"
+                        f"exec {python} -m {module} {args}\"$@\"\n")
+        tool.chmod(0o755)
+    shutil.copytree(benchmark_root / "megabench/primbench", project / "primbench",
+                    ignore=shutil.ignore_patterns("__pycache__", "__init__.py", "*.sbatch"))
+    shutil.copy2(benchmark_root / "megabench/primdb/schema.md", project / "primbench/schema.md")
+    agents = project / ".claude/agents"
+    agents.mkdir(parents=True)
+    shutil.copy2(benchmark_root / "megabench/integrations/microbench-agent.md",
+                 agents / "microbench.md")
     trace = project / "trace_regimes"
     trace.write_text(
         common + f"exec {python} -m megabench.integrations.trace_regimes "
@@ -327,6 +415,10 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "result over all regimes, each shape is built and checked separately, and a "
         "submission may specialize per regime; `./trace_regimes` derives regimes from a "
         "production trace (see the `megakernel-regimes` skill). "
+        "Use `./primdb` to look up measured B200 costs of hardware primitives (tensor-core "
+        "and mma.sync instruction shapes, SIMT and dequant rates, TMEM moves, barriers, "
+        "standalone and in-kernel GEMMs) before you choose or reject a design; "
+        "`./primdb --help` lists the queries. "
         "Use `./sol_info --json` for an optimistic " +
         ("speed-of-light floor (the largest of the HBM, tensor-core and NVLink "
          "bounds) with byte and FLOP breakdowns" if work_model(case)
@@ -340,9 +432,14 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
            "on one GPU as a separate Slurm job and can wait in the queue first. "
            "`./check_candidate`, `./profile_candidate` and `./timeline_candidate` already "
            "use it. Keep inputs and outputs inside this workspace, because the job does "
-           "not see this shell's `/tmp`.\n" if gpu_socket is not None else ""))
+           "not see this shell's `/tmp`.\n" if gpu_socket is not None else "")
+        + (ENGINE_MAP_TASK + MICROBENCH_TASK if agent == "vibesys" else ""))
     _write_tools(project, benchmark_root, case, gpu_socket)
     if agent == "vibesys":
+        (project / "progress/microbench").mkdir(parents=True, exist_ok=True)
+        (project / "progress/engine-map.md").write_text(_engine_map(project, benchmark_root, case))
+        (project / "roadmap").mkdir(exist_ok=True)
+        (project / "roadmap/engine-selection.md").write_text(ROADMAP_ENGINES)
         shutil.copy2(benchmark_root / "megabench/integrations/vibesys-agent.example.toml",
                      project / "agent.toml")
         make_task(case_id, project, benchmark_root,

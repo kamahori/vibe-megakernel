@@ -137,7 +137,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 cwd=project, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             for executable in ("check_candidate", "profile_candidate", "timeline_candidate",
-                               "sol_info"):
+                               "sol_info", "primdb", "engine_map"):
                 with self.subTest(executable=executable):
                     result = subprocess.run(
                         [str(project / executable), "--help"],
@@ -149,6 +149,43 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["cases"][0]["case_id"],
                              case.id)
+            result = subprocess.run(
+                [str(project / "primdb"), "q", "tcgen05.mma", "--limit", "1", "--json"],
+                cwd=project, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["origin"], "seed")
+            self.assertTrue((project / ".claude/agents/microbench.md").is_file())
+            self.assertTrue((project / "primbench/schema.md").is_file())
+            self.assertIn("Microbench phase", (project / "TASK.md").read_text())
+            self.assertIn("progress/engine-map.md", (project / "TASK.md").read_text())
+            self.assertIn("## Status", (project / "progress/engine-map.md").read_text())
+            self.assertTrue((project / "roadmap/engine-selection.md").is_file())
+            # The microbench gate: a round with a plan needs its requests and answers, an
+            # answer per plan claim, and an engine-map status entry for the round.
+            (project / "progress/plans").mkdir(parents=True, exist_ok=True)
+            (project / "progress/plans/round-0001.json").write_text(json.dumps(
+                {"reasoning": "Rejected alternatives: - Tensor-core designs: premature here."}))
+            result = subprocess.run([str(project / "check_candidate"), "--help"],
+                                    cwd=project, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 3)
+            self.assertIn("progress/microbench/requests/round-0001.md is missing", result.stderr)
+            result = subprocess.run([str(project / "microbench_items")],
+                                    cwd=project, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("P1", result.stdout)
+            for kind in ("requests", "answers"):
+                (project / "progress/microbench" / kind).mkdir(parents=True)
+                (project / "progress/microbench" / kind / "round-0001.md").write_text("- item\n")
+            result = subprocess.run([str(project / "check_candidate"), "--help"],
+                                    cwd=project, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 3)
+            self.assertIn("P1", result.stderr)
+            (project / "progress/microbench/answers/round-0001.md").write_text("P1: rows ...\n")
+            with (project / "progress/engine-map.md").open("a") as f:
+                f.write("### round-0001\n")
+            result = subprocess.run([str(project / "check_candidate"), "--help"],
+                                    cwd=project, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_kernelagent_adapter_and_no_overwrite(self) -> None:
         case = select_cases("p0")[0]
