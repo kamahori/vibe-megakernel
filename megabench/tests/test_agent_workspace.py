@@ -165,6 +165,11 @@ class AgentWorkspaceTests(unittest.TestCase):
             # Every role reads the rule against a fallback to a design measured slower.
             task_text = (project / "TASK.md").read_text()
             self.assertIn("No fallback to a design measured slower", task_text)
+            self.assertIn("Per-phase timing and measured rounds", task_text)
+            for role in ("Candidate contract", "Implementer", "Orchestrator",
+                         "Forecast miss", "Judge"):
+                self.assertIn(f"**{role}.**", task_text.split("Per-phase timing")[1])
+            self.assertIn("in the foreground", task_text)
             for role in ("**Orchestrator.**", "**Implementer.**", "**Judge.**"):
                 self.assertIn(role, task_text)
             # mb_build runs in the caller's directory and refuses a build without -o.

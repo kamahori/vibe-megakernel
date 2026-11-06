@@ -224,6 +224,30 @@ NO_FALLBACK_TASK = (
     "build. Only the orchestrator can change the design of a phase, and only with matched "
     "rows that rank another design faster.\n")
 
+PHASE_TIMING_TASK = (
+    "\n## Per-phase timing and measured rounds\n\n"
+    "A round acts on measured time per phase, not on estimates of it. This rule binds every "
+    "role:\n\n"
+    "- **Candidate contract.** A candidate with more than one phase exports "
+    "`build_timeline(case)` next to `build` and `run`, with one event per phase. When a "
+    "change adds, removes, splits or merges a phase, the same change updates the events.\n"
+    "- **Implementer.** Run `./check_candidate` and `./timeline_candidate` in the foreground "
+    "and read their results. Do not end your turn while a GPU command that you started still "
+    "runs. Before you return a correct candidate, record its per-phase table from "
+    "`./timeline_candidate` in the round notes.\n"
+    "- **Orchestrator.** A plan that targets performance cites the parent's measured time for "
+    "each phase from its latest timeline, next to the matched proxy row or the floor of that "
+    "phase. It targets the phase with the largest gap between the two, or cites rows that "
+    "show why another target recovers more.\n"
+    "- **Forecast miss.** When the checked time is outside the range that the plan forecast, "
+    "the next plan first finds the phases that missed their forecast and by how much, from "
+    "the timeline, and only then names a design. A whole-kernel Nsight Compute capture adds "
+    "all phases together, so it comes after the timeline, on the phase that the timeline "
+    "ranks first.\n"
+    "- **Judge.** A multi-phase candidate without `build_timeline`, or with events that do not "
+    "match its phases, has a contract gap: send it back for the timeline, which does not "
+    "change the candidate.\n")
+
 ROADMAP_ENGINES = (
     "# Engine selection per phase\n\n"
     "- [open] For each dominant phase, choose the engine, the instruction shape and the data path "
@@ -520,7 +544,7 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "kernel feedback. The capture command must set `TMPDIR=/tmp`, "
         "`TMP=/tmp`, and `TEMP=/tmp` inside the agent sandbox and pass "
         "`--profile-from-start off` to capture the warmed marker window. "
-        "Use `./timeline_candidate` for optional per-block phase timing: export "
+        "Use `./timeline_candidate` for per-block phase timing: export "
         "`build_timeline(case)` returning `(run, event_names)`, where `run(inputs)` "
         "launches a build with probes from the workspace's `timeline_probe.cuh` "
         "compiled with `-DMEGABENCH_TIMELINE` and returns the filled `uint64` buffer "
@@ -554,7 +578,7 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
            "`./check_candidate`, `./profile_candidate` and `./timeline_candidate` already "
            "use it. Keep inputs and outputs inside this workspace, because the job does "
            "not see this shell's `/tmp`.\n" if gpu_socket is not None else "")
-        + (ENGINE_MAP_TASK + MICROBENCH_TASK + NO_FALLBACK_TASK if agent == "vibesys" else ""))
+        + (ENGINE_MAP_TASK + MICROBENCH_TASK + NO_FALLBACK_TASK + PHASE_TIMING_TASK if agent == "vibesys" else ""))
     _write_tools(project, benchmark_root, case, gpu_socket)
     if agent == "vibesys":
         (project / "progress/microbench").mkdir(parents=True, exist_ok=True)

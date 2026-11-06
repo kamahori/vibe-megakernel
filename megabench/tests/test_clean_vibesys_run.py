@@ -66,6 +66,7 @@ class AgentEnvironmentTests(unittest.TestCase):
             args.microbench_minutes = 40.0
             clean.write_launch(args, run, env, srun)
             self.assertIn("VIBESYS_MICROBENCH_MINUTES=40 ", (run / "launch.sh").read_text())
+            self.assertIn("VIBESYS_MEASUREMENT_DIR=reports ", (run / "launch.sh").read_text())
 
     def test_subscription_token_replaces_the_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

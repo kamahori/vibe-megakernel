@@ -135,7 +135,7 @@ def write_launch(args, run: Path, env: dict[str, str], srun: list[str]) -> None:
         + " ".join(map(shlex.quote, broker)) + f" >> {q(run / 'gpu-broker.log')} 2>&1 &\n"
         "broker=$!\ntrap 'kill $broker 2>/dev/null || true' EXIT\n"
         f"for _ in $(seq 100); do [ -S {q(run / 'gpu/broker.sock')} ] && break; sleep 0.1; done\n"
-        f"env -i {passed} {key_env}=\"$key\" "
+        f"env -i {passed} {key_env}=\"$key\" VIBESYS_MEASUREMENT_DIR=reports "
         + ("VIBESYS_MICROBENCH_PHASE=1 " if getattr(args, "microbench_phase", False) else "")
         + (f"VIBESYS_MICROBENCH_MINUTES={args.microbench_minutes:g} "
            if getattr(args, "microbench_minutes", None) else "") + "\\\n  "
