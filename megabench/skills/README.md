@@ -7,6 +7,8 @@ Method guidance for megakernel work, one skill per directory:
 - `megakernel-microbench`: study the slowest or furthest-from-floor phase in isolated
   microbenchmarks; these do not use rounds.
 - `blackwell-tensor-core-design`: evaluate Blackwell tensor-core designs.
+- `megakernel-stage-linking`: split a megakernel into contract-checked stage packages and link them
+  into one kernel (PipeLink-style; `scripts/plk_link.py`), with measured seam costs on MI300X.
 - `megakernel-regimes`: decide whether to specialize the kernel per batch size or KV length, using
   trace-derived regimes (`./trace_regimes`).
 

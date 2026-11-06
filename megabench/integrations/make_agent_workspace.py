@@ -17,6 +17,28 @@ from .make_vibesys_case_task import make_task
 
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[2]
+ROCM_PROFILE_TEXT = (
+    "Use `./profile_candidate` (rocprofv3) for optional kernel feedback: it always records "
+    "a kernel dispatch trace and stats (grid, VGPR/SGPR/LDS/scratch, duration) under "
+    "`reports/rocprof-*/`; add `--kernel REGEX --pmc COUNTER ...` for hardware counters "
+    "of the warmed call (list them with `rocprofv3-avail`; one counter pass per run) or "
+    "`--att` for a thread trace. Use `./trace_report` for one merged analysis: phase timeline, "
+    "dispatch resources, HBM bandwidth/L2/instruction-mix counters and PC-sampling hotspots by "
+    "instruction class (sleep/poll, s_waitcnt, VMEM, LDS, VALU), ranked as findings in "
+    "`reports/trace-*/report.md`. ")
+ROCM_HARDWARE_TEXT = (
+    "\n## Platform: AMD ROCm\n\n"
+    "The GPU is an AMD Instinct MI300X (gfx942, CDNA3): 304 CUs in 8 XCDs, 64-wide "
+    "wavefronts, 64 KiB LDS per CU, 256 MB Infinity Cache, 5.3 TB/s HBM3, 192 GB. "
+    "PyTorch is the ROCm build, so `torch.cuda` and `cuda:0` address the HIP device and "
+    "`torch.utils.cpp_extension` compiles `.cu` sources with hipcc (hipify). Compile "
+    "kernels with `--offload-arch=gfx942`; `hipcc`, `hiprtc` and Triton are available. "
+    "`timeline_probe.cuh` works under HIP: it stamps raw `wall_clock64()` ticks and the CU id, and "
+    "`./timeline_candidate` scales them by the queried wall-clock rate (see `clock.json`). For the codegen gate use "
+    "`megakernel_skills/megakernel-phase-profiling/scripts/codegen_gate_amd.py` "
+    "(llvm-objdump/llvm-readelf) in place of the cuobjdump-based `codegen_gate.py`; "
+    "for fine intervals inside one CU use `clock64()`/`__builtin_amdgcn_s_memtime()` "
+    "instead of PTX `clock64`. Nsight tools are not available.\n")
 REFERENCE_FILES = {
     "dense_step": ("dense.py", "common.py", "references/qwen3.py"),
     "moe_step": ("moe.py", "common.py", "references/qwen3.py",
@@ -105,7 +127,8 @@ def _write_reference(project: Path, benchmark_root: Path, case: Case) -> str:
     return module
 
 
-def _write_tools(project: Path, benchmark_root: Path, case: Case) -> None:
+def _write_tools(project: Path, benchmark_root: Path, case: Case,
+                 platform: str = "cuda") -> None:
     python = shlex.quote(str(_python(benchmark_root)))
     trusted = shlex.quote(str(benchmark_root))
     submission = shlex.quote(str(project / "submission.py"))
@@ -124,8 +147,9 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case) -> None:
         + regimes_flag + "--output \"reports/check-$run_id.jsonl\" \"$@\"\n")
     check.chmod(0o755)
     profile = project / "profile_candidate"
+    profiler = "rocprof_profile_case" if platform == "rocm" else "ncu_profile_case"
     profile.write_text(
-        common + f"exec {python} -m megabench.integrations.ncu_profile_case "
+        common + f"exec {python} -m megabench.integrations.{profiler} "
         f"--case {case_id} --submission {submission} \"$@\"\n")
     profile.chmod(0o755)
     timeline = project / "timeline_candidate"
@@ -141,8 +165,15 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case) -> None:
                     ignore=shutil.ignore_patterns("__pycache__"))
     sol = project / "sol_info"
     sol.write_text(
-        common + f"exec {python} -m megabench sol --case {case_id} {regimes_flag}\"$@\"\n")
+        common + f"exec {python} -m megabench sol --case {case_id} {regimes_flag}"
+        + ("--bandwidth-tb-s 5.3 " if platform == "rocm" else "") + "\"$@\"\n")
     sol.chmod(0o755)
+    if platform == "rocm":
+        report = project / "trace_report"
+        report.write_text(
+            common + f"exec {python} -m megabench.integrations.amd_trace_report "
+            f"--case {case_id} --submission {submission} \"$@\"\n")
+        report.chmod(0o755)
     trace = project / "trace_regimes"
     trace.write_text(
         common + f"exec {python} -m megabench.integrations.trace_regimes "
@@ -202,7 +233,7 @@ def _write_kernelagent_task(project: Path, benchmark_root: Path,
 
 def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
                    benchmark_root: Path = BENCHMARK_ROOT,
-                   regimes: Path | None = None) -> Path:
+                   regimes: Path | None = None, platform: str = "cuda") -> Path:
     if agent not in ("vibesys", "kernelagent", "plain"):
         raise ValueError(f"unsupported agent: {agent}")
     case = select_cases("all", [case_id])[0]
@@ -294,11 +325,12 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         + ("Use `test.py` for local correctness. " if agent == "kernelagent"
            else "") +
         "Use `./check_candidate` for local correctness, launch auditing, "
-        "and timing. " +
+        "and timing. "
+        + (ROCM_PROFILE_TEXT if platform == "rocm" else
         "Use `./profile_candidate` with Nsight Compute for optional "
         "kernel feedback. The capture command must set `TMPDIR=/tmp`, "
         "`TMP=/tmp`, and `TEMP=/tmp` inside the agent sandbox and pass "
-        "`--profile-from-start off` to capture the warmed marker window. "
+        "`--profile-from-start off` to capture the warmed marker window. ") +
         "Use `./timeline_candidate` for optional per-block phase timing: export "
         "`build_timeline(case)` returning `(run, event_names)`, where `run(inputs)` "
         "launches a build with probes from the workspace's `timeline_probe.cuh` "
@@ -310,7 +342,9 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "phases and time them (`megakernel-phase-profiling`), study the slowest or "
         "furthest-from-floor phase in isolated microbenchmarks (`megakernel-microbench`; "
         "these do not use rounds), and evaluate Blackwell tensor-core designs "
-        "(`blackwell-tensor-core-design`). "
+        + ("(`blackwell-tensor-core-design`, NVIDIA-specific; on AMD use the same method: "
+           "derive matrix-core (MFMA) facts by measurement). " if platform == "rocm" else
+           "(`blackwell-tensor-core-design`). ") +
         "When `regimes.json` (or the case) lists regimes, the score is the weighted "
         "result over all regimes, each shape is built and checked separately, and a "
         "submission may specialize per regime; `./trace_regimes` derives regimes from a "
@@ -321,9 +355,13 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
          else "HBM speed-of-light floor and byte breakdown") +
         "; pass `--result PATH` for "
         "the gap to a checked CUDA-event result where a traffic model is available. "
-        "The default bandwidth is 8 TB/s per B200. These commands load the trusted benchmark outside "
+        + ("The bandwidth here is 5.3 TB/s per MI300X. " if platform == "rocm" else
+           "The default bandwidth is 8 TB/s per B200. ") +
+        "These commands load the trusted benchmark outside "
         "this workspace; final grading is run separately.\n")
-    _write_tools(project, benchmark_root, case)
+    if platform == "rocm":
+        (project / "TASK.md").write_text((project / "TASK.md").read_text() + ROCM_HARDWARE_TEXT)
+    _write_tools(project, benchmark_root, case, platform)
     if agent == "vibesys":
         shutil.copy2(benchmark_root / "megabench/integrations/vibesys-agent.example.toml",
                      project / "agent.toml")
@@ -350,9 +388,14 @@ def main() -> None:
                         help="trusted benchmark snapshot used by workspace tools")
     parser.add_argument("--regimes", type=Path,
                         help="regime set (JSON) baked into the case and scoring")
+    parser.add_argument("--platform", choices=("cuda", "rocm"), default=None,
+                        help="GPU platform for the workspace tools (default: detect)")
     args = parser.parse_args()
+    platform = args.platform or ("rocm" if Path("/opt/rocm").exists()
+                                 and shutil.which("nvidia-smi") is None else "cuda")
     print(make_workspace(args.case, args.output, agent=args.agent,
-                         benchmark_root=args.benchmark_root, regimes=args.regimes))
+                         benchmark_root=args.benchmark_root, regimes=args.regimes,
+                         platform=platform))
 
 
 if __name__ == "__main__":

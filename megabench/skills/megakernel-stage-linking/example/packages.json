@@ -1,0 +1,3 @@
+{"scale": {"src": "scale.cu", "exports": ["stage_scale"], "needs": [], "provides": ["v"]},
+ "bias":  {"src": "bias.cu",  "exports": ["stage_bias"], "needs": ["v"], "consumes": ["v"], "provides": ["out"]},
+ "driver":{"src": "driver.cu","exports": ["toy"], "calls": ["stage_scale", "stage_bias"]}}

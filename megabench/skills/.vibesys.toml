@@ -17,3 +17,8 @@ domains = ["kernel-writing"]
 path = "megakernel-regimes"
 backends = ["cuda"]
 domains = ["kernel-writing"]
+
+[[rule]]
+path = "megakernel-stage-linking"
+backends = ["cuda"]
+domains = ["kernel-writing"]

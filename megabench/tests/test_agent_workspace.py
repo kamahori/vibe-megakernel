@@ -24,7 +24,7 @@ from .test_glm53 import development as glm53_development
 
 MODULE_BY_FAMILY = TASK_MODULES
 SKILLS = ("megakernel-phase-profiling", "megakernel-microbench", "megakernel-regimes",
-          "blackwell-tensor-core-design")
+          "blackwell-tensor-core-design", "megakernel-stage-linking")
 MEGABENCH = Path(__file__).resolve().parents[1]
 
 
@@ -163,6 +163,23 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertIn("to('cpu', copy=True)", test_source)
             with self.assertRaises(FileExistsError):
                 make_workspace(case.id, destination, agent="kernelagent")
+
+    def test_rocm_workspace_uses_amd_profilers_and_bandwidth(self) -> None:
+        case = select_cases("p0")[0]
+        with tempfile.TemporaryDirectory() as directory:
+            project = make_workspace(case.id, Path(directory) / "rocm", agent="plain", platform="rocm")
+            self.assertIn("rocprof_profile_case", (project / "profile_candidate").read_text())
+            self.assertIn("amd_trace_report", (project / "trace_report").read_text())
+            self.assertIn("--bandwidth-tb-s 5.3", (project / "sol_info").read_text())
+            task = (project / "TASK.md").read_text()
+            for text in ("MI300X", "gfx942", "rocprofv3", "./trace_report", "codegen_gate_amd.py"):
+                self.assertIn(text, task)
+            self.assertNotIn("Nsight Compute for optional", task)
+            self.assertTrue((project / "megakernel_skills/megakernel-phase-profiling"
+                             / "scripts/codegen_gate_amd.py").is_file())
+            cuda = make_workspace(case.id, Path(directory) / "cuda", agent="plain", platform="cuda")
+            self.assertFalse((cuda / "trace_report").exists())
+            self.assertIn("ncu_profile_case", (cuda / "profile_candidate").read_text())
 
 
 if __name__ == "__main__":
