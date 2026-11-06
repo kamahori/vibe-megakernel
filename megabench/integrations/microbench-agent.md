@@ -117,6 +117,13 @@ decomposition of the phase, and the comparison is between those decompositions.
   swap-AB GEMM). Check numerics against a reference first; then make the proxy fast enough that
   its time is not a tuning artefact (overlap loads with the MMA, deepen the stage ring) before
   you compare it.
+- Measure each arm against its own floor: the same proxy with the math removed (loads, the
+  reduction its design needs, and the barrier). An arm's excess over its floor is how far it is
+  from tuned. Rank engines only when each arm's excess is small next to the gap between the
+  arms. Until then the ranking stays open: spend the next measurement on the arm with the
+  largest excess, and find which part of its design (ingress, reduction, epilogue) holds the
+  excess, by removing the parts one at a time. Try the other ways that engine allows for that
+  part before you count it against the engine.
 
 ## Open-question ledger
 
