@@ -154,6 +154,10 @@ phase it changed, the time measured in the candidate (timeline or profile), the 
 which designs this round's rows promoted, pruned or left unknown. When a proxy and the
 in-kernel time differ, record the ratio, and use it for the next estimates.
 
+When the plan rebuilds a phase's data path, decomposition or pipeline inside a design that the
+tree does not rank best for that phase, treat that as a plan claim: build the rebuilt part into
+both designs and measure them as a matched pair in the same round.
+
 ## Engine-map status entry
 
 Add `### <round>` under Status in `progress/engine-map.md`. For each phase that the newest

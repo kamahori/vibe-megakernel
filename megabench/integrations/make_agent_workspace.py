@@ -138,7 +138,12 @@ ENGINE_MAP_TASK = (
     "that prune it) or unknown (with an estimate range). The microbench phase keeps it. A plan "
     "names the branch it pursues and, for each phase it changes, a forecast of the phase time "
     "with the rows it uses; the next round reconciles the forecast with the measured time. Pursue "
-    "the alive branch with the largest estimated gain, or say why not, with rows.\n")
+    "the alive branch with the largest estimated gain, or say why not, with rows.\n\n"
+    "A change that rebuilds a phase's data path, decomposition or pipeline builds it inside the "
+    "design that the matched rows rank best for that phase, not inside the design the candidate "
+    "happens to use, unless the plan cites matched rows that show the current design gains more "
+    "from the same rebuild. Work spent on a design that the rows rank lower is work that a later "
+    "round throws away.\n")
 
 MICROBENCH_TASK = (
     "\n## Microbench phase (mandatory, each round)\n\n"
