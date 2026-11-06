@@ -101,6 +101,14 @@ class MbBuildTest(unittest.TestCase):
         all_steps()  # both units; their objects are the same bytes, so the link is a hit
         self.assertEqual(runs(self.tmp), 7)
 
+    def test_a_quoted_flag_string_is_split(self):
+        from unittest import mock
+
+        from ..integrations import mb_build
+        with mock.patch.object(mb_build, "build", return_value=0) as fake:
+            mb_build.main(["--", "-O3 -std=c++17", "a.cu", "-o", "a"])
+        self.assertEqual(fake.call_args[0][0], ["-O3", "-std=c++17", "a.cu", "-o", "a"])
+
     def test_without_an_output_it_refuses(self):
         self.assertEqual(build([str(self.src / "a.cu")], self.cache, 30,
                                fake_nvcc(self.tmp)), 2)

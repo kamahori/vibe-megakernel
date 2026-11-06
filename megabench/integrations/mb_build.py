@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -177,6 +178,9 @@ def main(argv: list[str] | None = None) -> int:
     opts = parser.parse_args(own)
     if not nvcc_args:
         parser.error("give the nvcc arguments after --")
+    # A quoted flag string ("-O3 -std=c++17 ...") is split into its flags.
+    nvcc_args = [part for arg in nvcc_args
+                 for part in (shlex.split(arg) if arg.startswith("-") and " " in arg else [arg])]
     return build(nvcc_args, opts.cache_dir, opts.timeout)
 
 
