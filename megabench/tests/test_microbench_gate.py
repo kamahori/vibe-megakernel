@@ -222,22 +222,35 @@ class GateTests(unittest.TestCase):
             self.assertIn("build/round-0001.md is missing", check(ws, build=True)[0])
             (mb / "build").mkdir()
             record = mb / "build/round-0001.md"
-            head = "| phase | built | best | rows | reason |\n|---|---|---|---|---|\n"
-            record.write_text(head + "| E1 | alpha_one_plain | alpha_one_plain | 0000000000 | |\n")
+            head = "| phase | built | notes |\n|---|---|---|\n"
+            record.write_text(head + "| E1 qkv | beta_split | |\n")
+            # Rows without p.phase and m.us rank nothing.
             self.assertEqual(check(ws, build=True), [])
-            # A phase built in a lower-ranked family needs rows of the built design.
-            record.write_text(head + "| E1 | beta_split | alpha_one_plain | 0000000000 | easier |\n")
-            self.assertIn("rank alpha_one_plain best", check(ws, build=True)[0])
-            record.write_text(head + "| E1 | beta_split | alpha_one_plain | 0000000000 | "
-                              "0000000000 |\n")
-            self.assertIn("rank alpha_one_plain best", check(ws, build=True)[0])
-            record.write_text(head + "| E1 | beta_split | alpha_one_plain | 0000000000 | "
-                              "0000000001 is as fast |\n")
+
+            def timed(*rows):
+                (mb / "primdb_local.jsonl").write_text("".join(json.dumps(
+                    {"id": f"{k:010d}", "params": {"engine": e, "phase": ph}, "metrics": {"us": us},
+                     "source": {"round": "round-0001", "question": "Q1",
+                                "conditions": c}}) + "\n"
+                    for k, (e, ph, us, c) in enumerate(rows)))
+
+            timed(("alpha_one_plain", "E1", 4.0, "matched"), ("beta_split", "E1", 4.1, "matched"),
+                  ("gamma_ffma", "E1", 9.0, "matched"), ("oracle_load", "E1", 1.0, "matched"),
+                  ("beta_split", "E1", 2.0, "other"))
+            # The fastest matched row decides; an oracle and other-conditions rows do not.
+            self.assertIn("fastest matched row is 0000000000", check(ws, build=True)[0])
+            record.write_text(head + "| E1 qkv | alpha_one_tuned | |\n")
             self.assertEqual(check(ws, build=True), [])
-            record.write_text(head + "| E1 | alpha_one_plain | alpha_one_plain | none | |\n")
-            self.assertIn("cites no row id", check(ws, build=True)[0])
+            # A faster matched row of the built design changes the order.
+            timed(("alpha_one_plain", "E1", 4.0, "matched"), ("beta_split", "E1", 3.9, "matched"),
+                  ("gamma_ffma", "E1", 9.0, "matched"))
+            self.assertIn("(beta_split, 3.9 us)", check(ws, build=True)[0])
+            # Every phase with matched rows needs a row in the record.
+            timed(("alpha_one_plain", "E1", 4.0, "matched"), ("beta_split", "E2", 3.0, "matched"),
+                  ("gamma_ffma", "E1", 9.0, "matched"))
+            self.assertIn("no row for phase E2", " ".join(check(ws, build=True)))
             record.write_text(head)
-            self.assertIn("no phase rows", check(ws, build=True)[0])
+            self.assertIn("no phase rows", " ".join(check(ws, build=True)))
 
     def test_open_questions_become_a_plan_claim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -12,8 +12,8 @@ that `./primdb add` stamped with the round) or closed with row ids; one may be d
 carried question that has gone longest without a matched measurement (rows added with
 `--question Q<n> --conditions matched`) needs one this round. Without a
 plan there is nothing to check. ./check_candidate runs `check --build` first and stops on a failure:
---build also needs progress/microbench/build/<round>.md, the design each changed phase was built
-in against the design the matched rows rank best.
+--build also needs progress/microbench/build/<round>.md, the design each phase is built in; each
+engine-map phase with matched rows (p.phase, m.us) is built in the family of its fastest row.
 """
 
 from __future__ import annotations
@@ -283,68 +283,78 @@ def check_ledger(workspace: Path, round_name: str, answers: str) -> list[str]:
 
 
 BUILD = MICROBENCH / "build"
-BUILD_HELP = ("one table row per phase whose code this round wrote or changed: "
-              "| phase | design built | design ranked best | rows | reason |, where the ranked "
-              "design and its row ids come from this round's matched rows")
+BUILD_HELP = ("one table row per phase of the candidate: | phase | design built | notes |, where "
+              "the phase cell names the engine-map tags (E1, E2, ...) that the phase computes")
+PHASE_TAG = re.compile(r"\bE\d+\b")
 
 
-def known_rows(workspace: Path, round_name: str) -> set[str]:
-    """Row ids that the workspace database holds or this round's answers cite."""
-    ids = {i for i, _ in local_sources(workspace) if i}
-    answer = workspace / MICROBENCH / "answers" / f"{round_name}.md"
-    if answer.is_file():
-        ids |= set(ROW_ID.findall(answer.read_text()))
-    return ids
+def phase_ranking(workspace: Path) -> dict[str, tuple[str, float, str]]:
+    """For each engine-map phase tag, the fastest matched row: (design, us, id).
+
+    Rows count when `./primdb add` stored them with `--conditions matched`, a design
+    (not an oracle), `p.phase` and the phase time `m.us`.
+    """
+    path = workspace / MICROBENCH / "primdb_local.jsonl"
+    best: dict[str, tuple[str, float, str]] = {}
+    if not path.is_file():
+        return best
+    for line in path.read_text().splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (row.get("source") or {}).get("conditions") != "matched":
+            continue
+        design = design_of(row)
+        phase = (row.get("params") or {}).get("phase")
+        us = (row.get("metrics") or {}).get("us")
+        if not design or not phase or not isinstance(us, (int, float)) or us <= 0:
+            continue
+        for tag in PHASE_TAG.findall(str(phase)):
+            if tag not in best or us < best[tag][1]:
+                best[tag] = (design, float(us), row.get("id", "?"))
+    return best
 
 
 def check_build(workspace: Path, round_name: str) -> list[str]:
-    """The build record of the round: which design each changed phase was built in.
+    """The build record of the round: the design each phase of the candidate is built in.
 
-    A phase built in another engine family than the one this round's matched rows rank best
-    needs a reason that cites rows measured this round showing the built design is not slower.
+    Each engine-map phase with matched rows is built in the engine family of its fastest
+    matched row. A design that the implementer prefers becomes the fastest by its own matched
+    rows, not by a claim.
     """
     path = workspace / BUILD / f"{round_name}.md"
     rel = path.relative_to(workspace)
     if not path.is_file():
         return [f"{rel} is missing: write {BUILD_HELP}"]
     families = engine_families(workspace)
-    known = known_rows(workspace, round_name)
-    fresh = {}  # id -> design of each row measured this round
-    path_db = workspace / MICROBENCH / "primdb_local.jsonl"
-    if path_db.is_file():
-        for line in path_db.read_text().splitlines():
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if (row.get("source") or {}).get("round") == round_name and row.get("id"):
-                fresh[row["id"]] = design_of(row)
-    problems, phases = [], 0
+    ranking = phase_ranking(workspace)
+    built: dict[str, str] = {}
     for line in path.read_text().splitlines():
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if not line.lstrip().startswith("|") or len(cells) < 4:
+        if not line.lstrip().startswith("|") or len(cells) < 2:
             continue
         if _norm(cells[0]) in ("phase", "") or set(cells[0]) <= set("-: "):
             continue
-        phases += 1
-        phase, built, best, rows = cells[:4]
-        reason = cells[4] if len(cells) > 4 else ""
-        if not set(ROW_ID.findall(rows)) & known:
-            problems.append(f"{rel}: phase {phase} cites no row id of this round's answers or "
-                            "the workspace database for its ranking")
-        same = (family_of(built, families) == family_of(best, families)
-                if families and family_of(best, families) else _norm(built) == _norm(best))
-        cited = [fresh[i] for i in ROW_ID.findall(reason) if fresh.get(i)]
-        if not same and not any(family_of(d, families) == family_of(built, families)
-                                if families else _norm(d).startswith(_norm(built))
-                                for d in cited):
+        for tag in PHASE_TAG.findall(cells[0]):
+            built[tag] = cells[1]
+    problems = []
+
+    def family(name: str) -> str:
+        return (family_of(name, families) if families else None) or _norm(name)
+
+    for tag, (design, us, row_id) in sorted(ranking.items()):
+        if tag not in built:
+            problems.append(f"{rel} has no row for phase {tag}, which has matched rows: name the "
+                            "design the candidate computes it in")
+        elif family(built[tag]) != family(design):
             problems.append(
-                f"{rel}: phase {phase} is built in {built}, but the rows rank {best} best. A phase "
-                "built in a lower-ranked design is code that later rounds throw away: rebuild it "
-                "in the ranked design (the verified proxies under progress/microbench/bench/ are "
-                "a start), or give a reason that cites rows of the built design measured this "
-                "round showing that it is not slower for this phase")
-    if phases == 0:
+                f"{rel}: phase {tag} is built in {built[tag]}, but its fastest matched row is "
+                f"{row_id} ({design}, {us:g} us). Build {tag} in that design's engine family (the "
+                "verified proxies under progress/microbench/bench/ are a start). If you expect "
+                "your design to be faster, measure it under matched conditions with p.phase="
+                f"{tag}; its rows then decide")
+    if not built:
         problems.append(f"{rel} has no phase rows: write {BUILD_HELP}")
     return problems
 

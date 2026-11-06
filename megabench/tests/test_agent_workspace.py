@@ -194,9 +194,10 @@ class AgentWorkspaceTests(unittest.TestCase):
                                     cwd=project, capture_output=True, text=True)
             self.assertIn("Q1 has gone longest", result.stderr)
             (project / "progress/microbench/primdb_local.jsonl").write_text("".join(json.dumps(
-                {"id": i, "params": {"engine": e}, "source": {"round": "round-0001", "question": "Q1",
+                {"id": i, "params": {"engine": e, "phase": "E1"}, "metrics": {"us": us}, "source": {"round": "round-0001", "question": "Q1",
                                                               "conditions": "matched"}}) + "\n"
-                for i, e in (("eeeeeeeeee", "mma_sync_a"), ("eeeeeeeeef", "tcgen05_b"), ("eeeeeeeeeg", "simt_c"))))
+                for i, e, us in (("eeeeeeeeee", "mma_sync_a", 6.0), ("eeeeeeeeef", "tcgen05_b", 4.0),
+                                 ("eeeeeeeeeg", "simt_c", 20.0))))
             (project / "progress/microbench/answers/round-0001.md").write_text(
                 "P1 P2: rows ...\n## Q1\neeeeeeeeee\n")
             with (project / "progress/engine-map.md").open("a") as f:
@@ -216,14 +217,12 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertIn("build/round-0001.md is missing", result.stderr)
             (project / "progress/microbench/build").mkdir()
             (project / "progress/microbench/build/round-0001.md").write_text(
-                "| phase | built | best | rows | reason |\n|---|---|---|---|---|\n"
-                "| E1 | mma_sync_a | tcgen05_b | eeeeeeeeef | |\n")
+                "| phase | built | notes |\n|---|---|---|\n| E1 | mma_sync_a | |\n")
             result = subprocess.run([str(project / "check_candidate"), "--help"],
                                     cwd=project, capture_output=True, text=True)
-            self.assertIn("rank tcgen05_b best", result.stderr)
+            self.assertIn("fastest matched row is eeeeeeeeef", result.stderr)
             (project / "progress/microbench/build/round-0001.md").write_text(
-                "| phase | built | best | rows | reason |\n|---|---|---|---|---|\n"
-                "| E1 | tcgen05_b | tcgen05_b | eeeeeeeeef | |\n")
+                "| phase | built | notes |\n|---|---|---|\n| E1 | tcgen05_b | |\n")
             result = subprocess.run([str(project / "check_candidate"), "--help"],
                                     cwd=project, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)

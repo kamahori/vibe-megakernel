@@ -81,6 +81,10 @@ the data and what it shows, with its conditions.
    its `settles it` line names, and add its rows with
    `./primdb add --question Q<n> --conditions matched <file>` (`--conditions other` for rows
    that only hint). `./check_candidate` names that question when it is due.
+   A matched row that measures a whole phase of the engine map carries the phase tag of the
+   engine map as `p.phase` (for example the tag of its section) and the phase time in
+   microseconds as `m.us`, and names its design in `p.engine`. `./check_candidate` builds each
+   tagged phase in the design of its fastest matched row.
 
 The workspace seeds the ledger with one question opened `round-0000`: which engine design
 wins each dominant phase of the engine map. It cannot be deferred, so round 1 measures it:
@@ -125,10 +129,11 @@ decomposition of the phase, and the comparison is between those decompositions.
   you compare it.
 - Measure each arm against its own floor: the same proxy with the math removed (loads, the
   reduction its design needs, and the barrier). An arm's excess over its floor is how far it is
-  from tuned. Rank engines only when each arm's excess is small next to the gap between the
-  arms. Until then the ranking stays open: spend the next measurement on the arm with the
-  largest excess, and find which part of its design (ingress, reduction, epilogue) holds the
-  excess, by removing the parts one at a time. Try the other ways that engine allows for that
+  from tuned. The order of the designs at a phase is the order of their measured times under
+  matched conditions; the excess does not change that order, it says which arm to measure
+  next. Spend the next measurement on the arm with the largest excess, and find which part of
+  its design (ingress, reduction, epilogue) holds the excess, by removing the parts one at a
+  time. A tuned arm that becomes faster changes the order through its new rows. Try the other ways that engine allows for that
   part before you count it against the engine.
 
 ## Open-question ledger
