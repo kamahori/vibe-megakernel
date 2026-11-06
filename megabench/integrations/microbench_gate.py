@@ -234,6 +234,9 @@ def check(workspace: Path) -> list[str]:
             problems.append(f"{answer.relative_to(workspace)} does not answer plan claims "
                             f"{', '.join(missing)} (see {MICROBENCH}/items/{round_name}.md)")
         problems += check_ledger(workspace, round_name, text)
+    space = workspace / "progress/design-space.md"
+    if space.is_file() and f"### {round_name}" not in space.read_text():
+        problems.append(f"progress/design-space.md has no reconcile entry for {round_name}")
     engine_map = workspace / ENGINE_MAP
     if not engine_map.is_file() or round_name not in engine_map.read_text():
         problems.append(f"{ENGINE_MAP} has no status entry for {round_name}")

@@ -21,6 +21,7 @@ Outputs:
 - `progress/microbench/answers/<round>.md`;
 - a `### <round>` entry in the Status section of `progress/engine-map.md`;
 - the updated ledger `progress/microbench/open.md`;
+- the updated design tree `progress/design-space.md`;
 - new measured rows in the database (`./primdb add`, which stamps each row with the round).
 
 Measuring is your main job, not a fallback. Rows answer an item only under matching conditions;
@@ -134,6 +135,24 @@ largest first.
 An estimate for a design that has no matched rows yet is a range. Its top assumes the design
 removes every phase, reduction and barrier that it could remove, priced with the measured costs
 of those phases and barriers; show that arithmetic. Narrow the range only with matched rows.
+
+## Design space
+
+`progress/design-space.md` is the tree that the orchestrator plans from. Keep one section per
+dominant phase:
+
+    ## <phase and shape>
+    - D<n> · alive|pruned|unknown · <engine, decomposition, data path> · <measured or estimated
+      whole-phase time, with row ids> · <estimated end-to-end gain over the current design>
+
+List every design that the engine map and the hardware allow for the phase, not only the one
+the candidate uses. Mark a design pruned only with matched rows that show it slower; a design
+without matched rows is unknown, with an estimate range (see the ledger rule for ranges).
+
+Each round, add `### <round>` at the end: the branch the plan pursued, its forecast for each
+phase it changed, the time measured in the candidate (timeline or profile), the error, and
+which designs this round's rows promoted, pruned or left unknown. When a proxy and the
+in-kernel time differ, record the ratio, and use it for the next estimates.
 
 ## Engine-map status entry
 

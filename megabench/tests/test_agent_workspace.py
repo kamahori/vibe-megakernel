@@ -195,6 +195,12 @@ class AgentWorkspaceTests(unittest.TestCase):
                 "P1 P2: rows ...\n## Q1\neeeeeeeeee\n")
             with (project / "progress/engine-map.md").open("a") as f:
                 f.write("### round-0001\n")
+            self.assertIn("# Design space", (project / "progress/design-space.md").read_text())
+            result = subprocess.run([str(project / "check_candidate"), "--help"],
+                                    cwd=project, capture_output=True, text=True)
+            self.assertIn("design-space.md has no reconcile entry", result.stderr)
+            with (project / "progress/design-space.md").open("a") as f:
+                f.write("### round-0001\n")
             result = subprocess.run([str(project / "check_candidate"), "--help"],
                                     cwd=project, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)

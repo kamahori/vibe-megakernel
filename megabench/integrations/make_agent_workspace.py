@@ -132,7 +132,13 @@ ENGINE_MAP_TASK = (
     "`progress/microbench/open.md` is the ledger of questions that measurements have not "
     "settled yet, each with an estimated end-to-end effect. When you plan a round, read it with "
     "the engine-map status. If the plan's target is not the open question with the largest "
-    "estimate, the plan says why, with rows for both estimates.\n")
+    "estimate, the plan says why, with rows for both estimates.\n\n"
+    "`progress/design-space.md` is the design tree of this case: for each dominant phase, every "
+    "candidate design (engine, decomposition, data path) as alive, pruned (with the matched rows "
+    "that prune it) or unknown (with an estimate range). The microbench phase keeps it. A plan "
+    "names the branch it pursues and, for each phase it changes, a forecast of the phase time "
+    "with the rows it uses; the next round reconciles the forecast with the measured time. Pursue "
+    "the alive branch with the largest estimated gain, or say why not, with rows.\n")
 
 MICROBENCH_TASK = (
     "\n## Microbench phase (mandatory, each round)\n\n"
@@ -174,6 +180,12 @@ ROADMAP_ENGINES = (
     "shape by more than run-to-run noise, or a rejection that cites no rows.\n"
     "- [open] Work through `progress/microbench/open.md` in order of estimated effect; a plan "
     "that targets something else says why, with rows.\n")
+
+DESIGN_SPACE = (
+    "# Design space\n\n"
+    "Kept by the microbench phase; see the `microbench` subagent for the format. One section per "
+    "dominant phase with its candidate designs, then one `### round-NNNN` reconcile entry per "
+    "round.\n")
 
 LEDGER = (
     "# Open questions\n\n"
@@ -487,6 +499,7 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         engine_map = _engine_map(project, benchmark_root, case)
         (project / "progress/microbench/open.md").write_text(seeded_ledger(engine_map))
         (project / "progress/engine-map.md").write_text(engine_map)
+        (project / "progress/design-space.md").write_text(DESIGN_SPACE)
         (project / "roadmap").mkdir(exist_ok=True)
         (project / "roadmap/engine-selection.md").write_text(ROADMAP_ENGINES)
         shutil.copy2(benchmark_root / "megabench/integrations/vibesys-agent.example.toml",
