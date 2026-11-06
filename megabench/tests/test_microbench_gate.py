@@ -1,0 +1,205 @@
+from __future__ import annotations
+
+import io
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from megabench import primdb
+from megabench.integrations.microbench_gate import check, plan_items
+from megabench.primdb import engine_map, phases
+
+# Rejections of earlier VibeSys plans, in their words; none cites a measured row.
+PAST_REJECTIONS = [
+    {"reasoning": "No candidate exists. Rejected: starting directly with tcgen05/TMA designs, "
+                  "because at batch 1 the GEMVs have no tensor-core reuse and that complexity "
+                  "adds correctness risk. Rejected: aggressive phase fusion."},
+    {"reasoning": "Rejected alternatives: - Tuning CS alone keeps the per-item syncs. - A "
+                  "tensor-core QK/PV path is premature while latency and sync dominate. "
+                  "Keeping the other phases fixed keeps the attribution clean."},
+    {"reasoning": "The rejected alternatives are a tcgen05/tensor-core GEMM and per-phase "
+                  "tuning. A tensor-core GEMM does not pay off at b=1, where the step is pure "
+                  "GEMV and bandwidth-bound."},
+    {"reasoning": "Rejected alternatives: - Tensor-core mma: needs a multi-row tile "
+                  "restructure and still pays the same per-element dequant to bf16. - Dropping "
+                  "per-element bf16 rounding: risks breaking reference numerics."},
+]
+
+
+class PlanItemTests(unittest.TestCase):
+    def test_past_tensor_core_rejections_become_items(self) -> None:
+        for plan in PAST_REJECTIONS:
+            with self.subTest(plan=plan["reasoning"][:40]):
+                items = plan_items(plan)
+                self.assertTrue(any("tensor-core" in i or "Tensor-core" in i for i in items), items)
+                self.assertFalse(any(i.startswith("Keeping") for i in items), items)
+
+    def test_plan_without_rejections_has_no_items(self) -> None:
+        self.assertEqual(plan_items({"reasoning": "Profile first. The parent is HEAD."}), [])
+
+
+class GateTests(unittest.TestCase):
+    def test_gate_needs_files_answers_and_map_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            self.assertEqual(check(ws), [])
+            (ws / "progress/plans").mkdir(parents=True)
+            (ws / "progress/plans/round-0002.json").write_text(json.dumps(PAST_REJECTIONS[2]))
+            problems = check(ws)
+            self.assertEqual(len(problems), 3, problems)
+            items = (ws / "progress/microbench/items/round-0002.md").read_text()
+            self.assertIn("- P1:", items)
+            mb = ws / "progress/microbench"
+            for kind in ("requests", "answers"):
+                (mb / kind).mkdir(parents=True)
+                (mb / kind / "round-0002.md").write_text("- q\n")
+            (ws / "progress/engine-map.md").write_text("## Status\n### round-0002\n")
+            self.assertIn("P1", check(ws)[0])
+            n = items.count("- P")
+            (mb / "answers/round-0002.md").write_text(" ".join(f"P{i}" for i in range(1, n + 1)))
+            self.assertEqual(check(ws), [])
+
+    def test_ledger_needs_rows_measured_in_the_round(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            mb = ws / "progress/microbench"
+            (ws / "progress/plans").mkdir(parents=True)
+            (ws / "progress/plans/round-0003.json").write_text(json.dumps({"reasoning": "Go."}))
+            for kind in ("requests", "answers"):
+                (mb / kind).mkdir(parents=True)
+                (mb / kind / "round-0003.md").write_text("- q\n")
+            (ws / "progress/engine-map.md").write_text("### round-0003\n")
+            (mb / "open.md").write_text(
+                "# Open questions\n\n## Q1 · open · opened round-0001\n- settle: matched pair\n\n"
+                "## Q2 · open · opened round-0003\n- settle: new this round\n")
+            answers = "P1\n## Q1\nstill estimated\n"
+            (mb / "answers/round-0003.md").write_text(answers)
+            problems = check(ws)
+            self.assertIn("Q1 (opened round-0001) has no rows", problems[0])
+            # A row measured in an earlier round does not count; one stamped with this round does.
+            local = mb / "primdb_local.jsonl"
+            local.write_text(json.dumps({"id": "aaaaaaaaaa", "source": {"round": "round-0002"}}) + "\n"
+                             + json.dumps({"id": "bbbbbbbbbb", "source": {"round": "round-0003",
+                                                                    "question": "Q1",
+                                                                    "conditions": "matched"}}) + "\n")
+            (mb / "answers/round-0003.md").write_text("P1\n## Q1\nrow aaaaaaaaaa\n")
+            self.assertIn("Q1", check(ws)[0])
+            (mb / "answers/round-0003.md").write_text("P1\n## Q1\nrow bbbbbbbbbb\n## Q2\n")
+            self.assertEqual(check(ws), [])
+            # One carried question may be deferred; closing needs rows.
+            (mb / "answers/round-0003.md").write_text("P1\n## Q1\ndeferred: Q2 first\n")
+            self.assertEqual(check(ws), [])
+            # Not the same question two rounds in a row.
+            (mb / "answers/round-0002.md").write_text("## Q1\ndeferred: later\n")
+            self.assertIn("deferred in the previous round", check(ws)[0])
+            (mb / "answers/round-0002.md").unlink()
+            (mb / "open.md").write_text("## Q1 · closed · opened round-0001\n- by reasoning\n")
+            self.assertIn("without row ids", check(ws)[0])
+            (mb / "open.md").write_text("## Q1 · refuted · opened round-0001\n- cccccccccc\n")
+            self.assertEqual(check(ws), [])
+
+    def test_stalest_question_needs_a_matched_measurement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            mb = ws / "progress/microbench"
+            (ws / "progress/plans").mkdir(parents=True)
+            (ws / "progress/plans/round-0003.json").write_text(json.dumps({"reasoning": "Go."}))
+            for kind in ("requests", "answers"):
+                (mb / kind).mkdir(parents=True)
+                (mb / kind / "round-0003.md").write_text("- q\n")
+            (ws / "progress/engine-map.md").write_text("### round-0003\n")
+            (mb / "open.md").write_text("## Q1 · open · opened round-0001\n\n"
+                                        "## Q2 · open · opened round-0001\n")
+
+            def rows(*specs):
+                (mb / "primdb_local.jsonl").write_text("".join(
+                    json.dumps({"id": i, "source": {"round": r, "question": q, "conditions": c}})
+                    + "\n" for i, r, q, c in specs))
+
+            # Q1 had a matched row in round 2; Q2 never did, so Q2 is due.
+            rows(("aaaaaaaaaa", "round-0002", "Q1", "matched"),
+                 ("bbbbbbbbbb", "round-0003", "Q1", "other"),
+                 ("cccccccccc", "round-0003", "Q2", "other"))
+            (mb / "answers/round-0003.md").write_text("P1\n## Q1\nbbbbbbbbbb\n## Q2\ncccccccccc\n")
+            problems = check(ws)
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn("Q2 has gone longest", problems[0])
+            rows(("aaaaaaaaaa", "round-0002", "Q1", "matched"),
+                 ("bbbbbbbbbb", "round-0003", "Q1", "other"),
+                 ("cccccccccc", "round-0003", "Q2", "matched"))
+            self.assertEqual(check(ws), [])
+            # An earlier answer measured under matching conditions also counts.
+            rows(("bbbbbbbbbb", "round-0003", "Q1", "other"), ("cccccccccc", "round-0003", "Q2", "other"))
+            (mb / "answers/round-0002.md").write_text("## Q2\n- Confidence: measured under matching conditions.\n")
+            self.assertIn("Q1 has gone longest", check(ws)[0])
+            (mb / "answers/round-0002.md").unlink()
+            rows(("aaaaaaaaaa", "round-0002", "Q1", "matched"),
+                 ("bbbbbbbbbb", "round-0003", "Q1", "other"),
+                 ("cccccccccc", "round-0003", "Q2", "matched"))
+            # Deferring the due question is the round's one deferral.
+            (mb / "answers/round-0003.md").write_text("P1\n## Q1\nbbbbbbbbbb\n## Q2\ndeferred: x\n")
+            self.assertEqual(check(ws), [])
+
+    def test_open_questions_become_a_plan_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            (ws / "progress/plans").mkdir(parents=True)
+            (ws / "progress/plans/round-0002.json").write_text(json.dumps({"reasoning": "Go."}))
+            (ws / "progress/microbench").mkdir(parents=True)
+            (ws / "progress/microbench/open.md").write_text("## Q4 · open · opened round-0001\n")
+            check(ws)
+            items = (ws / "progress/microbench/items/round-0002.md").read_text()
+            self.assertIn("- P1: The plan chose its target over the open questions Q4", items)
+
+
+class EngineMapTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.seed = Path(self.tmp.name) / "seed.jsonl"
+        rows = [primdb.normalize({"family": "tc_mma", "primitive": "tcgen05.mma", "p.kind": "f16",
+                                  "p.a_src": "smem", "p.cta_group": 1, "p.M": 128, "p.N": n,
+                                  "m.fma_per_clk_sm": 32.0 * n, "c.sm_clock_mhz": 1900.0})
+                for n in (16, 64, 256)]
+        rows.append(primdb.normalize({"family": "mma_sync", "primitive": "mma.sync",
+                                      "p.shape": "m16n8k16", "m.fma_per_clk_sm": 1000.0}))
+        rows.append(primdb.normalize({"family": "simt", "primitive": "simt.ffma",
+                                      "m.flop_per_clk_sm": 256.0}))
+        primdb.append(rows, self.seed)
+        self.rows = primdb.load(self.seed, Path(self.tmp.name) / "none.jsonl")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_mappings_pad_tokens_to_legal_shapes(self) -> None:
+        by = {(m["engine"], m["orientation"], m["instr"]): m
+              for m in engine_map.mappings(self.rows, 50, 4096, "bfloat16")}
+        swap = by[("tcgen05", "cta_group 1, swap-AB (tokens as MMA N)", "M128 N64")]
+        self.assertEqual(swap["padded_m"], 64)
+        self.assertAlmostEqual(swap["useful"], 50 / 64)
+        self.assertEqual(swap["rate"], 32.0 * 64)
+        self.assertEqual(by[("tcgen05", "cta_group 1, tokens as MMA M", "M128 N256")]["padded_m"], 128)
+        self.assertEqual(by[("SIMT", "FFMA, fp32 accumulate", "-")]["rate"], 128.0)
+        # cta_group 2 has no rows here: the map says to measure it.
+        self.assertTrue(any(m["rate"] is None for m in by.values()))
+
+    def test_section_reports_bytes_and_rows(self) -> None:
+        text = engine_map.section(self.rows, {"M": 50, "N": 4096, "K": 1024, "dtype": "bfloat16"})
+        self.assertIn("8.39 MB per call", text)
+        self.assertIn("| tcgen05 |", text)
+        self.assertIn("no measured GEMM rows", text)
+
+    def test_traced_cases_map_with_the_seed(self) -> None:
+        table = phases.load()
+        self.assertTrue(table, "case_phases.json is empty")
+        rows = primdb.load()
+        for case_id, case_phases in table.items():
+            with self.subTest(case=case_id):
+                self.assertTrue(all({"M", "N", "K", "count"} <= set(p) for p in case_phases))
+                out = io.StringIO()
+                self.assertEqual(engine_map.main(["--case", case_id], out), 0)
+                self.assertIn("E1: ", out.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()

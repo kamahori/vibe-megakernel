@@ -184,15 +184,16 @@ def _evaluate_shape(case: Case, submission: Path, record: dict, *, device: str,
             except Exception as exc:
                 record["graph_baseline_unavailable"] = (
                     f"{type(exc).__name__}: {exc}")
-        if compiled_baselines and torch.device(device).type == "cuda":
-            from ..baselines import timing_baselines
+        if (compiled_baselines or case.baselines) and torch.device(device).type == "cuda":
+            from ..baselines import cached_timing_baselines
             from ..workloads import oracle
 
             expected = reference(case, perf_inputs)
             exact = oracle(case, perf_inputs)
-            record["compiled_baselines"] = timing_baselines(
+            record["compiled_baselines"] = cached_timing_baselines(
                 case, perf_inputs, device, warmup, reps,
-                expected=expected, exact=exact)
+                expected=expected, exact=exact,
+                variants=None if compiled_baselines else case.baselines)
             del expected, exact
         record["launch_audit"] = _audit_launches(candidate, perf_inputs, device,
                                                  case.max_gpu_launches)

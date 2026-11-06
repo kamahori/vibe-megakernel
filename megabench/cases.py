@@ -12,6 +12,10 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 
+BASELINE_VARIANTS = ("capture_safe_eager", "capture_safe_graph", "torch_compile",
+                     "torch_compile_graph")
+
+
 @dataclass(frozen=True)
 class Case:
     id: str
@@ -46,6 +50,9 @@ class Case:
     contexts: tuple[int, ...] = ()
     # Weighted shapes a result is scored over; see regime_cases.
     regimes: tuple[dict, ...] = ()
+    # Capture-safe baseline variants (megabench.baselines) that every timed
+    # evaluation of this case runs; the fastest one counts toward the score.
+    baselines: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.id or not self.family or not self.model or not self.phase:
@@ -61,6 +68,9 @@ class Case:
         if self.gate not in GATES:
             raise ValueError(f"invalid gate in {self.id}")
         object.__setattr__(self, "contexts", tuple(self.contexts))
+        object.__setattr__(self, "baselines", tuple(self.baselines))
+        if not set(self.baselines) <= set(BASELINE_VARIANTS):
+            raise ValueError(f"unknown baseline variant in {self.id}")
         if self.contexts:
             if "batch" not in self.params or "context" not in self.params:
                 raise ValueError(f"contexts need batch and context params in {self.id}")
@@ -83,11 +93,13 @@ class Case:
         # the contracts recorded by earlier results.
         values = asdict(self)
         for name, default in (("checkpoint", ""), ("gate", "band"),
-                              ("contexts", ()), ("regimes", ())):
+                              ("contexts", ()), ("regimes", ()), ("baselines", ())):
             if values[name] == default:
                 del values[name]
         if "contexts" in values:
             values["contexts"] = list(values["contexts"])
+        if "baselines" in values:
+            values["baselines"] = list(values["baselines"])
         if "regimes" in values:
             values["regimes"] = [
                 {k: list(v) if k == "contexts" else v for k, v in r.items()}
@@ -141,6 +153,10 @@ DEEPSEEK_CHECKPOINT = "deepseek-ai/DeepSeek-V3.2@a7e62ac04ecb2c0a54d736dc46601c5
 DEEPSEEK_NOTE = ("Real FP8 checkpoint MLA/DSA TP8 decode with TileRT 0.1.6 numerics (BF16 caches "
                  "and indexer) over prefilled chat prompts; TileRT-style output gate.")
 
+# Triton W8A16 GEMMs and FlashInfer attention, compiled and graph-captured
+# (megabench.baselines._gemma); the plain graph is the fallback.
+GEMMA_BASELINES = ("capture_safe_graph", "torch_compile_graph")
+
 CASES: tuple[Case, ...] = (
     Case("dense-step-qwen3-06b-b1-s128", "dense_step", "Qwen/Qwen3-0.6B",
          "decode", {"batch": 1, "context": 128, "layers": 28,
@@ -163,6 +179,28 @@ CASES: tuple[Case, ...] = (
           "bits": 8, "local_window": 1024}, "quantized_llm", "p0",
          ready=True, atol=0.003, rtol=0.003,
          note="Full synthetic Gemma 3 W8A16 decode; checkpoint tier pending."),
+    # Sixteen ragged sequences (KV 1K-8K, mean about 4K): still memory-bound, but
+    # attention is about 40% of the traffic and the work per sequence is uneven.
+    Case("quant-step-gemma3-4b-w8-b16-ragged4k", "quant_step",
+         "google/gemma-3-4b-it", "decode",
+         {"batch": 16, "context": 8192, "layers": 34, "hidden": 2560,
+          "q_heads": 8, "kv_heads": 4, "head_dim": 256,
+          "intermediate": 10240, "vocab": 262144,
+          "bits": 8, "local_window": 1024}, "quantized_llm", "p1",
+         ready=True, atol=0.003, rtol=0.003,
+         contexts=(3488, 1093, 6421, 2290, 5059, 7905, 1530, 4207,
+                   2716, 5903, 3911, 1877, 7012, 3105, 4630, 5466),
+         baselines=GEMMA_BASELINES,
+         note="Synthetic Gemma 3 W8A16 decode, 16 sequences with ragged KV lengths."),
+    Case("quant-step-gemma3-4b-w8-prefill-t2048-c2048", "quant_step",
+         "google/gemma-3-4b-it", "prefill",
+         {"batch": 1, "tokens": 2048, "context": 2048, "layers": 34,
+          "hidden": 2560, "q_heads": 8, "kv_heads": 4, "head_dim": 256,
+          "intermediate": 10240, "vocab": 262144,
+          "bits": 8, "local_window": 1024}, "quantized_llm", "p1",
+         ready=True, atol=0.003, rtol=0.003, baselines=GEMMA_BASELINES,
+         note="Synthetic Gemma 3 W8A16 prefill chunk: 2048 new tokens "
+              "after 2048 cached tokens."),
     Case("quant-step-gemma3-4b-w4-b1-s128", "quant_step",
          "google/gemma-3-4b-it", "decode",
          {"batch": 1, "context": 128, "layers": 34, "hidden": 2560,

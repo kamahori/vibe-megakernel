@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 from pathlib import Path
 
 from dataclasses import replace
@@ -11,6 +13,47 @@ from dataclasses import replace
 from ..cases import load_regimes, select_cases
 from ..harness.correctness import check_trials
 from ..harness.runner import _load_submission, evaluate_case
+
+
+def pinned_score(result: dict, pin_dir: Path | None, key: dict) -> tuple[float, dict | None]:
+    """The progress score against one best-baseline time pinned per run.
+
+    The baselines are re-measured at each evaluation and drift between rounds,
+    so a faster kernel could score below a slower one measured earlier. The
+    first successful evaluation in *pin_dir* writes its measured best baseline
+    (the fastest of eager, graph and compiled); every later evaluation with the
+    same *key* scores against that value. Without *pin_dir* the score uses the
+    measured baseline, as before.
+    """
+    if result.get("status") != "ok_provisional":
+        return 0.0, None
+    measured = result["speedup_vs_best_baseline_cuda_event"]
+    if pin_dir is None:
+        return 1.0 + measured / (1.0 + measured), None
+    cand = result["candidate_timing"]["cuda_event_p50_ms"]
+    measured_best = measured * cand
+    digest = hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode()).hexdigest()[:16]
+    path = Path(pin_dir) / f"score-baseline-{digest}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pinned_now = False
+    if not path.is_file():
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"key": key, "best_baseline_cuda_event_p50_ms": measured_best},
+                                  sort_keys=True, default=str))
+        try:
+            os.link(tmp, path)  # fails if another evaluation pinned first
+            pinned_now = True
+        except FileExistsError:
+            pass
+        finally:
+            tmp.unlink()
+    pinned = json.loads(path.read_text())["best_baseline_cuda_event_p50_ms"]
+    speedup = pinned / cand
+    info = {"pinned_best_baseline_cuda_event_p50_ms": pinned,
+            "measured_best_baseline_cuda_event_p50_ms": measured_best,
+            "speedup_vs_pinned_baseline_cuda_event": speedup,
+            "pinned_now": pinned_now, "file": str(path)}
+    return 1.0 + speedup / (1.0 + speedup), info
 
 
 def benchmark_output(case_id: str, result: dict, score: float) -> dict:
@@ -69,8 +112,15 @@ def main(case_id: str, argv: list[str] | None = None,
                                warmup=1, reps=3, graph_baseline=False)
     except Exception as exc:
         result = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"}
-    speedup = result.get("speedup_vs_best_baseline_cuda_event")
-    score = 1.0 + speedup / (1.0 + speedup) if result["status"] == "ok_provisional" else 0.0
+    pin_dir = os.environ.get("MEGABENCH_BASELINE_CACHE")
+    key = {"case": case.to_dict()}
+    if pin_dir and result.get("status") == "ok_provisional":
+        import torch
+
+        key["gpu"] = torch.cuda.get_device_name(0)
+    score, pin = pinned_score(result, Path(pin_dir) if pin_dir else None, key)
+    if pin is not None:
+        result["score_baseline"] = pin
     output = benchmark_output(case_id, result, score)
     with args.output_json.open("x", encoding="utf-8") as file:
         json.dump(output, file)
