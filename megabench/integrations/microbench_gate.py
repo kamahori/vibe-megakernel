@@ -164,9 +164,9 @@ def matched_comparison(workspace: Path, question: str, round_name: str) -> set[s
 
     A matched measurement compares designs under the same conditions, so the rows must
     cover at least two designs; matched rows of one design alone are not a comparison.
-    The question seeded from the engine map compares engines, so its rows must cover at
-    least two of the engine families that the engine map lists; variants of one engine
-    are not an engine comparison.
+    The question seeded from the engine map compares engines, so its rows must cover every
+    engine family that the engine map lists, as its `settles it` line says; variants of one
+    engine are not an engine comparison.
     """
     path = workspace / MICROBENCH / "primdb_local.jsonl"
     rows = []
@@ -184,7 +184,7 @@ def matched_comparison(workspace: Path, question: str, round_name: str) -> set[s
         return set()
     seeded = any(e["tag"] == question and e["opened"] == SEEDED for e in ledger(workspace))
     families = engine_families(workspace)
-    if seeded and families and len({family_of(d, families) for d in designs} - {None}) < 2:
+    if seeded and families and not set(families) <= {family_of(d, families) for d in designs}:
         return set()
     return {r.get("id") for r in picked}
 
@@ -271,8 +271,8 @@ def check_ledger(workspace: Path, round_name: str, answers: str) -> list[str]:
                 f"open question {stale['tag']} has gone longest without a matched measurement: "
                 f"build every design its `settles it` line names under the same conditions "
                 f"(matched rows of one design alone are not a comparison; an oracle is not a "
-                f"design; for a question seeded from the engine map, variants of one engine "
-                f"family are not an engine comparison), add the rows with ./primdb add --question {stale['tag']} "
+                f"design; for a question seeded from the engine map, every engine family in its "
+                f"tables, not variants of one family), add the rows with ./primdb add --question {stale['tag']} "
                 "--conditions matched, and cite them in its section (or defer it, once)")
     if len(deferred) > 1:
         problems.append(f"only one carried open question may be deferred per round, not "

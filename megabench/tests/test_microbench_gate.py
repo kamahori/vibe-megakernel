@@ -184,7 +184,7 @@ class GateTests(unittest.TestCase):
             (mb / "primdb_local.jsonl").write_text("".join(json.dumps(r) + "\n" for r in matched))
             self.assertEqual(check(ws), [])
 
-    def test_seeded_question_needs_two_engine_families_from_the_engine_map(self) -> None:
+    def test_seeded_question_needs_every_engine_family_of_the_engine_map(self) -> None:
         from megabench.integrations.make_agent_workspace import seeded_ledger
         with tempfile.TemporaryDirectory() as directory:
             ws = Path(directory)
@@ -211,6 +211,12 @@ class GateTests(unittest.TestCase):
             rows("alpha_one_plain", "alpha_one_prefetch", "oracle_load")
             self.assertIn("Q1 has gone longest", check(ws)[0])
             rows("alpha_one_plain", "beta_split")
+            self.assertEqual(check(ws), [])
+            # Every family in the engine map, not two of them.
+            (ws / "progress/engine-map.md").write_text(
+                "| engine | mapping |\n|---|---|\n| alpha.one | x |\n| beta | y |\n| GAMMA | z |\n\n### round-0001\n")
+            self.assertIn("Q1 has gone longest", check(ws)[0])
+            rows("alpha_one_plain", "beta_split", "gamma_ffma")
             self.assertEqual(check(ws), [])
 
     def test_open_questions_become_a_plan_claim(self) -> None:
