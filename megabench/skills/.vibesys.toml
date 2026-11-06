@@ -1,11 +1,11 @@
 [[rule]]
 path = "megakernel-phase-profiling"
-backends = ["cuda"]
+backends = ["cuda", "rocm"]
 domains = ["kernel-writing"]
 
 [[rule]]
 path = "megakernel-microbench"
-backends = ["cuda"]
+backends = ["cuda", "rocm"]
 domains = ["kernel-writing"]
 
 [[rule]]
@@ -15,5 +15,5 @@ domains = ["kernel-writing"]
 
 [[rule]]
 path = "megakernel-regimes"
-backends = ["cuda"]
+backends = ["cuda", "rocm"]
 domains = ["kernel-writing"]

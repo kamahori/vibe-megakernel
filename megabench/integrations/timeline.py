@@ -150,8 +150,11 @@ class _Pairing:
         self.unmatched += 1
 
 
-def decode_buffer(data: bytes, event_names: Sequence[str] = ()) -> Timeline:
+def decode_buffer(data: bytes, event_names: Sequence[str] = (), tick_ns: float = 1.0) -> Timeline:
     """Decode a raw timeline buffer (FlashInfer layout).
+
+    ``tick_ns`` converts stamps to nanoseconds: 1 for ``%globaltimer``; on AMD the probe
+    stores raw ``wall_clock64()`` ticks, so pass 1e6 / hipDeviceAttributeWallClockRate (kHz).
 
     Timestamps are the low 32 bits of the global nanosecond timer. They are unwrapped
     against the first recorded event, so a capture must span less than about 2.1 s.
@@ -178,8 +181,8 @@ def decode_buffer(data: bytes, event_names: Sequence[str] = ()) -> Timeline:
         Interval(
             f"blk{slot // num_groups}_g{slot % num_groups} sm{sm}",
             _event_name(index, event_names),
-            float(begin - origin),
-            float(end - origin),
+            float(begin - origin) * tick_ns,
+            float(end - origin) * tick_ns,
         )
         for slot, sm, index, begin, end in pairing.closed
     )
@@ -447,11 +450,16 @@ def to_chrome_trace(timeline: Timeline) -> dict[str, object]:
     return {"traceEvents": events, "displayTimeUnit": "ns"}
 
 
-def load(path: str | Path, event_names: Sequence[str] = ()) -> Timeline:
+def load(path: str | Path, event_names: Sequence[str] = (), tick_ns: float | None = None) -> Timeline:
     """Decode a saved timeline: ``.json`` as a Chrome trace, anything else as a raw buffer."""
     path = Path(path)
     data = path.read_bytes()
-    return decode_chrome_trace(data) if path.suffix == ".json" else decode_buffer(data, event_names)
+    if path.suffix == ".json":
+        return decode_chrome_trace(data)
+    if tick_ns is None:  # timeline_profile_case records the scale next to the buffer
+        meta = path.with_name("clock.json")
+        tick_ns = json.loads(meta.read_text())["tick_ns"] if meta.exists() else 1.0
+    return decode_buffer(data, event_names, tick_ns)
 
 
 def phase_table(timeline: Timeline) -> list[dict[str, object]]:
@@ -493,10 +501,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--track-filter", default="", help="keep tracks whose name contains this")
     parser.add_argument("--event", help="print per-occurrence skew for one event as JSON")
     parser.add_argument("--chrome", type=Path, help="also write a Perfetto-readable .json here")
+    parser.add_argument("--tick-ns", type=float, default=None,
+                        help="ns per stamp tick (default: clock.json beside the buffer, else 1)")
     args = parser.parse_args(argv)
     names = [name for name in args.events.split(",") if name]
     try:
-        timeline = load(args.path, names).select(args.track_filter)
+        timeline = load(args.path, names, args.tick_ns).select(args.track_filter)
         if args.event:
             print(json.dumps(event_skew(timeline, args.event, top=10), indent=2))
         else:

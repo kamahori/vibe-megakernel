@@ -131,3 +131,55 @@ where cost lands. Timestamps are `%globaltimer` nanoseconds, too coarse for
 phases under about 0.1 µs, and one capture must span less than about 2.1 s.
 Timelines locate a bottleneck. Correctness and latency still come only from
 `./check_candidate` and the final grading.
+
+## AMD ROCm sessions
+
+On an AMD GPU, create the workspace with `--backend rocm` (it is also chosen
+automatically when `/opt/rocm` exists and `nvidia-smi` does not; `--platform` is an
+alias). The workspace then targets the ROCm build of PyTorch, where `torch.cuda` and
+`cuda:0` address the HIP device. Skills and skill scripts are filtered by backend
+(`megabench/skills/.vibesys.toml` and `backend_files.toml`), so a ROCm workspace gets
+no Blackwell tensor-core skill and no cuobjdump gate. Its tools change as follows:
+
+- `./profile_candidate` runs `rocprofv3` instead of Nsight Compute. It always
+  records a kernel dispatch trace with stats (grid, workgroup, VGPR/SGPR/LDS,
+  scratch, duration). `--kernel REGEX --pmc COUNTER ...` collects hardware
+  counters for the warmed call only, and `--att` requests a thread trace.
+  `rocprofv3-avail` lists the counters. A counter set that does not fit in one
+  hardware pass fails; on gfx942 that includes `FETCH_SIZE WRITE_SIZE
+  GRBM_GUI_ACTIVE` together.
+- `./trace_report` combines the phase timeline, rocprofv3 counters and
+  PC sampling (host_trap) into `reports/trace-*/report.md`. Counters are
+  discovered on the device, and a set that does not fit is retried one counter
+  per pass. PC samples are kept for the candidate's dispatches only and grouped
+  by instruction class: sleep or barrier, `s_waitcnt`, VMEM, LDS, VALU, SALU.
+  The report ranks findings such as achieved HBM bandwidth, L2 hit rate, the
+  share of samples spent waiting, and the most imbalanced phase. rocprofv3 can
+  hang in its own error handler after a fatal error while holding GPU memory,
+  so each pass runs in its own process group and is killed on a fatal log line
+  or a timeout.
+- `timeline_probe.cuh` compiles under HIP. It stamps raw `wall_clock64()`
+  ticks, and `./timeline_candidate` scales them by
+  `hipDeviceAttributeWallClockRate` (25 MHz on MI210) and writes the scale to
+  `clock.json`. `python -m megabench.integrations.timeline` reads that file
+  when it re-reads a saved buffer; `--tick-ns` overrides it. The rate query uses
+  the ROCm 7.x enum value and rejects an implausible answer; set
+  `MEGABENCH_TICK_NS` (nanoseconds per tick) where it fails.
+- `megakernel_skills/megakernel-phase-profiling/scripts/codegen_gate_amd.py`
+  replaces the cuobjdump-based gate. It extracts code objects with
+  `clang-offload-bundler`, compares ISA from `llvm-objdump`, and reads VGPR,
+  AGPR, SGPR, LDS, scratch and spill counts from `llvm-readelf --notes`.
+- `--gpu {mi300x,mi210,mi350x}` (default `mi300x`) sets the hardware section of
+  TASK.md, the offload architecture (gfx942, gfx90a, gfx950) and the bandwidth
+  `./sol_info` assumes (5.3, 1.6 and 8 TB/s).
+- The PipeLink-style `megakernel-stage-linking` skill is optional
+  (`--optional-skill megakernel-stage-linking`). It did not improve performance on
+  MI300X: a separately compiled and linked seam cost 1.6-2.4%, and stages swapped
+  between independently written kernels were slower or neutral.
+
+The ATT thread-trace decoder is a separate ROCm package; where it is not
+installed, `--att` produces no instruction timeline and PC sampling is the
+instruction-level signal. A persistent kernel that deadlocks keeps its process
+on the GPU, and every later launch queues behind it: wrap grid-size and
+synchronization experiments in `timeout`, and kill any leftover process before
+the next check.

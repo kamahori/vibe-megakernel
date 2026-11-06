@@ -25,6 +25,10 @@ from ..cases import select_cases
 from ..workloads import make_inputs
 from . import timeline
 
+# hipDeviceAttribute_t value of hipDeviceAttributeWallClockRate in the ROCm 7.x headers
+# (AmdSpecificBegin + 17). tick_ns_from_rate rejects an implausible answer.
+_HIP_WALL_CLOCK_RATE_ATTR = 10017
+
 
 def _load_timeline_build(path: Path, contract: dict):
     spec = importlib.util.spec_from_file_location("megabench_candidate_timeline", path)
@@ -43,7 +47,41 @@ def _load_timeline_build(path: Path, contract: dict):
     return run, [str(name) for name in names]
 
 
-def _save(buffer, names: list[str], output: Path) -> str:
+def tick_ns_from_rate(status: int, rate_khz: int) -> float:
+    """Nanoseconds per wall_clock64 tick from hipDeviceGetAttribute's result, if plausible."""
+    if status != 0 or not 1_000 <= rate_khz <= 1_000_000:
+        raise RuntimeError(
+            f"hipDeviceGetAttribute(hipDeviceAttributeWallClockRate={_HIP_WALL_CLOCK_RATE_ATTR}) "
+            f"returned status {status}, {rate_khz} kHz; expected 1 MHz to 1 GHz. The enum value "
+            "comes from the ROCm 7.x headers and may differ in this ROCm version: set "
+            "MEGABENCH_TICK_NS to the nanoseconds per wall_clock64 tick (40 for a 25 MHz "
+            "clock, 10 for 100 MHz)")
+    return 1e6 / rate_khz
+
+
+def _tick_ns(device_index: int) -> float:
+    """Nanoseconds per probe tick: 1 for CUDA %globaltimer; the AMD wall_clock64 period otherwise.
+
+    MEGABENCH_TICK_NS overrides the queried value.
+    """
+    import os
+
+    import torch
+
+    override = os.environ.get("MEGABENCH_TICK_NS")
+    if override:
+        return float(override)
+    if not torch.version.hip:
+        return 1.0
+    import ctypes
+
+    hip = ctypes.CDLL("libamdhip64.so")
+    rate = ctypes.c_int(0)
+    status = hip.hipDeviceGetAttribute(ctypes.byref(rate), _HIP_WALL_CLOCK_RATE_ATTR, device_index)
+    return tick_ns_from_rate(status, rate.value)
+
+
+def _save(buffer, names: list[str], output: Path, tick_ns: float = 1.0) -> str:
     import torch
 
     if buffer.dtype not in (torch.uint64, torch.int64) or buffer.dim() != 1:
@@ -53,7 +91,8 @@ def _save(buffer, names: list[str], output: Path) -> str:
     raw = output / "timeline.u64"
     raw.write_bytes(buffer.detach().view(torch.int64).cpu().numpy().tobytes())
     (output / "events.json").write_text(json.dumps(names))
-    decoded = timeline.decode_buffer(raw.read_bytes(), names)
+    (output / "clock.json").write_text(json.dumps({"tick_ns": tick_ns}))
+    decoded = timeline.decode_buffer(raw.read_bytes(), names, tick_ns)
     (output / "trace.json").write_text(json.dumps(timeline.to_chrome_trace(decoded)))
     rows = timeline.phase_table(decoded)
     summary = timeline.summarize(decoded, top=len(rows) or 1)
@@ -90,7 +129,7 @@ def capture(rank: int, contract: dict, submission: str, seed: int, output: str,
             buffer = run(inputs)
             torch.cuda.synchronize(device)
         target = Path(output) / (f"rank{rank}" if rendezvous else "")
-        table = _save(buffer, names, target)
+        table = _save(buffer, names, target, _tick_ns(rank))
         if rank == 0:
             print(table)
         print(f"rank {rank}: wrote {target}/timeline.u64, trace.json (ui.perfetto.dev), summary.json")
