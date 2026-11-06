@@ -141,6 +141,35 @@ class GateTests(unittest.TestCase):
             (mb / "answers/round-0003.md").write_text("P1\n## Q1\nbbbbbbbbbb\n## Q2\ndeferred: x\n")
             self.assertEqual(check(ws), [])
 
+    def test_seeded_question_is_due_in_round_one_and_cannot_be_deferred(self) -> None:
+        from megabench.integrations.make_agent_workspace import seeded_ledger
+        ledger = seeded_ledger("# Engine map\n\n### E1: mm M=50 N=4096 K=1024\n\n"
+                               "### E2: addmm M=1 N=3072 K=1024\n")
+        self.assertIn("## Q1 · open · opened round-0000", ledger)
+        self.assertIn("E1 (mm M=50 N=4096 K=1024); E2 (addmm M=1 N=3072 K=1024)", ledger)
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            mb = ws / "progress/microbench"
+            (ws / "progress/plans").mkdir(parents=True)
+            (ws / "progress/plans/round-0001.json").write_text(json.dumps({"reasoning": "Go."}))
+            for kind in ("requests", "answers"):
+                (mb / kind).mkdir(parents=True)
+                (mb / kind / "round-0001.md").write_text("- q\n")
+            (ws / "progress/engine-map.md").write_text("### round-0001\n")
+            (mb / "open.md").write_text(ledger)
+            (mb / "answers/round-0001.md").write_text("P1\n## Q1\ndeferred: later\n")
+            problems = check(ws)
+            self.assertTrue(any("cannot be deferred" in p for p in problems), problems)
+            (mb / "primdb_local.jsonl").write_text(json.dumps(
+                {"id": "dddddddddd", "source": {"round": "round-0001", "question": "Q1",
+                                                "conditions": "other"}}) + "\n")
+            (mb / "answers/round-0001.md").write_text("P1\n## Q1\ndddddddddd\n")
+            self.assertIn("Q1 has gone longest", check(ws)[0])
+            (mb / "primdb_local.jsonl").write_text(json.dumps(
+                {"id": "dddddddddd", "source": {"round": "round-0001", "question": "Q1",
+                                                "conditions": "matched"}}) + "\n")
+            self.assertEqual(check(ws), [])
+
     def test_open_questions_become_a_plan_claim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             ws = Path(directory)

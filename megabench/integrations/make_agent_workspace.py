@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import os
 import shlex
 import shutil
@@ -179,6 +180,29 @@ LEDGER = (
     "Questions that measurements have not settled under matching conditions, the largest "
     "estimated end-to-end effect first. Kept by the microbench phase; see the `microbench` "
     "subagent for the entry format. An entry closes only with the row ids that settle it.\n")
+
+
+def seeded_ledger(engine_map: str) -> str:
+    """The ledger with one question seeded from the engine map: which design wins each phase.
+
+    The question names the phases of this case's engine map and asks for a matched comparison
+    of every legal engine design. It carries no answer; the microbench phase of round 1 must
+    measure it (``microbench_gate`` does not let a seeded question be deferred).
+    """
+    phases = re.findall(r"(?m)^### (E\d+): (.+)$", engine_map)
+    listed = "; ".join(f"{tag} ({desc.strip()})" for tag, desc in phases) or (
+        "the matrix-multiply phases of the reference")
+    return LEDGER + (
+        "\n## Q1 · open · opened round-0000\n"
+        f"- phase: every phase in `progress/engine-map.md`: {listed}\n"
+        "- question: for each phase that the reference profile or timeline shows as dominant, "
+        "which engine design gives the lowest whole-phase time at its real shape, including the "
+        "reductions, barriers and neighbouring phases that the design removes\n"
+        "- settles it: per dominant phase, one proxy per engine family in its engine-map table, "
+        "each built the way that engine allows (see Comparing engines and designs), all at the "
+        "real shape in a persistent kernel with the same CTA count and ingress path\n"
+        "- estimate: not yet measured; give the range with its arithmetic in round 1\n"
+        "- history: seeded from the engine map when the workspace was made\n")
 
 
 def _engine_map(project: Path, benchmark_root: Path, case: Case) -> str:
@@ -460,8 +484,9 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
     _write_tools(project, benchmark_root, case, gpu_socket)
     if agent == "vibesys":
         (project / "progress/microbench").mkdir(parents=True, exist_ok=True)
-        (project / "progress/microbench/open.md").write_text(LEDGER)
-        (project / "progress/engine-map.md").write_text(_engine_map(project, benchmark_root, case))
+        engine_map = _engine_map(project, benchmark_root, case)
+        (project / "progress/microbench/open.md").write_text(seeded_ledger(engine_map))
+        (project / "progress/engine-map.md").write_text(engine_map)
         (project / "roadmap").mkdir(exist_ok=True)
         (project / "roadmap/engine-selection.md").write_text(ROADMAP_ENGINES)
         shutil.copy2(benchmark_root / "megabench/integrations/vibesys-agent.example.toml",

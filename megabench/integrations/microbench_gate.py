@@ -125,6 +125,9 @@ def local_sources(workspace: Path) -> list[tuple[str, dict]]:
     return out
 
 
+SEEDED = "round-0000"  # questions written into the ledger when the workspace was made
+
+
 def rows_of_round(workspace: Path, round_name: str) -> set[str]:
     """Ids of the rows that `./primdb add` stamped with this round."""
     return {i for i, s in local_sources(workspace) if s.get("round") == round_name}
@@ -182,6 +185,10 @@ def check_ledger(workspace: Path, round_name: str, answers: str) -> list[str]:
         if new_rows & set(ROW_ID.findall(section)):
             continue
         if re.search(r"(?im)^\W*deferred:\s*\S", section):
+            if entry["opened"] == SEEDED:
+                problems.append(f"open question {entry['tag']} was seeded with the workspace "
+                                "and cannot be deferred; measure it")
+                continue
             if re.search(r"(?im)^\W*deferred:\s*\S", _section(previous, entry["tag"])):
                 problems.append(f"open question {entry['tag']} was deferred in the previous "
                                 f"round too; measure it in {round_name}")

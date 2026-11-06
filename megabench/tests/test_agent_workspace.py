@@ -182,7 +182,17 @@ class AgentWorkspaceTests(unittest.TestCase):
                                     cwd=project, capture_output=True, text=True)
             self.assertEqual(result.returncode, 3)
             self.assertIn("P1", result.stderr)
+            # The seeded engine question is due in round 1, with a matched measurement.
+            self.assertIn("opened round-0000", (project / "progress/microbench/open.md").read_text())
             (project / "progress/microbench/answers/round-0001.md").write_text("P1: rows ...\n")
+            result = subprocess.run([str(project / "check_candidate"), "--help"],
+                                    cwd=project, capture_output=True, text=True)
+            self.assertIn("Q1 has gone longest", result.stderr)
+            (project / "progress/microbench/primdb_local.jsonl").write_text(json.dumps(
+                {"id": "eeeeeeeeee", "source": {"round": "round-0001", "question": "Q1",
+                                                "conditions": "matched"}}) + "\n")
+            (project / "progress/microbench/answers/round-0001.md").write_text(
+                "P1 P2: rows ...\n## Q1\neeeeeeeeee\n")
             with (project / "progress/engine-map.md").open("a") as f:
                 f.write("### round-0001\n")
             result = subprocess.run([str(project / "check_candidate"), "--help"],
