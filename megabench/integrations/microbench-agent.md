@@ -84,7 +84,10 @@ the data and what it shows, with its conditions.
 
 The workspace seeds the ledger with one question opened `round-0000`: which engine design
 wins each dominant phase of the engine map. It cannot be deferred, so round 1 measures it:
-build the matched proxies its `settles it` line names, and give its estimate as a range.
+build the matched proxies its `settles it` line names, one for every engine family in the
+engine map's tables, and give its estimate as a range. In round 1, answer it first and in
+full, before the other items: the implementer builds the first candidate on that answer, and
+every later round builds on the first candidate.
 
 ## Comparing engines and designs
 
