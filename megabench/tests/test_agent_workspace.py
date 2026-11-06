@@ -162,6 +162,11 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertTrue((project / "roadmap/engine-selection.md").is_file())
             self.assertIn("# Open questions", (project / "progress/microbench/open.md").read_text())
             self.assertIn("progress/microbench/open.md", (project / "TASK.md").read_text())
+            # Every role reads the rule against a fallback to a design measured slower.
+            task_text = (project / "TASK.md").read_text()
+            self.assertIn("No fallback to a design measured slower", task_text)
+            for role in ("**Orchestrator.**", "**Implementer.**", "**Judge.**"):
+                self.assertIn(role, task_text)
             # mb_build runs in the caller's directory and refuses a build without -o.
             result = subprocess.run([str(project / "mb_build"), "--", "x.cu"],
                                     cwd=project / "progress", capture_output=True, text=True)

@@ -204,6 +204,26 @@ MICROBENCH_TASK = (
     "request file and give it to the subagent again. Keep these files under `progress/`: a "
     "revert to an earlier round keeps them.\n")
 
+NO_FALLBACK_TASK = (
+    "\n## No fallback to a design measured slower\n\n"
+    "When the matched rows rank one design fastest for a phase, that design is the one the "
+    "round builds. This rule binds every role:\n\n"
+    "- **Orchestrator.** A plan names one design for each phase that it writes. It does not "
+    "name a fallback to a design that the matched rows rank slower, and it does not make "
+    "the faster design conditional on how hard it is to build.\n"
+    "- **Implementer.** Build the phase in the design that the plan names. Do not put a "
+    "design that the rows rank slower in its place, for any reason, even if the plan text "
+    "allows it. If you cannot make the design correct, keep working on it inside the round. "
+    "If the round ends first, return the failure: what you built, the test that fails, and "
+    "the step that would fix it. A failed attempt at the faster design is a valid round "
+    "result; a correct build of a slower design is not.\n"
+    "- **Judge.** Compare the design of each phase that the candidate builds or rewrites "
+    "with the design that this round's matched rows rank fastest. If the candidate builds a "
+    "phase in a design that the rows rank slower, do not accept it, however correct or fast "
+    "it is: send it back to the implementer with the phase, the row ids and the design to "
+    "build. Only the orchestrator can change the design of a phase, and only with matched "
+    "rows that rank another design faster.\n")
+
 ROADMAP_ENGINES = (
     "# Engine selection per phase\n\n"
     "- [open] For each dominant phase, choose the engine, the instruction shape and the data path "
@@ -534,7 +554,7 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
            "`./check_candidate`, `./profile_candidate` and `./timeline_candidate` already "
            "use it. Keep inputs and outputs inside this workspace, because the job does "
            "not see this shell's `/tmp`.\n" if gpu_socket is not None else "")
-        + (ENGINE_MAP_TASK + MICROBENCH_TASK if agent == "vibesys" else ""))
+        + (ENGINE_MAP_TASK + MICROBENCH_TASK + NO_FALLBACK_TASK if agent == "vibesys" else ""))
     _write_tools(project, benchmark_root, case, gpu_socket)
     if agent == "vibesys":
         (project / "progress/microbench").mkdir(parents=True, exist_ok=True)
