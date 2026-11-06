@@ -136,7 +136,9 @@ def write_launch(args, run: Path, env: dict[str, str], srun: list[str]) -> None:
         "broker=$!\ntrap 'kill $broker 2>/dev/null || true' EXIT\n"
         f"for _ in $(seq 100); do [ -S {q(run / 'gpu/broker.sock')} ] && break; sleep 0.1; done\n"
         f"env -i {passed} {key_env}=\"$key\" "
-        + ("VIBESYS_MICROBENCH_PHASE=1 " if getattr(args, "microbench_phase", False) else "") + "\\\n  "
+        + ("VIBESYS_MICROBENCH_PHASE=1 " if getattr(args, "microbench_phase", False) else "")
+        + (f"VIBESYS_MICROBENCH_MINUTES={args.microbench_minutes:g} "
+           if getattr(args, "microbench_minutes", None) else "") + "\\\n  "
         + " ".join(NO_GPU) + " timeout --signal=TERM --kill-after=60s "
         f"{timeout}s {q(args.vibesys)} "
         + " ".join(shlex.quote(a) for a in vibesys_args) + "\n")
@@ -202,6 +204,9 @@ def main() -> int:
     parser.add_argument("--microbench-phase", action="store_true",
                         help="each round plan is a draft: VibeSys runs the microbench phase on it "
                              "and the orchestrator revises the plan before the implementer starts")
+    parser.add_argument("--microbench-minutes", type=float,
+                        help="time limit of each pre-plan microbench phase; the agents get a "
+                             "deadline and leave what they cannot measure open")
     parser.add_argument("--forbid", type=Path, action="append", default=[],
                         help="extra path that must be absent in the sandbox (repeat)")
     args = parser.parse_args()

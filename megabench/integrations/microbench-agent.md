@@ -58,11 +58,24 @@ the data and what it shows, with its conditions.
    - The sources in `primbench/` show the method: a fixed-cost cancelling slope over two loop
      lengths, a measured SM clock, a check of the output against a reference before timing,
      and values that the compiler cannot remove or hoist. Reuse them where they fit.
+   - Before you write a new benchmark, look for one that already exists: the rows of earlier
+     rounds name their source file (`./primdb explain <id>`), and the files stay under
+     `progress/microbench/bench/`. Extend or reuse a file that measures the same phase; write
+     a new one only for a design that no file builds.
+   - Put each measured arm in its own translation unit, with the shared code in a header. One
+     file that holds all arms behind `-D` sets compiles every arm for each set and can take
+     many minutes per build.
+   - Compile with `./mb_build -- <nvcc arguments> -o <binary>`. It skips nvcc when the
+     sources and flags did not change, and it stops a compile that passes its time limit. If
+     it stops one, split the source; do not wait for a longer compile. Start compiles in the
+     foreground, or in the background with a bounded wait, never an unbounded poll.
    - Compile for the device with the arch-specific target. Read the SASS (`cuobjdump -sass`)
      and confirm that the instructions you meant to time are present and are not removed or
      moved out of the loop.
-   - Run GPU commands through `./gpu_run`, as the task file says. Repeat the run and record
-     the spread.
+   - Run GPU commands through `./gpu_run`, as the task file says. Screen the arms first with
+     few repetitions, then repeat only the arms that can change the answer and record their
+     spread. An arm that is slower than the best by more than the spread does not need more
+     repetitions.
    - Compare the result with the physical limits (peak rates, bandwidth). If it is above a
      limit, the benchmark is wrong; fix it before you report it.
    - Add each verified point to the database: print flat JSON lines with `family`,
@@ -92,6 +105,14 @@ build the matched proxies its `settles it` line names, one for every engine fami
 engine map's tables, and give its estimate as a range. In round 1, answer it first and in
 full, before the other items: the implementer builds the first candidate on that answer, and
 every later round builds on the first candidate.
+
+## Time limit
+
+If the request file gives a deadline, plan the measurements to fit it: the questions with
+the largest estimated effect first, the screen before the repeats. At the deadline, stop
+measuring, answer each item from the rows you have, and mark the items that the rows do not
+settle as open in the ledger with the measurement that would settle them. A later round
+measures them.
 
 ## Before you return
 

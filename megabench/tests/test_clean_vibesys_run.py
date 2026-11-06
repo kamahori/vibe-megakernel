@@ -62,6 +62,10 @@ class AgentEnvironmentTests(unittest.TestCase):
                        if "VIBESYS_MICROBENCH_PHASE=1" in line]
             self.assertEqual(len(vibesys), 1)
             self.assertNotIn("gpu_broker", vibesys[0])
+            self.assertNotIn("VIBESYS_MICROBENCH_MINUTES", vibesys[0])
+            args.microbench_minutes = 40.0
+            clean.write_launch(args, run, env, srun)
+            self.assertIn("VIBESYS_MICROBENCH_MINUTES=40 ", (run / "launch.sh").read_text())
 
     def test_subscription_token_replaces_the_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

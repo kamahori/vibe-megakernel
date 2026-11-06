@@ -162,6 +162,11 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertTrue((project / "roadmap/engine-selection.md").is_file())
             self.assertIn("# Open questions", (project / "progress/microbench/open.md").read_text())
             self.assertIn("progress/microbench/open.md", (project / "TASK.md").read_text())
+            # mb_build runs in the caller's directory and refuses a build without -o.
+            result = subprocess.run([str(project / "mb_build"), "--", "x.cu"],
+                                    cwd=project / "progress", capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("-o", result.stderr)
             # The microbench gate: a round with a plan needs its requests and answers, an
             # answer per plan claim, and an engine-map status entry for the round.
             (project / "progress/plans").mkdir(parents=True, exist_ok=True)

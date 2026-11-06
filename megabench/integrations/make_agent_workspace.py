@@ -328,6 +328,14 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case,
         tool.write_text(common + f"export PRIMDB_LOCAL={local}\n"
                         f"exec {python} -m {module} {args}\"$@\"\n")
         tool.chmod(0o755)
+    # nvcc with a content cache and a time limit; it runs in the caller's directory.
+    cache = shlex.quote(str(project / "progress/microbench/.build-cache"))
+    mb_build = project / "mb_build"
+    mb_build.write_text(
+        f"#!/bin/sh\nset -eu\nexport PYTHONPATH={trusted}\n"
+        f"export MB_BUILD_CACHE=\"${{MB_BUILD_CACHE:-{cache}}}\"\n"
+        f"exec {python} -m megabench.integrations.mb_build \"$@\"\n")
+    mb_build.chmod(0o755)
     shutil.copytree(benchmark_root / "megabench/primbench", project / "primbench",
                     ignore=shutil.ignore_patterns("__pycache__", "__init__.py", "*.sbatch"))
     shutil.copy2(benchmark_root / "megabench/primdb/schema.md", project / "primbench/schema.md")
