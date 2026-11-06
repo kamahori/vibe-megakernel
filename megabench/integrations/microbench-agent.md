@@ -62,13 +62,20 @@ the data and what it shows, with its conditions.
      rounds name their source file (`./primdb explain <id>`), and the files stay under
      `progress/microbench/bench/`. Extend or reuse a file that measures the same phase; write
      a new one only for a design that no file builds.
-   - Put each measured arm in its own translation unit, with the shared code in a header. One
-     file that holds all arms behind `-D` sets compiles every arm for each set and can take
-     many minutes per build.
-   - Compile with `./mb_build -- <nvcc arguments> -o <binary>`. It skips nvcc when the
-     sources and flags did not change, and it stops a compile that passes its time limit. If
-     it stops one, split the source; do not wait for a longer compile. Start compiles in the
-     foreground, or in the background with a bounded wait, never an unbounded poll.
+   - Build each benchmark from separate translation units: one for the host driver (setup,
+     timing, checks, row output) and one for each measured arm. Each arm unit holds all of
+     its device code and exposes one host launch function, declared in a small header that
+     the driver includes. Device code that the arms share goes in a header that each arm
+     includes, not in a separately compiled unit: a device call across units is not inlined
+     and changes the time you measure. One file that holds all arms behind `-D` sets
+     compiles every arm for each set and can take many minutes per build.
+   - Compile each unit to an object and link the objects, all with
+     `./mb_build -- <nvcc arguments> -c <unit> -o <object>` and
+     `./mb_build -- <nvcc arguments> <objects> -o <binary>`. It runs nvcc only for a unit
+     whose source, included files or flags changed, and for a link whose objects changed. It
+     stops a compile that passes its time limit; if it stops one, split the unit, do not wait
+     for a longer compile. Start compiles in the foreground, or in the background with a
+     bounded wait, never an unbounded poll.
    - Compile for the device with the arch-specific target. Read the SASS (`cuobjdump -sass`)
      and confirm that the instructions you meant to time are present and are not removed or
      moved out of the loop.

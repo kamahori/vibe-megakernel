@@ -15,9 +15,18 @@ def fake_nvcc(tmp: Path, sleep: float = 0.0) -> str:
     script.write_text(
         "#!/bin/sh\n"
         "if [ \"$1\" = --version ]; then echo fake 1.0; exit 0; fi\n"
+        # -M: the make rule of each .cu input and the local headers it includes.
+        "case \" $* \" in *\" -M \"*)\n"
+        "  for a in \"$@\"; do case \"$a\" in *.cu) d=$(dirname \"$a\");\n"
+        "    printf 'x.o: %s' \"$a\";\n"
+        "    for h in $(sed -n 's/#include \"\\(.*\\)\"/\\1/p' \"$a\"); do printf ' \\\\\\n %s' \"$d/$h\"; done;\n"
+        "    echo;; esac; done; exit 0;; esac\n"
         f"echo run >> {tmp}/runs\n"
         f"sleep {sleep}\n"
-        "while [ $# -gt 0 ]; do if [ \"$1\" = -o ]; then echo bin > \"$2\"; fi; shift; done\n")
+        # The output holds the contents of its inputs, so an object changes with its source.
+        "out=; ins=; for a in \"$@\"; do [ \"$p\" = -o ] && out=$a;\n"
+        "  case \"$a\" in *.cu|*.o) [ \"$p\" = -o ] || ins=\"$ins $a\";; esac; p=$a; done\n"
+        "cat $ins > \"$out.tmp\"; echo bin >> \"$out.tmp\"; mv \"$out.tmp\" \"$out\"\n")
     script.chmod(0o755)
     return str(script)
 
@@ -33,7 +42,7 @@ class MbBuildTest(unittest.TestCase):
         self.tmp = Path(self._tmp.name)
         self.src = self.tmp / "src"
         self.src.mkdir()
-        (self.src / "a.cu").write_text("int main(){}\n")
+        (self.src / "a.cu").write_text('#include "common.cuh"\nint main(){}\n')
         (self.src / "common.cuh").write_text("// v1\n")
         self.cache = self.tmp / "cache"
 
@@ -65,6 +74,32 @@ class MbBuildTest(unittest.TestCase):
         self.assertEqual(build(self.args(), self.cache, 1, nvcc), 124)
         self.assertLess(time.monotonic() - start, 10)
         self.assertFalse(self.cache.exists() and any(self.cache.rglob("a.out")))
+
+    def test_an_edit_to_one_unit_rebuilds_only_that_unit_and_the_link(self):
+        nvcc = fake_nvcc(self.tmp)
+        (self.src / "a.cu").write_text('#include "common.cuh"\nint a;\n')
+        (self.src / "b.cu").write_text('#include "common.cuh"\nint b;\n')
+        (self.src / "other.cuh").write_text("// not included\n")
+        a_o, b_o, exe = (str(self.tmp / n) for n in ("a.o", "b.o", "bench"))
+
+        def all_steps():
+            build(["-c", str(self.src / "a.cu"), "-o", a_o], self.cache, 30, nvcc)
+            build(["-c", str(self.src / "b.cu"), "-o", b_o], self.cache, 30, nvcc)
+            build([a_o, b_o, "-o", exe], self.cache, 30, nvcc)
+
+        all_steps()
+        self.assertEqual(runs(self.tmp), 3)
+        all_steps()  # nothing changed
+        self.assertEqual(runs(self.tmp), 3)
+        (self.src / "other.cuh").write_text("// changed, still not included\n")
+        all_steps()
+        self.assertEqual(runs(self.tmp), 3)
+        (self.src / "b.cu").write_text('#include "common.cuh"\nint b2;\n')
+        all_steps()  # b.o and the link
+        self.assertEqual(runs(self.tmp), 5)
+        (self.src / "common.cuh").write_text("// v2\n")
+        all_steps()  # both units; their objects are the same bytes, so the link is a hit
+        self.assertEqual(runs(self.tmp), 7)
 
     def test_without_an_output_it_refuses(self):
         self.assertEqual(build([str(self.src / "a.cu")], self.cache, 30,
