@@ -181,6 +181,25 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertFalse((cuda / "trace_report").exists())
             self.assertIn("ncu_profile_case", (cuda / "profile_candidate").read_text())
 
+    def test_gpu_sets_hardware_text_arch_and_bandwidth(self) -> None:
+        case = select_cases("p0")[0]
+        with tempfile.TemporaryDirectory() as directory:
+            mi210 = make_workspace(case.id, Path(directory) / "mi210", agent="plain", backend="rocm",
+                                   gpu="mi210")
+            task = (mi210 / "TASK.md").read_text()
+            for text in ("AMD Instinct MI210", "gfx90a", "1.6 TB/s"):
+                self.assertIn(text, task)
+            self.assertNotIn("MI300X", task)
+            self.assertIn("--bandwidth-tb-s 1.6", (mi210 / "sol_info").read_text())
+            mi350 = make_workspace(case.id, Path(directory) / "mi350", agent="plain", backend="rocm",
+                                   gpu="mi350x")
+            task = (mi350 / "TASK.md").read_text()
+            self.assertIn("--offload-arch=gfx950", task)
+            self.assertIn("--lds-per-cu 163840", task)
+            self.assertIn("--bandwidth-tb-s 8", (mi350 / "sol_info").read_text())
+            with self.assertRaises(ValueError):
+                make_workspace(case.id, Path(directory) / "cuda", agent="plain", backend="cuda", gpu="mi210")
+
     def test_skills_and_scripts_follow_the_backend(self) -> None:
         case = select_cases("p0")[0]
         scripts = "megakernel_skills/megakernel-phase-profiling/scripts"

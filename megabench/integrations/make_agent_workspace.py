@@ -27,19 +27,40 @@ ROCM_PROFILE_TEXT = (
     "dispatch resources, HBM bandwidth/L2/instruction-mix counters and PC-sampling hotspots by "
     "instruction class (sleep/poll, s_waitcnt, VMEM, LDS, VALU), ranked as findings in "
     "`reports/trace-*/report.md`. ")
-ROCM_HARDWARE_TEXT = (
-    "\n## Platform: AMD ROCm\n\n"
-    "The GPU is an AMD Instinct MI300X (gfx942, CDNA3): 304 CUs in 8 XCDs, 64-wide "
-    "wavefronts, 64 KiB LDS per CU, 256 MB Infinity Cache, 5.3 TB/s HBM3, 192 GB. "
-    "PyTorch is the ROCm build, so `torch.cuda` and `cuda:0` address the HIP device and "
-    "`torch.utils.cpp_extension` compiles `.cu` sources with hipcc (hipify). Compile "
-    "kernels with `--offload-arch=gfx942`; `hipcc`, `hiprtc` and Triton are available. "
-    "`timeline_probe.cuh` works under HIP: it stamps raw `wall_clock64()` ticks and the CU id, and "
-    "`./timeline_candidate` scales them by the queried wall-clock rate (see `clock.json`). For the codegen gate use "
-    "`megakernel_skills/megakernel-phase-profiling/scripts/codegen_gate_amd.py` "
-    "(llvm-objdump/llvm-readelf) in place of the cuobjdump-based `codegen_gate.py`; "
-    "for fine intervals inside one CU use `clock64()`/`__builtin_amdgcn_s_memtime()` "
-    "instead of PTX `clock64`. Nsight tools are not available.\n")
+AMD_GPUS = {
+    "mi300x": {"name": "AMD Instinct MI300X", "arch": "gfx942", "bandwidth_tb_s": 5.3,
+               "lds_per_cu": 65536,
+               "detail": "CDNA3: 304 CUs in 8 XCDs, 64-wide wavefronts, 64 KiB LDS per CU, "
+                         "256 MB Infinity Cache, 5.3 TB/s HBM3, 192 GB"},
+    "mi210": {"name": "AMD Instinct MI210", "arch": "gfx90a", "bandwidth_tb_s": 1.6,
+              "lds_per_cu": 65536,
+              "detail": "CDNA2: 104 CUs, 64-wide wavefronts, 64 KiB LDS per CU, 8 MB L2, "
+                        "1.6 TB/s HBM2e, 64 GB"},
+    "mi350x": {"name": "AMD Instinct MI350X", "arch": "gfx950", "bandwidth_tb_s": 8.0,
+               "lds_per_cu": 163840,
+               "detail": "CDNA4: 256 CUs in 8 XCDs, 64-wide wavefronts, 160 KiB LDS per CU, "
+                         "256 MB Infinity Cache, 8 TB/s HBM3E, 288 GB"},
+}
+
+
+def rocm_hardware_text(gpu: str) -> str:
+    g = AMD_GPUS[gpu]
+    lds_flag = (f" (pass `--lds-per-cu {g['lds_per_cu']}`)" if g["lds_per_cu"] != 65536 else "")
+    return (
+        "\n## Platform: AMD ROCm\n\n"
+        f"The GPU is an {g['name']} ({g['arch']}, {g['detail']}). "
+        "PyTorch is the ROCm build, so `torch.cuda` and `cuda:0` address the HIP device and "
+        "`torch.utils.cpp_extension` compiles `.cu` sources with hipcc (hipify). Compile "
+        f"kernels with `--offload-arch={g['arch']}`; `hipcc`, `hiprtc` and Triton are available. "
+        "`timeline_probe.cuh` works under HIP: it stamps raw `wall_clock64()` ticks and the CU id, and "
+        "`./timeline_candidate` scales them by the queried wall-clock rate (see `clock.json`). "
+        "The codegen gate is "
+        "`megakernel_skills/megakernel-phase-profiling/scripts/codegen_gate_amd.py` "
+        f"(llvm-objdump/llvm-readelf){lds_flag}; "
+        "for fine intervals inside one CU use `clock64()`/`__builtin_amdgcn_s_memtime()` "
+        "instead of PTX `clock64`. Nsight tools are not available.\n")
+
+
 REFERENCE_FILES = {
     "dense_step": ("dense.py", "common.py", "references/qwen3.py"),
     "moe_step": ("moe.py", "common.py", "references/qwen3.py",
@@ -162,7 +183,8 @@ def _copy_skills(benchmark_root: Path, dest: Path, backend: str,
 
 
 def _write_tools(project: Path, benchmark_root: Path, case: Case,
-                 backend: str = "cuda", optional_skills: tuple[str, ...] = ()) -> None:
+                 backend: str = "cuda", optional_skills: tuple[str, ...] = (),
+                 gpu: str | None = None) -> None:
     python = shlex.quote(str(_python(benchmark_root)))
     trusted = shlex.quote(str(benchmark_root))
     submission = shlex.quote(str(project / "submission.py"))
@@ -199,7 +221,8 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case,
     sol = project / "sol_info"
     sol.write_text(
         common + f"exec {python} -m megabench sol --case {case_id} {regimes_flag}"
-        + ("--bandwidth-tb-s 5.3 " if backend == "rocm" else "") + "\"$@\"\n")
+        + (f"--bandwidth-tb-s {AMD_GPUS[gpu]['bandwidth_tb_s']:g} " if backend == "rocm" else "")
+        + "\"$@\"\n")
     sol.chmod(0o755)
     if backend == "rocm":
         report = project / "trace_report"
@@ -267,9 +290,15 @@ def _write_kernelagent_task(project: Path, benchmark_root: Path,
 def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
                    benchmark_root: Path = BENCHMARK_ROOT,
                    regimes: Path | None = None, backend: str = "cuda",
-                   optional_skills: tuple[str, ...] = ()) -> Path:
+                   optional_skills: tuple[str, ...] = (), gpu: str | None = None) -> Path:
     if backend not in ("cuda", "rocm"):
         raise ValueError(f"unsupported backend: {backend}")
+    if backend == "rocm":
+        gpu = gpu or "mi300x"
+        if gpu not in AMD_GPUS:
+            raise ValueError(f"unsupported AMD GPU {gpu!r}; choose from {sorted(AMD_GPUS)}")
+    elif gpu is not None:
+        raise ValueError("--gpu selects an AMD GPU and applies to the rocm backend only")
     if agent not in ("vibesys", "kernelagent", "plain"):
         raise ValueError(f"unsupported agent: {agent}")
     case = select_cases("all", [case_id])[0]
@@ -393,13 +422,14 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
          else "HBM speed-of-light floor and byte breakdown") +
         "; pass `--result PATH` for "
         "the gap to a checked CUDA-event result where a traffic model is available. "
-        + ("The bandwidth here is 5.3 TB/s per MI300X. " if backend == "rocm" else
+        + (f"The bandwidth here is {AMD_GPUS[gpu]['bandwidth_tb_s']:g} TB/s per "
+           f"{AMD_GPUS[gpu]['name'].split()[-1]}. " if backend == "rocm" else
            "The default bandwidth is 8 TB/s per B200. ") +
         "These commands load the trusted benchmark outside "
         "this workspace; final grading is run separately.\n")
     if backend == "rocm":
-        (project / "TASK.md").write_text((project / "TASK.md").read_text() + ROCM_HARDWARE_TEXT)
-    _write_tools(project, benchmark_root, case, backend, tuple(optional_skills))
+        (project / "TASK.md").write_text((project / "TASK.md").read_text() + rocm_hardware_text(gpu))
+    _write_tools(project, benchmark_root, case, backend, tuple(optional_skills), gpu)
     if agent == "vibesys":
         shutil.copy2(benchmark_root / "megabench/integrations/vibesys-agent.example.toml",
                      project / "agent.toml")
@@ -430,6 +460,9 @@ def main() -> None:
                         default=None,
                         help="GPU backend: selects the profiler, skills and skill scripts "
                              "(default: rocm when /opt/rocm exists and nvidia-smi does not)")
+    parser.add_argument("--gpu", choices=sorted(AMD_GPUS), default=None,
+                        help="AMD GPU for the rocm backend: sets TASK.md's hardware section, the "
+                             "offload arch and sol_info's bandwidth (default: mi300x)")
     parser.add_argument("--optional-skill", action="append", default=[], metavar="NAME",
                         help="also copy this skill from megabench/skills-optional "
                              "(e.g. megakernel-stage-linking); repeatable")
@@ -438,7 +471,8 @@ def main() -> None:
                                and shutil.which("nvidia-smi") is None else "cuda")
     print(make_workspace(args.case, args.output, agent=args.agent,
                          benchmark_root=args.benchmark_root, regimes=args.regimes,
-                         backend=backend, optional_skills=tuple(args.optional_skill)))
+                         backend=backend, optional_skills=tuple(args.optional_skill),
+                         gpu=args.gpu))
 
 
 if __name__ == "__main__":

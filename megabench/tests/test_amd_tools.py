@@ -14,7 +14,7 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-from ..integrations import amd_trace_report, timeline
+from ..integrations import amd_trace_report, timeline, timeline_profile_case
 
 SKILLS = Path(__file__).resolve().parents[1] / "skills"
 
@@ -58,6 +58,18 @@ class TimelineTickTests(unittest.TestCase):
             (Path(d) / "clock.json").write_text(json.dumps({"tick_ns": 10.0}))
             self.assertEqual(timeline.load(raw, ["p"]).intervals[0].end_ns, 250.0)
             self.assertEqual(timeline.load(raw, ["p"], tick_ns=1.0).intervals[0].end_ns, 25.0)
+
+    def test_wall_clock_rate_must_be_plausible(self) -> None:
+        self.assertEqual(timeline_profile_case.tick_ns_from_rate(0, 25_000), 40.0)
+        self.assertEqual(timeline_profile_case.tick_ns_from_rate(0, 100_000), 10.0)
+        for status, rate in ((0, 0), (1, 25_000), (0, 5_000_000), (0, 999)):
+            with self.subTest(status=status, rate=rate), self.assertRaises(RuntimeError) as err:
+                timeline_profile_case.tick_ns_from_rate(status, rate)
+            self.assertIn("MEGABENCH_TICK_NS", str(err.exception))
+
+    def test_tick_override_wins_without_a_device_query(self) -> None:
+        with unittest.mock.patch.dict("os.environ", {"MEGABENCH_TICK_NS": "40"}):
+            self.assertEqual(timeline_profile_case._tick_ns(0), 40.0)
 
 
 NOTES = """
@@ -187,6 +199,14 @@ class StageLinkingTests(unittest.TestCase):
         pipe["slots"]["a"] = "b"
         errs = plk.check(PKGS, pipe)
         self.assertTrue(any(e.startswith("L-CALL package drv calls 'stage_a'") for e in errs))
+
+    def test_onetu_scopes_each_package_s_defines(self) -> None:
+        pkgs = dict(PKGS, a={**PKGS["a"], "defines": ["VARIANT=2", "FAST"]})
+        src = plk.onetu_source(pkgs, self.pipe()).splitlines()
+        i = src.index('#include "a.cu"')
+        self.assertEqual(src[i - 2:i], ["#define VARIANT 2", "#define FAST"])
+        self.assertEqual(src[i + 1:i + 3], ["#undef VARIANT", "#undef FAST"])
+        self.assertNotIn("#define", "\n".join(src[:src.index('#include "i.cu"') + 1]))
 
     def test_unknown_package_is_rejected(self) -> None:
         pipe = self.pipe(a="missing")

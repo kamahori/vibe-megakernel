@@ -162,12 +162,16 @@ no Blackwell tensor-core skill and no cuobjdump gate. Its tools change as follow
   ticks, and `./timeline_candidate` scales them by
   `hipDeviceAttributeWallClockRate` (25 MHz on MI210) and writes the scale to
   `clock.json`. `python -m megabench.integrations.timeline` reads that file
-  when it re-reads a saved buffer; `--tick-ns` overrides it.
+  when it re-reads a saved buffer; `--tick-ns` overrides it. The rate query uses
+  the ROCm 7.x enum value and rejects an implausible answer; set
+  `MEGABENCH_TICK_NS` (nanoseconds per tick) where it fails.
 - `megakernel_skills/megakernel-phase-profiling/scripts/codegen_gate_amd.py`
   replaces the cuobjdump-based gate. It extracts code objects with
   `clang-offload-bundler`, compares ISA from `llvm-objdump`, and reads VGPR,
   AGPR, SGPR, LDS, scratch and spill counts from `llvm-readelf --notes`.
-- `./sol_info` assumes 5.3 TB/s per MI300X.
+- `--gpu {mi300x,mi210,mi350x}` (default `mi300x`) sets the hardware section of
+  TASK.md, the offload architecture (gfx942, gfx90a, gfx950) and the bandwidth
+  `./sol_info` assumes (5.3, 1.6 and 8 TB/s).
 - The PipeLink-style `megakernel-stage-linking` skill is optional
   (`--optional-skill megakernel-stage-linking`). It did not improve performance on
   MI300X: a separately compiled and linked seam cost 1.6-2.4%, and stages swapped

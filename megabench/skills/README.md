@@ -3,10 +3,10 @@
 Method guidance for megakernel work, one skill per directory:
 
 - `megakernel-phase-profiling`: split the kernel into phases, time them, and gate codegen
-  changes (`scripts/codegen_gate.py`).
+  changes (`scripts/codegen_gate.py` on cuda, `scripts/codegen_gate_amd.py` on rocm).
 - `megakernel-microbench`: study the slowest or furthest-from-floor phase in isolated
   microbenchmarks; these do not use rounds.
-- `blackwell-tensor-core-design`: evaluate Blackwell tensor-core designs.
+- `blackwell-tensor-core-design`: evaluate Blackwell tensor-core designs (cuda backend only).
 - `megakernel-regimes`: decide whether to specialize the kernel per batch size or KV length, using
   trace-derived regimes (`./trace_regimes`).
 

@@ -45,6 +45,21 @@ def check(pkgs, pipe):
             run(step, None)
     return sorted(set(errs))
 
+def onetu_source(pkgs, pipe):
+    """One TU that #includes every package, each with its own defines scoped around it.
+
+    A header shared by several packages (e.g. an ABI header with #pragma once) is expanded only
+    once, under the first package's defines.
+    """
+    lines = []
+    for n in pipe["slots"].values():
+        defs = pkgs[n].get("defines", [])
+        lines += [f"#define {d.replace('=', ' ', 1)}" for d in defs]
+        lines.append(f'#include "{pkgs[n]["src"]}"')
+        lines += [f"#undef {d.split('=', 1)[0]}" for d in defs]
+    return "\n".join(lines) + "\n"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--packages", required=True); ap.add_argument("--pipeline", required=True)
@@ -68,14 +83,11 @@ def main():
     subprocess.check_call(["hipcc", *base, "-fgpu-rdc", "--hip-link", "-shared", *objs, "-o", a.out])
     print(f"linked {a.out} from {len(objs)} packages")
     if a.onetu:
-        defs = {d for n in pipe["slots"].values() for d in pkgs[n].get("defines", [])}
-        if len({tuple(pkgs[n].get("defines", [])) for n in pipe["slots"].values()} - {()}) > 0:
-            print("note: package-specific defines are applied globally in the one-TU control")
         with tempfile.NamedTemporaryFile("w", suffix=".cu", dir=root, delete=False) as f:
-            for n in pipe["slots"].values(): f.write(f'#include "{pkgs[n]["src"]}"\n')
+            f.write(onetu_source(pkgs, pipe))
             tu = f.name
         try:
-            subprocess.check_call(["hipcc", *base, *[f"-D{d}" for d in sorted(defs)], "-shared", tu, "-o", a.onetu])
+            subprocess.check_call(["hipcc", *base, "-shared", tu, "-o", a.onetu])
         finally:
             os.unlink(tu)
         print(f"one-TU control {a.onetu}")
