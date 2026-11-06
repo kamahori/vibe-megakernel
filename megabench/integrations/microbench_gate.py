@@ -125,6 +125,40 @@ def local_sources(workspace: Path) -> list[tuple[str, dict]]:
     return out
 
 
+def design_of(row: dict) -> str | None:
+    """The design a row measures: its engine, else its arm, else its primitive.
+
+    Rows that only load and synchronise (an oracle) set a floor; they are not a design.
+    """
+    params = row.get("params") or {}
+    name = params.get("engine") or params.get("arm") or row.get("primitive")
+    if not name or str(name).lower().startswith("oracle"):
+        return None
+    return str(name)
+
+
+def matched_comparison(workspace: Path, question: str, round_name: str) -> set[str]:
+    """Ids of the matched rows for *question* in *round_name*, if they compare two designs.
+
+    A matched measurement compares designs under the same conditions, so the rows must
+    cover at least two designs; matched rows of one design alone are not a comparison.
+    """
+    path = workspace / MICROBENCH / "primdb_local.jsonl"
+    rows = []
+    if path.is_file():
+        for line in path.read_text().splitlines():
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    picked = [r for r in rows if (r.get("source") or {}).get("question") == question
+              and (r.get("source") or {}).get("conditions") == "matched"
+              and (r.get("source") or {}).get("round") == round_name]
+    if len({d for d in map(design_of, picked) if d}) < 2:
+        return set()
+    return {r.get("id") for r in picked}
+
+
 SEEDED = "round-0000"  # questions written into the ledger when the workspace was made
 
 
@@ -144,8 +178,9 @@ def stalest_unmatched(workspace: Path, round_name: str) -> dict | None:
     last = {}
     for _, s in local_sources(workspace):
         if s.get("conditions") == "matched" and s.get("round", "") < round_name:
-            tag = s.get("question")
-            last[tag] = max(last.get(tag, ""), s.get("round", ""))
+            tag, rnd = s.get("question"), s.get("round", "")
+            if rnd > last.get(tag, "") and matched_comparison(workspace, tag, rnd):
+                last[tag] = rnd
     for path in (workspace / MICROBENCH / "answers").glob("round-*.md"):
         if path.stem >= round_name:
             continue
@@ -200,14 +235,14 @@ def check_ledger(workspace: Path, round_name: str, answers: str) -> list[str]:
             "with ./primdb add, or close or refute it in the ledger with row ids")
     stale = stalest_unmatched(workspace, round_name)
     if stale and stale["tag"] not in deferred:
-        matched = {i for i, s in local_sources(workspace) if s.get("round") == round_name
-                   and s.get("question") == stale["tag"] and s.get("conditions") == "matched"}
+        matched = matched_comparison(workspace, stale["tag"], round_name)
         if not matched & set(ROW_ID.findall(_section(answers, stale["tag"]))):
             problems.append(
                 f"open question {stale['tag']} has gone longest without a matched measurement: "
-                f"build the measurement its `settles it` line names, add the rows with "
-                f"./primdb add --question {stale['tag']} --conditions matched, and cite them in "
-                "its section (or defer it, once)")
+                f"build every design its `settles it` line names under the same conditions "
+                f"(matched rows of one design alone are not a comparison; an oracle is not a "
+                f"design), add the rows with ./primdb add --question {stale['tag']} "
+                "--conditions matched, and cite them in its section (or defer it, once)")
     if len(deferred) > 1:
         problems.append(f"only one carried open question may be deferred per round, not "
                         f"{', '.join(deferred)}")

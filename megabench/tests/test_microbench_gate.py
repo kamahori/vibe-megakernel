@@ -80,9 +80,10 @@ class GateTests(unittest.TestCase):
             # A row measured in an earlier round does not count; one stamped with this round does.
             local = mb / "primdb_local.jsonl"
             local.write_text(json.dumps({"id": "aaaaaaaaaa", "source": {"round": "round-0002"}}) + "\n"
-                             + json.dumps({"id": "bbbbbbbbbb", "source": {"round": "round-0003",
-                                                                    "question": "Q1",
-                                                                    "conditions": "matched"}}) + "\n")
+                             + "".join(json.dumps({"id": i, "params": {"engine": e},
+                                                   "source": {"round": "round-0003", "question": "Q1",
+                                                              "conditions": "matched"}}) + "\n"
+                                       for i, e in (("bbbbbbbbbb", "one"), ("bbbbbbbbbc", "two"))))
             (mb / "answers/round-0003.md").write_text("P1\n## Q1\nrow aaaaaaaaaa\n")
             self.assertIn("Q1", check(ws)[0])
             (mb / "answers/round-0003.md").write_text("P1\n## Q1\nrow bbbbbbbbbb\n## Q2\n")
@@ -113,15 +114,20 @@ class GateTests(unittest.TestCase):
                                         "## Q2 · open · opened round-0001\n")
 
             def rows(*specs):
-                (mb / "primdb_local.jsonl").write_text("".join(
-                    json.dumps({"id": i, "source": {"round": r, "question": q, "conditions": c}})
-                    + "\n" for i, r, q, c in specs))
+                # Each matched spec also gets a second design, so that it is a comparison.
+                out = []
+                for i, r, q, c in specs:
+                    for k, engine in enumerate(("one", "two") if c == "matched" else ("one",)):
+                        out.append(json.dumps({"id": i[:-1] + str(k), "params": {"engine": engine},
+                                               "source": {"round": r, "question": q,
+                                                          "conditions": c}}) + "\n")
+                (mb / "primdb_local.jsonl").write_text("".join(out))
 
             # Q1 had a matched row in round 2; Q2 never did, so Q2 is due.
             rows(("aaaaaaaaaa", "round-0002", "Q1", "matched"),
                  ("bbbbbbbbbb", "round-0003", "Q1", "other"),
                  ("cccccccccc", "round-0003", "Q2", "other"))
-            (mb / "answers/round-0003.md").write_text("P1\n## Q1\nbbbbbbbbbb\n## Q2\ncccccccccc\n")
+            (mb / "answers/round-0003.md").write_text("P1\n## Q1\nbbbbbbbbb0\n## Q2\nccccccccc0\n")
             problems = check(ws)
             self.assertEqual(len(problems), 1, problems)
             self.assertIn("Q2 has gone longest", problems[0])
@@ -138,7 +144,7 @@ class GateTests(unittest.TestCase):
                  ("bbbbbbbbbb", "round-0003", "Q1", "other"),
                  ("cccccccccc", "round-0003", "Q2", "matched"))
             # Deferring the due question is the round's one deferral.
-            (mb / "answers/round-0003.md").write_text("P1\n## Q1\nbbbbbbbbbb\n## Q2\ndeferred: x\n")
+            (mb / "answers/round-0003.md").write_text("P1\n## Q1\nbbbbbbbbb0\n## Q2\ndeferred: x\n")
             self.assertEqual(check(ws), [])
 
     def test_seeded_question_is_due_in_round_one_and_cannot_be_deferred(self) -> None:
@@ -165,9 +171,17 @@ class GateTests(unittest.TestCase):
                                                 "conditions": "other"}}) + "\n")
             (mb / "answers/round-0001.md").write_text("P1\n## Q1\ndddddddddd\n")
             self.assertIn("Q1 has gone longest", check(ws)[0])
-            (mb / "primdb_local.jsonl").write_text(json.dumps(
-                {"id": "dddddddddd", "source": {"round": "round-0001", "question": "Q1",
-                                                "conditions": "matched"}}) + "\n")
+            matched = [{"id": "dddddddddd", "params": {"engine": "one"},
+                        "source": {"round": "round-0001", "question": "Q1", "conditions": "matched"}},
+                       {"id": "eeeeeeeeee", "params": {"engine": "oracle_load_only"},
+                        "source": {"round": "round-0001", "question": "Q1", "conditions": "matched"}}]
+            (mb / "primdb_local.jsonl").write_text("".join(json.dumps(r) + "\n" for r in matched))
+            # Matched rows of one design and an oracle are not a comparison.
+            self.assertIn("Q1 has gone longest", check(ws)[0])
+            matched.append({"id": "ffffffffff", "params": {"engine": "two"},
+                            "source": {"round": "round-0001", "question": "Q1",
+                                       "conditions": "matched"}})
+            (mb / "primdb_local.jsonl").write_text("".join(json.dumps(r) + "\n" for r in matched))
             self.assertEqual(check(ws), [])
 
     def test_open_questions_become_a_plan_claim(self) -> None:

@@ -188,9 +188,10 @@ class AgentWorkspaceTests(unittest.TestCase):
             result = subprocess.run([str(project / "check_candidate"), "--help"],
                                     cwd=project, capture_output=True, text=True)
             self.assertIn("Q1 has gone longest", result.stderr)
-            (project / "progress/microbench/primdb_local.jsonl").write_text(json.dumps(
-                {"id": "eeeeeeeeee", "source": {"round": "round-0001", "question": "Q1",
-                                                "conditions": "matched"}}) + "\n")
+            (project / "progress/microbench/primdb_local.jsonl").write_text("".join(json.dumps(
+                {"id": i, "params": {"engine": e}, "source": {"round": "round-0001", "question": "Q1",
+                                                              "conditions": "matched"}}) + "\n"
+                for i, e in (("eeeeeeeeee", "one"), ("eeeeeeeeef", "two"))))
             (project / "progress/microbench/answers/round-0001.md").write_text(
                 "P1 P2: rows ...\n## Q1\neeeeeeeeee\n")
             with (project / "progress/engine-map.md").open("a") as f:
