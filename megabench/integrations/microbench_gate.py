@@ -137,11 +137,36 @@ def design_of(row: dict) -> str | None:
     return str(name)
 
 
+def _norm(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def engine_families(workspace: Path) -> list[str]:
+    """The engine names in the tables of `progress/engine-map.md`."""
+    path = workspace / "progress" / "engine-map.md"
+    if not path.is_file():
+        return []
+    names = {m.group(1).strip() for m in re.finditer(r"(?m)^\|\s*([^|]+?)\s*\|", path.read_text())}
+    return sorted(n for n in names if _norm(n) and _norm(n) != "engine" and not set(n) <= set("-: "))
+
+
+def family_of(design: str, families: list[str]) -> str | None:
+    """The engine-map family whose name begins the design name, the longest match first."""
+    d = _norm(design)
+    for f in sorted(families, key=lambda f: -len(_norm(f))):
+        if d.startswith(_norm(f)):
+            return f
+    return None
+
+
 def matched_comparison(workspace: Path, question: str, round_name: str) -> set[str]:
     """Ids of the matched rows for *question* in *round_name*, if they compare two designs.
 
     A matched measurement compares designs under the same conditions, so the rows must
     cover at least two designs; matched rows of one design alone are not a comparison.
+    The question seeded from the engine map compares engines, so its rows must cover at
+    least two of the engine families that the engine map lists; variants of one engine
+    are not an engine comparison.
     """
     path = workspace / MICROBENCH / "primdb_local.jsonl"
     rows = []
@@ -154,7 +179,12 @@ def matched_comparison(workspace: Path, question: str, round_name: str) -> set[s
     picked = [r for r in rows if (r.get("source") or {}).get("question") == question
               and (r.get("source") or {}).get("conditions") == "matched"
               and (r.get("source") or {}).get("round") == round_name]
-    if len({d for d in map(design_of, picked) if d}) < 2:
+    designs = {d for d in map(design_of, picked) if d}
+    if len(designs) < 2:
+        return set()
+    seeded = any(e["tag"] == question and e["opened"] == SEEDED for e in ledger(workspace))
+    families = engine_families(workspace)
+    if seeded and families and len({family_of(d, families) for d in designs} - {None}) < 2:
         return set()
     return {r.get("id") for r in picked}
 
@@ -241,7 +271,8 @@ def check_ledger(workspace: Path, round_name: str, answers: str) -> list[str]:
                 f"open question {stale['tag']} has gone longest without a matched measurement: "
                 f"build every design its `settles it` line names under the same conditions "
                 f"(matched rows of one design alone are not a comparison; an oracle is not a "
-                f"design), add the rows with ./primdb add --question {stale['tag']} "
+                f"design; for a question seeded from the engine map, variants of one engine "
+                f"family are not an engine comparison), add the rows with ./primdb add --question {stale['tag']} "
                 "--conditions matched, and cite them in its section (or defer it, once)")
     if len(deferred) > 1:
         problems.append(f"only one carried open question may be deferred per round, not "

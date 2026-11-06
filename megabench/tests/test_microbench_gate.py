@@ -184,6 +184,35 @@ class GateTests(unittest.TestCase):
             (mb / "primdb_local.jsonl").write_text("".join(json.dumps(r) + "\n" for r in matched))
             self.assertEqual(check(ws), [])
 
+    def test_seeded_question_needs_two_engine_families_from_the_engine_map(self) -> None:
+        from megabench.integrations.make_agent_workspace import seeded_ledger
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            mb = ws / "progress/microbench"
+            (ws / "progress/plans").mkdir(parents=True)
+            (ws / "progress/plans/round-0001.json").write_text(json.dumps({"reasoning": "Go."}))
+            for kind in ("requests", "answers"):
+                (mb / kind).mkdir(parents=True)
+                (mb / kind / "round-0001.md").write_text("- q\n")
+            (ws / "progress/engine-map.md").write_text(
+                "### E1: mm M=50 N=4096 K=1024\n\n| engine | mapping |\n|---|---|\n"
+                "| alpha.one | x |\n| beta | y |\n\n### round-0001\n")
+            (mb / "open.md").write_text(seeded_ledger("### E1: mm M=50 N=4096 K=1024\n"))
+
+            def rows(*engines):
+                (mb / "primdb_local.jsonl").write_text("".join(json.dumps(
+                    {"id": f"{k:010d}", "params": {"engine": e},
+                     "source": {"round": "round-0001", "question": "Q1", "conditions": "matched"}})
+                    + "\n" for k, e in enumerate(engines)))
+                (mb / "answers/round-0001.md").write_text(
+                    "P1\n## Q1\n" + " ".join(f"{k:010d}" for k in range(len(engines))) + "\n")
+
+            # Two variants of one engine family are not an engine comparison.
+            rows("alpha_one_plain", "alpha_one_prefetch", "oracle_load")
+            self.assertIn("Q1 has gone longest", check(ws)[0])
+            rows("alpha_one_plain", "beta_split")
+            self.assertEqual(check(ws), [])
+
     def test_open_questions_become_a_plan_claim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             ws = Path(directory)
