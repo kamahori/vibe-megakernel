@@ -89,6 +89,12 @@ engine map's tables, and give its estimate as a range. In round 1, answer it fir
 full, before the other items: the implementer builds the first candidate on that answer, and
 every later round builds on the first candidate.
 
+## Before you return
+
+Run `./microbench_check`. It runs the gate that `./check_candidate` runs. If it fails, do what
+its message names, then run it again. Return only when it passes: the implementer writes code
+from the answers that you return, and answers that the gate rejects are not complete.
+
 ## Comparing engines and designs
 
 An engine is not a drop-in replacement for an instruction. Each engine allows a different

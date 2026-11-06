@@ -171,6 +171,11 @@ class AgentWorkspaceTests(unittest.TestCase):
                                     cwd=project, capture_output=True, text=True)
             self.assertEqual(result.returncode, 3)
             self.assertIn("progress/microbench/requests/round-0001.md is missing", result.stderr)
+            # The microbench agent runs the same gate before it returns its answers.
+            result = subprocess.run([str(project / "microbench_check")],
+                                    cwd=project, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("progress/microbench/requests/round-0001.md is missing", result.stderr)
             result = subprocess.run([str(project / "microbench_items")],
                                     cwd=project, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)

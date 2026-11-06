@@ -177,7 +177,11 @@ MICROBENCH_TASK = (
     "largest question still open in `progress/microbench/open.md`. It writes "
     "`progress/microbench/answers/<round>.md`, adds new measurements to the database, updates "
     "the ledger, and adds a status entry for the round to `progress/engine-map.md`.\n"
-    "4. Wait for the answers before you write the code of a phase, then implement the plan. In your notes, cite the answers that changed "
+    "4. Wait for complete answers before you write the code of a phase: `./microbench_check` "
+    "passes only when they are complete. If it fails after the subagent returns, give the "
+    "subagent its message and wait again. Then implement the plan. If later answers rank a "
+    "phase's design differently from the code you already wrote, rebuild that phase in the "
+    "design they rank best before you run `./check_candidate`. In your notes, cite the answers that changed "
     "or confirmed a design choice. The plan's choice of design (engine, decomposition, data "
     "path) for a phase whose code this round writes or rewrites is a claim, not a constraint: "
     "if this round's matched rows rank another design best for that phase, build the phase in "
@@ -311,7 +315,9 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case,
     for name, module, args in (("primdb", "megabench.primdb", ""),
                                ("engine_map", "megabench.primdb.engine_map", ""),
                                ("microbench_items", "megabench.integrations.microbench_gate",
-                                "items ")):
+                                "items "),
+                               ("microbench_check", "megabench.integrations.microbench_gate",
+                                "check ")):
         tool = project / name
         tool.write_text(common + f"export PRIMDB_LOCAL={local}\n"
                         f"exec {python} -m {module} {args}\"$@\"\n")
