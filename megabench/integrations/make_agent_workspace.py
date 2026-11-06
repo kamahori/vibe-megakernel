@@ -181,7 +181,12 @@ MICROBENCH_TASK = (
     "passes only when they are complete. If it fails after the subagent returns, give the "
     "subagent its message and wait again. Then implement the plan. If later answers rank a "
     "phase's design differently from the code you already wrote, rebuild that phase in the "
-    "design they rank best before you run `./check_candidate`. In your notes, cite the answers that changed "
+    "design they rank best before you run `./check_candidate`. Before the check, write "
+    "`progress/microbench/build/<round>.md`: one table row per phase whose code this round "
+    "wrote or changed, `| phase | design built | design ranked best | rows | reason |`. "
+    "`./check_candidate` refuses a phase built in another engine family than the one the rows "
+    "rank best, unless its reason cites rows measured this round that show the built design is "
+    "not slower for that phase. In your notes, cite the answers that changed "
     "or confirmed a design choice. The plan's choice of design (engine, decomposition, data "
     "path) for a phase whose code this round writes or rewrites is a claim, not a constraint: "
     "if this round's matched rows rank another design best for that phase, build the phase in "
@@ -283,7 +288,7 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case,
         gpu_run.chmod(0o755)
     check = project / "check_candidate"
     check.write_text(
-        common + f"{python} -m megabench.integrations.microbench_gate check || exit 3\n"
+        common + f"{python} -m megabench.integrations.microbench_gate check --build || exit 3\n"
         "run_id=$(date -u +%Y%m%dT%H%M%S)-$$\n"
         f"exec {gpu}{python} -m megabench evaluate --case {case_id} "
         f"--submission {submission} --method local-check "

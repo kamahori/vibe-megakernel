@@ -11,7 +11,9 @@ that progress/microbench/open.md carries open from an earlier round was measured
 that `./primdb add` stamped with the round) or closed with row ids; one may be deferred. The
 carried question that has gone longest without a matched measurement (rows added with
 `--question Q<n> --conditions matched`) needs one this round. Without a
-plan there is nothing to check. ./check_candidate runs `check` first and stops on a failure.
+plan there is nothing to check. ./check_candidate runs `check --build` first and stops on a failure:
+--build also needs progress/microbench/build/<round>.md, the design each changed phase was built
+in against the design the matched rows rank best.
 """
 
 from __future__ import annotations
@@ -280,7 +282,74 @@ def check_ledger(workspace: Path, round_name: str, answers: str) -> list[str]:
     return problems
 
 
-def check(workspace: Path) -> list[str]:
+BUILD = MICROBENCH / "build"
+BUILD_HELP = ("one table row per phase whose code this round wrote or changed: "
+              "| phase | design built | design ranked best | rows | reason |, where the ranked "
+              "design and its row ids come from this round's matched rows")
+
+
+def known_rows(workspace: Path, round_name: str) -> set[str]:
+    """Row ids that the workspace database holds or this round's answers cite."""
+    ids = {i for i, _ in local_sources(workspace) if i}
+    answer = workspace / MICROBENCH / "answers" / f"{round_name}.md"
+    if answer.is_file():
+        ids |= set(ROW_ID.findall(answer.read_text()))
+    return ids
+
+
+def check_build(workspace: Path, round_name: str) -> list[str]:
+    """The build record of the round: which design each changed phase was built in.
+
+    A phase built in another engine family than the one this round's matched rows rank best
+    needs a reason that cites rows measured this round showing the built design is not slower.
+    """
+    path = workspace / BUILD / f"{round_name}.md"
+    rel = path.relative_to(workspace)
+    if not path.is_file():
+        return [f"{rel} is missing: write {BUILD_HELP}"]
+    families = engine_families(workspace)
+    known = known_rows(workspace, round_name)
+    fresh = {}  # id -> design of each row measured this round
+    path_db = workspace / MICROBENCH / "primdb_local.jsonl"
+    if path_db.is_file():
+        for line in path_db.read_text().splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (row.get("source") or {}).get("round") == round_name and row.get("id"):
+                fresh[row["id"]] = design_of(row)
+    problems, phases = [], 0
+    for line in path.read_text().splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if not line.lstrip().startswith("|") or len(cells) < 4:
+            continue
+        if _norm(cells[0]) in ("phase", "") or set(cells[0]) <= set("-: "):
+            continue
+        phases += 1
+        phase, built, best, rows = cells[:4]
+        reason = cells[4] if len(cells) > 4 else ""
+        if not set(ROW_ID.findall(rows)) & known:
+            problems.append(f"{rel}: phase {phase} cites no row id of this round's answers or "
+                            "the workspace database for its ranking")
+        same = (family_of(built, families) == family_of(best, families)
+                if families and family_of(best, families) else _norm(built) == _norm(best))
+        cited = [fresh[i] for i in ROW_ID.findall(reason) if fresh.get(i)]
+        if not same and not any(family_of(d, families) == family_of(built, families)
+                                if families else _norm(d).startswith(_norm(built))
+                                for d in cited):
+            problems.append(
+                f"{rel}: phase {phase} is built in {built}, but the rows rank {best} best. A phase "
+                "built in a lower-ranked design is code that later rounds throw away: rebuild it "
+                "in the ranked design (the verified proxies under progress/microbench/bench/ are "
+                "a start), or give a reason that cites rows of the built design measured this "
+                "round showing that it is not slower for this phase")
+    if phases == 0:
+        problems.append(f"{rel} has no phase rows: write {BUILD_HELP}")
+    return problems
+
+
+def check(workspace: Path, build: bool = False) -> list[str]:
     plan = newest_plan(workspace)
     if plan is None:
         return []
@@ -306,6 +375,8 @@ def check(workspace: Path) -> list[str]:
     engine_map = workspace / ENGINE_MAP
     if not engine_map.is_file() or round_name not in engine_map.read_text():
         problems.append(f"{ENGINE_MAP} has no status entry for {round_name}")
+    if build and not problems:
+        problems += check_build(workspace, round_name)
     return problems
 
 
@@ -314,6 +385,8 @@ def main(argv: list[str] | None = None) -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", choices=("items", "check"))
     p.add_argument("--workspace", type=Path, default=Path.cwd())
+    p.add_argument("--build", action="store_true",
+                   help="also check the round's build record (./check_candidate)")
     args = p.parse_args(argv)
     if args.command == "items":
         plan = newest_plan(args.workspace)
@@ -323,10 +396,11 @@ def main(argv: list[str] | None = None) -> int:
         write_items(args.workspace, plan)
         print((args.workspace / MICROBENCH / "items" / f"{plan.stem}.md").read_text(), end="")
         return 0
-    problems = check(args.workspace)
+    problems = check(args.workspace, build=args.build)
     for problem in problems:
-        print(f"check_candidate: {problem}. Do the microbench phase of TASK.md first.",
-              file=sys.stderr)
+        step = ("Build each phase as TASK.md step 4 says" if "/build/" in problem
+                else "Do the microbench phase of TASK.md first")
+        print(f"check_candidate: {problem}. {step}.", file=sys.stderr)
     return 3 if problems else 0
 
 

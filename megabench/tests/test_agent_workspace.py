@@ -207,6 +207,23 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertIn("design-space.md has no reconcile entry", result.stderr)
             with (project / "progress/design-space.md").open("a") as f:
                 f.write("### round-0001\n")
+            # The answers pass; ./check_candidate also needs the round's build record.
+            result = subprocess.run([str(project / "microbench_check")],
+                                    cwd=project, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = subprocess.run([str(project / "check_candidate"), "--help"],
+                                    cwd=project, capture_output=True, text=True)
+            self.assertIn("build/round-0001.md is missing", result.stderr)
+            (project / "progress/microbench/build").mkdir()
+            (project / "progress/microbench/build/round-0001.md").write_text(
+                "| phase | built | best | rows | reason |\n|---|---|---|---|---|\n"
+                "| E1 | mma_sync_a | tcgen05_b | eeeeeeeeef | |\n")
+            result = subprocess.run([str(project / "check_candidate"), "--help"],
+                                    cwd=project, capture_output=True, text=True)
+            self.assertIn("rank tcgen05_b best", result.stderr)
+            (project / "progress/microbench/build/round-0001.md").write_text(
+                "| phase | built | best | rows | reason |\n|---|---|---|---|---|\n"
+                "| E1 | tcgen05_b | tcgen05_b | eeeeeeeeef | |\n")
             result = subprocess.run([str(project / "check_candidate"), "--help"],
                                     cwd=project, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)

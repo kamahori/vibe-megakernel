@@ -218,6 +218,26 @@ class GateTests(unittest.TestCase):
             self.assertIn("Q1 has gone longest", check(ws)[0])
             rows("alpha_one_plain", "beta_split", "gamma_ffma")
             self.assertEqual(check(ws), [])
+            # ./check_candidate also needs the build record of the round.
+            self.assertIn("build/round-0001.md is missing", check(ws, build=True)[0])
+            (mb / "build").mkdir()
+            record = mb / "build/round-0001.md"
+            head = "| phase | built | best | rows | reason |\n|---|---|---|---|---|\n"
+            record.write_text(head + "| E1 | alpha_one_plain | alpha_one_plain | 0000000000 | |\n")
+            self.assertEqual(check(ws, build=True), [])
+            # A phase built in a lower-ranked family needs rows of the built design.
+            record.write_text(head + "| E1 | beta_split | alpha_one_plain | 0000000000 | easier |\n")
+            self.assertIn("rank alpha_one_plain best", check(ws, build=True)[0])
+            record.write_text(head + "| E1 | beta_split | alpha_one_plain | 0000000000 | "
+                              "0000000000 |\n")
+            self.assertIn("rank alpha_one_plain best", check(ws, build=True)[0])
+            record.write_text(head + "| E1 | beta_split | alpha_one_plain | 0000000000 | "
+                              "0000000001 is as fast |\n")
+            self.assertEqual(check(ws, build=True), [])
+            record.write_text(head + "| E1 | alpha_one_plain | alpha_one_plain | none | |\n")
+            self.assertIn("cites no row id", check(ws, build=True)[0])
+            record.write_text(head)
+            self.assertIn("no phase rows", check(ws, build=True)[0])
 
     def test_open_questions_become_a_plan_claim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
