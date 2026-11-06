@@ -135,7 +135,8 @@ def write_launch(args, run: Path, env: dict[str, str], srun: list[str]) -> None:
         + " ".join(map(shlex.quote, broker)) + f" >> {q(run / 'gpu-broker.log')} 2>&1 &\n"
         "broker=$!\ntrap 'kill $broker 2>/dev/null || true' EXIT\n"
         f"for _ in $(seq 100); do [ -S {q(run / 'gpu/broker.sock')} ] && break; sleep 0.1; done\n"
-        f"env -i {passed} {key_env}=\"$key\" \\\n  "
+        f"env -i {passed} {key_env}=\"$key\" "
+        + ("VIBESYS_MICROBENCH_PHASE=1 " if getattr(args, "microbench_phase", False) else "") + "\\\n  "
         + " ".join(NO_GPU) + " timeout --signal=TERM --kill-after=60s "
         f"{timeout}s {q(args.vibesys)} "
         + " ".join(shlex.quote(a) for a in vibesys_args) + "\n")
@@ -198,6 +199,9 @@ def main() -> int:
     parser.add_argument("--gpu-mem", default="64G")
     parser.add_argument("--max-gpu-jobs", type=int, default=1,
                         help="GPU jobs from the agent queued or running at a time")
+    parser.add_argument("--microbench-phase", action="store_true",
+                        help="each round plan is a draft: VibeSys runs the microbench phase on it "
+                             "and the orchestrator revises the plan before the implementer starts")
     parser.add_argument("--forbid", type=Path, action="append", default=[],
                         help="extra path that must be absent in the sandbox (repeat)")
     args = parser.parse_args()

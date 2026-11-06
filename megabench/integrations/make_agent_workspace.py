@@ -160,6 +160,12 @@ ENGINE_MAP_TASK = (
 
 MICROBENCH_TASK = (
     "\n## Microbench phase (mandatory, each round)\n\n"
+    "A round plan starts as a draft. Before the implementer starts, the framework runs steps "
+    "1-3 below on the draft, and the orchestrator revises the plan from the answers: the "
+    "plan that the implementer receives already follows the measured rows. The implementer "
+    "builds that plan, in the engine, decomposition and data path it names. When you "
+    "implement, run `./microbench_check` first: if it passes, go to step 4. If it fails "
+    "(the revised plan makes claims that the draft did not), do steps 1-3 for what it names.\n\n"
     "Before you write code for a round, do these steps. `<round>` is the name of the newest "
     "`progress/plans/round-*.json`.\n\n"
     "1. Run `./microbench_items`. It lists the claims of the plan that reject an alternative "
@@ -181,12 +187,7 @@ MICROBENCH_TASK = (
     "passes only when they are complete. If it fails after the subagent returns, give the "
     "subagent its message and wait again. Then implement the plan. If later answers rank a "
     "phase's design differently from the code you already wrote, rebuild that phase in the "
-    "design they rank best before you run `./check_candidate`. Before the check, write "
-    "`progress/microbench/build/<round>.md`: one table row per phase of the candidate, "
-    "`| phase | design built | notes |`, with the engine-map tags (E1, E2, ...) of the phase. "
-    "`./check_candidate` refuses a phase built in another engine family than its fastest "
-    "matched row. To keep a design that is not the fastest, measure it under matched conditions "
-    "first; its rows then decide. In your notes, cite the answers that changed "
+    "design they rank best before you run `./check_candidate`. In your notes, cite the answers that changed "
     "or confirmed a design choice. The plan's choice of design (engine, decomposition, data "
     "path) for a phase whose code this round writes or rewrites is a claim, not a constraint: "
     "if this round's matched rows rank another design best for that phase, build the phase in "
@@ -288,7 +289,7 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case,
         gpu_run.chmod(0o755)
     check = project / "check_candidate"
     check.write_text(
-        common + f"{python} -m megabench.integrations.microbench_gate check --build || exit 3\n"
+        common + f"{python} -m megabench.integrations.microbench_gate check || exit 3\n"
         "run_id=$(date -u +%Y%m%dT%H%M%S)-$$\n"
         f"exec {gpu}{python} -m megabench evaluate --case {case_id} "
         f"--submission {submission} --method local-check "

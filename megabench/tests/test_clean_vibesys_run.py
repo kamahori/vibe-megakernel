@@ -55,6 +55,13 @@ class AgentEnvironmentTests(unittest.TestCase):
             self.assertIn(" ".join(clean.NO_GPU) + " timeout", "\n".join(lines))
             self.assertIn("36000s", "\n".join(lines))
             self.assertFalse((run / "job.sbatch").exists())
+            self.assertNotIn("VIBESYS_MICROBENCH_PHASE", "\n".join(lines))
+            args.microbench_phase = True
+            clean.write_launch(args, run, env, srun)
+            vibesys = [line for line in (run / "launch.sh").read_text().splitlines()
+                       if "VIBESYS_MICROBENCH_PHASE=1" in line]
+            self.assertEqual(len(vibesys), 1)
+            self.assertNotIn("gpu_broker", vibesys[0])
 
     def test_subscription_token_replaces_the_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
