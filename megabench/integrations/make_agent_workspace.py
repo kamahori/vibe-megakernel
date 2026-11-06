@@ -8,6 +8,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tomllib
 from dataclasses import replace
 from pathlib import Path
 
@@ -127,8 +128,41 @@ def _write_reference(project: Path, benchmark_root: Path, case: Case) -> str:
     return module
 
 
+def skills_for_backend(skills_root: Path, backend: str) -> list[str]:
+    """Skill directories whose `backends` in skills_root/.vibesys.toml include `backend`."""
+    rules = tomllib.loads((skills_root / ".vibesys.toml").read_text()).get("rule", [])
+    return sorted(r["path"] for r in rules if backend in r.get("backends", []))
+
+
+def _backend_files(skills_root: Path) -> dict[str, set[str]]:
+    path = skills_root / "backend_files.toml"
+    data = tomllib.loads(path.read_text()) if path.exists() else {}
+    return {b: set(v.get("files", [])) for b, v in data.items()}
+
+
+def _copy_skills(benchmark_root: Path, dest: Path, backend: str,
+                 optional_skills: tuple[str, ...] = ()) -> None:
+    """Copy the skills this backend may use; files pinned to another backend stay out."""
+    root = benchmark_root / "megabench/skills"
+    optional_root = benchmark_root / "megabench/skills-optional"
+    pinned = _backend_files(root)
+    foreign = set().union(*(f for b, f in pinned.items() if b != backend)) - pinned.get(backend, set())
+    dest.mkdir()
+    for name in skills_for_backend(root, backend):
+        shutil.copytree(root / name, dest / name, ignore=shutil.ignore_patterns("__pycache__"))
+    for rel in foreign:
+        (dest / rel).unlink(missing_ok=True)
+    available = skills_for_backend(optional_root, backend) if optional_root.is_dir() else []
+    for name in optional_skills:
+        if name not in available:
+            raise ValueError(f"optional skill {name!r} is not available for backend {backend!r}; "
+                             f"choose from {available}")
+        shutil.copytree(optional_root / name, dest / name, ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copy2(root / "README.md", dest / "README.md")
+
+
 def _write_tools(project: Path, benchmark_root: Path, case: Case,
-                 platform: str = "cuda") -> None:
+                 backend: str = "cuda", optional_skills: tuple[str, ...] = ()) -> None:
     python = shlex.quote(str(_python(benchmark_root)))
     trusted = shlex.quote(str(benchmark_root))
     submission = shlex.quote(str(project / "submission.py"))
@@ -147,7 +181,7 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case,
         + regimes_flag + "--output \"reports/check-$run_id.jsonl\" \"$@\"\n")
     check.chmod(0o755)
     profile = project / "profile_candidate"
-    profiler = "rocprof_profile_case" if platform == "rocm" else "ncu_profile_case"
+    profiler = "rocprof_profile_case" if backend == "rocm" else "ncu_profile_case"
     profile.write_text(
         common + f"exec {python} -m megabench.integrations.{profiler} "
         f"--case {case_id} --submission {submission} \"$@\"\n")
@@ -161,14 +195,13 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case,
     timeline.chmod(0o755)
     shutil.copy2(benchmark_root / "megabench/integrations/timeline_probe.cuh",
                  project / "timeline_probe.cuh")
-    shutil.copytree(benchmark_root / "megabench/skills", project / "megakernel_skills",
-                    ignore=shutil.ignore_patterns("__pycache__"))
+    _copy_skills(benchmark_root, project / "megakernel_skills", backend, optional_skills)
     sol = project / "sol_info"
     sol.write_text(
         common + f"exec {python} -m megabench sol --case {case_id} {regimes_flag}"
-        + ("--bandwidth-tb-s 5.3 " if platform == "rocm" else "") + "\"$@\"\n")
+        + ("--bandwidth-tb-s 5.3 " if backend == "rocm" else "") + "\"$@\"\n")
     sol.chmod(0o755)
-    if platform == "rocm":
+    if backend == "rocm":
         report = project / "trace_report"
         report.write_text(
             common + f"exec {python} -m megabench.integrations.amd_trace_report "
@@ -233,7 +266,10 @@ def _write_kernelagent_task(project: Path, benchmark_root: Path,
 
 def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
                    benchmark_root: Path = BENCHMARK_ROOT,
-                   regimes: Path | None = None, platform: str = "cuda") -> Path:
+                   regimes: Path | None = None, backend: str = "cuda",
+                   optional_skills: tuple[str, ...] = ()) -> Path:
+    if backend not in ("cuda", "rocm"):
+        raise ValueError(f"unsupported backend: {backend}")
     if agent not in ("vibesys", "kernelagent", "plain"):
         raise ValueError(f"unsupported agent: {agent}")
     case = select_cases("all", [case_id])[0]
@@ -326,7 +362,7 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
            else "") +
         "Use `./check_candidate` for local correctness, launch auditing, "
         "and timing. "
-        + (ROCM_PROFILE_TEXT if platform == "rocm" else
+        + (ROCM_PROFILE_TEXT if backend == "rocm" else
         "Use `./profile_candidate` with Nsight Compute for optional "
         "kernel feedback. The capture command must set `TMPDIR=/tmp`, "
         "`TMP=/tmp`, and `TEMP=/tmp` inside the agent sandbox and pass "
@@ -341,10 +377,12 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "`megakernel_skills/` holds guidance for the method: split the kernel into "
         "phases and time them (`megakernel-phase-profiling`), study the slowest or "
         "furthest-from-floor phase in isolated microbenchmarks (`megakernel-microbench`; "
-        "these do not use rounds), and evaluate Blackwell tensor-core designs "
-        + ("(`blackwell-tensor-core-design`, NVIDIA-specific; on AMD use the same method: "
-           "derive matrix-core (MFMA) facts by measurement). " if platform == "rocm" else
-           "(`blackwell-tensor-core-design`). ") +
+        "these do not use rounds)"
+        + (". " if backend == "rocm" else
+           ", and evaluate Blackwell tensor-core designs (`blackwell-tensor-core-design`). ")
+        + ("`megakernel-stage-linking` (optional, included on request) splits the kernel into "
+           "contract-checked stage packages; measured seams are not free, so ship a one-TU build. "
+           if "megakernel-stage-linking" in optional_skills else "") +
         "When `regimes.json` (or the case) lists regimes, the score is the weighted "
         "result over all regimes, each shape is built and checked separately, and a "
         "submission may specialize per regime; `./trace_regimes` derives regimes from a "
@@ -355,13 +393,13 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
          else "HBM speed-of-light floor and byte breakdown") +
         "; pass `--result PATH` for "
         "the gap to a checked CUDA-event result where a traffic model is available. "
-        + ("The bandwidth here is 5.3 TB/s per MI300X. " if platform == "rocm" else
+        + ("The bandwidth here is 5.3 TB/s per MI300X. " if backend == "rocm" else
            "The default bandwidth is 8 TB/s per B200. ") +
         "These commands load the trusted benchmark outside "
         "this workspace; final grading is run separately.\n")
-    if platform == "rocm":
+    if backend == "rocm":
         (project / "TASK.md").write_text((project / "TASK.md").read_text() + ROCM_HARDWARE_TEXT)
-    _write_tools(project, benchmark_root, case, platform)
+    _write_tools(project, benchmark_root, case, backend, tuple(optional_skills))
     if agent == "vibesys":
         shutil.copy2(benchmark_root / "megabench/integrations/vibesys-agent.example.toml",
                      project / "agent.toml")
@@ -388,14 +426,19 @@ def main() -> None:
                         help="trusted benchmark snapshot used by workspace tools")
     parser.add_argument("--regimes", type=Path,
                         help="regime set (JSON) baked into the case and scoring")
-    parser.add_argument("--platform", choices=("cuda", "rocm"), default=None,
-                        help="GPU platform for the workspace tools (default: detect)")
+    parser.add_argument("--backend", "--platform", dest="backend", choices=("cuda", "rocm"),
+                        default=None,
+                        help="GPU backend: selects the profiler, skills and skill scripts "
+                             "(default: rocm when /opt/rocm exists and nvidia-smi does not)")
+    parser.add_argument("--optional-skill", action="append", default=[], metavar="NAME",
+                        help="also copy this skill from megabench/skills-optional "
+                             "(e.g. megakernel-stage-linking); repeatable")
     args = parser.parse_args()
-    platform = args.platform or ("rocm" if Path("/opt/rocm").exists()
-                                 and shutil.which("nvidia-smi") is None else "cuda")
+    backend = args.backend or ("rocm" if Path("/opt/rocm").exists()
+                               and shutil.which("nvidia-smi") is None else "cuda")
     print(make_workspace(args.case, args.output, agent=args.agent,
                          benchmark_root=args.benchmark_root, regimes=args.regimes,
-                         platform=platform))
+                         backend=backend, optional_skills=tuple(args.optional_skill)))
 
 
 if __name__ == "__main__":

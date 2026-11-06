@@ -27,7 +27,7 @@ def _load(name: str, path: Path):
 
 
 gate = _load("codegen_gate_amd", SKILLS / "megakernel-phase-profiling" / "scripts" / "codegen_gate_amd.py")
-plk = _load("plk_link", SKILLS / "megakernel-stage-linking" / "scripts" / "plk_link.py")
+plk = _load("plk_link", SKILLS.parent / "skills-optional" / "megakernel-stage-linking" / "scripts" / "plk_link.py")
 
 
 def _buffer(blocks: int, stamps: dict[int, list[tuple[int, int, int]]]) -> bytes:

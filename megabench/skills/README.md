@@ -7,12 +7,19 @@ Method guidance for megakernel work, one skill per directory:
 - `megakernel-microbench`: study the slowest or furthest-from-floor phase in isolated
   microbenchmarks; these do not use rounds.
 - `blackwell-tensor-core-design`: evaluate Blackwell tensor-core designs.
-- `megakernel-stage-linking`: split a megakernel into contract-checked stage packages and link them
-  into one kernel (PipeLink-style; `scripts/plk_link.py`), with measured seam costs on MI300X.
 - `megakernel-regimes`: decide whether to specialize the kernel per batch size or KV length, using
   trace-derived regimes (`./trace_regimes`).
 
-`make_agent_workspace.py` copies this directory into every workspace as `megakernel_skills/`.
+`make_agent_workspace.py` copies these skills into every workspace as `megakernel_skills/`, filtered by
+backend (`--backend cuda|rocm`): a skill is copied only if its `backends` in `.vibesys.toml` lists the
+backend, and files listed for one backend in `backend_files.toml` (for example `codegen_gate.py` for
+cuda and `codegen_gate_amd.py` for rocm) are left out of other backends' workspaces.
+
+Optional skills live in `../skills-optional/` and are copied only on request
+(`--optional-skill NAME`). `megakernel-stage-linking` is optional: it splits a megakernel into
+contract-checked stage packages (PipeLink-style, `scripts/plk_link.py`). On MI300X the split did not
+improve performance: a separately compiled and linked seam cost 1.6-2.4%, and stages swapped between
+independently written kernels were slower or neutral.
 
 VibeSys loads the skills natively; `.vibesys.toml` routes them to the `cuda` backend and the
 `kernel-writing` domain:

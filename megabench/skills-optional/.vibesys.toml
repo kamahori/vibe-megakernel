@@ -1,0 +1,7 @@
+# Optional skills: not copied into workspaces or loaded by VibeSys unless requested
+# (make_agent_workspace --optional-skill NAME).
+
+[[rule]]
+path = "megakernel-stage-linking"
+backends = ["cuda", "rocm"]
+domains = ["kernel-writing"]

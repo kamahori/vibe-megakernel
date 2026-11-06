@@ -134,10 +134,12 @@ Timelines locate a bottleneck. Correctness and latency still come only from
 
 ## AMD ROCm sessions
 
-On an AMD GPU, create the workspace with `--platform rocm` (it is also chosen
-automatically when `/opt/rocm` exists and `nvidia-smi` does not). The workspace
-then targets the ROCm build of PyTorch, where `torch.cuda` and `cuda:0` address
-the HIP device, and its tools change as follows:
+On an AMD GPU, create the workspace with `--backend rocm` (it is also chosen
+automatically when `/opt/rocm` exists and `nvidia-smi` does not; `--platform` is an
+alias). The workspace then targets the ROCm build of PyTorch, where `torch.cuda` and
+`cuda:0` address the HIP device. Skills and skill scripts are filtered by backend
+(`megabench/skills/.vibesys.toml` and `backend_files.toml`), so a ROCm workspace gets
+no Blackwell tensor-core skill and no cuobjdump gate. Its tools change as follows:
 
 - `./profile_candidate` runs `rocprofv3` instead of Nsight Compute. It always
   records a kernel dispatch trace with stats (grid, workgroup, VGPR/SGPR/LDS,
@@ -166,6 +168,10 @@ the HIP device, and its tools change as follows:
   `clang-offload-bundler`, compares ISA from `llvm-objdump`, and reads VGPR,
   AGPR, SGPR, LDS, scratch and spill counts from `llvm-readelf --notes`.
 - `./sol_info` assumes 5.3 TB/s per MI300X.
+- The PipeLink-style `megakernel-stage-linking` skill is optional
+  (`--optional-skill megakernel-stage-linking`). It did not improve performance on
+  MI300X: a separately compiled and linked seam cost 1.6-2.4%, and stages swapped
+  between independently written kernels were slower or neutral.
 
 The ATT thread-trace decoder is a separate ROCm package; where it is not
 installed, `--att` produces no instruction timeline and PC sampling is the
