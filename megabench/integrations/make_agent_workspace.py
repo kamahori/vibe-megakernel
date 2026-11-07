@@ -273,6 +273,32 @@ PHASE_TIMING_TASK = (
     "match its phases, has a contract gap: send it back for the timeline, which does not "
     "change the candidate.\n")
 
+PHASE_AGENTS_TASK = (
+    "\n## Phase table and phase rounds\n\n"
+    "By the end of the blueprint rounds (the opening rounds that run the full microbench "
+    "phase), keep `progress/phases.md`: one row per phase of the kernel, with the timeline "
+    "event name, the inputs and outputs with their layouts, the resources the phase may use "
+    "(shared memory, registers, tensor-memory columns, blocks), the sync that starts and ends "
+    "it, and its latest window from the timeline. `./timeline_candidate` writes the window of "
+    "each phase (the critical-path time it adds) under `windows` in its `summary.json`. A row "
+    "is the contract of its phase: other code relies on it.\n\n"
+    "A later round is a phase round. The implementer coordinates and does not edit phase code "
+    "before the subagents return:\n\n"
+    "1. Give each target phase of the plan to a `phase` subagent (Agent tool, "
+    "`subagent_type: phase`, `run_in_background: true`), all at once, with the round, the phase, "
+    "its row of `progress/phases.md`, the plan and the parent timeline. Each subagent works in "
+    "`variants/<round>/<phase>/<name>/` copies of the parent candidate and scores them with "
+    "`./phase_ab PARENT_DIR VARIANT_DIR`, which in one GPU job builds both, checks the variant, "
+    "times both alternately and compares the window of each phase.\n"
+    "2. A boundary item (fuse two phases, replace a barrier) goes to one subagent that owns "
+    "both phases.\n"
+    "3. Wait for all subagents. Merge the winning diffs into the main candidate.\n"
+    "4. Run `./check_candidate` and `./timeline_candidate` on the merged build in the "
+    "foreground. Drop a diff whose gain does not hold in the merged build. Update "
+    "`progress/phases.md` from the new timeline.\n\n"
+    "The orchestrator plan of a phase round names the target phases from the timeline windows, "
+    "largest gaps first, and the boundary items.\n")
+
 ROADMAP_ENGINES = (
     "# Engine selection per phase\n\n"
     "- [open] For each dominant phase, choose the engine, the instruction shape and the data path "
@@ -337,7 +363,7 @@ def _engine_map(project: Path, benchmark_root: Path, case: Case) -> str:
 
 
 def _write_tools(project: Path, benchmark_root: Path, case: Case,
-                 gpu_socket: Path | None = None) -> None:
+                 gpu_socket: Path | None = None, phase_agents: bool = False) -> None:
     python = shlex.quote(str(_python(benchmark_root)))
     trusted = shlex.quote(str(benchmark_root))
     submission = shlex.quote(str(project / "submission.py"))
@@ -378,6 +404,13 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case,
         f"--case {case_id} --submission {submission} "
         "--output \"reports/timeline-$run_id\" \"$@\"\n")
     timeline.chmod(0o755)
+    if phase_agents:
+        phase_ab = project / "phase_ab"
+        phase_ab.write_text(
+            common + "run_id=$(date -u +%Y%m%dT%H%M%S)-$$\n"
+            f"exec {gpu}{python} -m megabench.integrations.phase_ab --case {case_id} "
+            + regimes_flag + "--output \"reports/phase-ab-$run_id\" \"$@\"\n")
+        phase_ab.chmod(0o755)
     shutil.copy2(benchmark_root / "megabench/integrations/timeline_probe.cuh",
                  project / "timeline_probe.cuh")
     shutil.copytree(benchmark_root / "megabench/skills", project / "megakernel_skills",
@@ -413,6 +446,8 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case,
     agents.mkdir(parents=True)
     shutil.copy2(benchmark_root / "megabench/integrations/microbench-agent.md",
                  agents / "microbench.md")
+    if phase_agents:
+        shutil.copy2(benchmark_root / "megabench/integrations/phase-agent.md", agents / "phase.md")
     trace = project / "trace_regimes"
     trace.write_text(
         common + f"exec {python} -m megabench.integrations.trace_regimes "
@@ -473,7 +508,7 @@ def _write_kernelagent_task(project: Path, benchmark_root: Path,
 def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
                    benchmark_root: Path = BENCHMARK_ROOT,
                    regimes: Path | None = None, gpu_socket: Path | None = None,
-                   gate_launcher: tuple[str, ...] = ()) -> Path:
+                   gate_launcher: tuple[str, ...] = (), phase_agents: bool = False) -> Path:
     if agent not in ("vibesys", "kernelagent", "plain"):
         raise ValueError(f"unsupported agent: {agent}")
     case = select_cases("all", [case_id])[0]
@@ -488,7 +523,7 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
     project.mkdir(parents=True, exist_ok=False)
     (project / ".gitignore").write_text(
         "/.venv\nreports/\n.cache/\n.torch_extensions/\n"
-        "__pycache__/\n*.log\n*.ncu-rep\n/agent.toml\n")
+        "__pycache__/\n*.log\n*.ncu-rep\n/agent.toml\n/variants/\n")
     shared_venv = benchmark_root / ".venv"
     if shared_venv.is_dir():
         (project / ".venv").symlink_to(shared_venv, target_is_directory=True)
@@ -604,8 +639,9 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
            "`./check_candidate`, `./profile_candidate` and `./timeline_candidate` already "
            "use it. Keep inputs and outputs inside this workspace, because the job does "
            "not see this shell's `/tmp`.\n" if gpu_socket is not None else "")
-        + (ENGINE_MAP_TASK + MICROBENCH_TASK + NO_FALLBACK_TASK + PHASE_TIMING_TASK if agent == "vibesys" else ""))
-    _write_tools(project, benchmark_root, case, gpu_socket)
+        + (ENGINE_MAP_TASK + MICROBENCH_TASK + NO_FALLBACK_TASK + PHASE_TIMING_TASK
+           + (PHASE_AGENTS_TASK if phase_agents else "") if agent == "vibesys" else ""))
+    _write_tools(project, benchmark_root, case, gpu_socket, phase_agents)
     if agent == "vibesys":
         (project / "progress/microbench").mkdir(parents=True, exist_ok=True)
         engine_map = _engine_map(project, benchmark_root, case)
@@ -642,13 +678,17 @@ def main() -> None:
                         help="regime set (JSON) baked into the case and scoring")
     parser.add_argument("--gpu-socket", type=Path,
                         help="gpu_broker socket: GPU commands run through ./gpu_run")
+    parser.add_argument("--phase-agents", action="store_true",
+                        help="add the phase table section to TASK.md and install ./phase_ab and "
+                             "the phase subagent")
     parser.add_argument("--gate-launcher", default="",
                         help="command prefix for the VibeSys accuracy and benchmark gates")
     args = parser.parse_args()
     print(make_workspace(args.case, args.output, agent=args.agent,
                          benchmark_root=args.benchmark_root, regimes=args.regimes,
                          gpu_socket=args.gpu_socket,
-                         gate_launcher=tuple(shlex.split(args.gate_launcher))))
+                         gate_launcher=tuple(shlex.split(args.gate_launcher)),
+                         phase_agents=args.phase_agents))
 
 
 if __name__ == "__main__":

@@ -140,9 +140,11 @@ def write_launch(args, run: Path, env: dict[str, str], srun: list[str]) -> None:
         + (f"VIBESYS_MICROBENCH_MINUTES={args.microbench_minutes:g} "
            if getattr(args, "microbench_minutes", None) else "")
         + (f"VIBESYS_MICROBENCH_FULL_ROUNDS={full_rounds} "
-           if getattr(args, "microbench_phase", False)
+           if (getattr(args, "microbench_phase", False) or getattr(args, "phase_agents", False))
            and (full_rounds := getattr(args, "microbench_full_rounds", None)) is not None
-           and full_rounds >= 0 else "") + "\\\n  "
+           and full_rounds >= 0 else "")
+        + ("VIBESYS_PHASE_AGENTS=1 " if getattr(args, "phase_agents", False) else "")
+        + "\\\n  "
         + " ".join(NO_GPU) + " timeout --signal=TERM --kill-after=60s "
         f"{timeout}s {q(args.vibesys)} "
         + " ".join(shlex.quote(a) for a in vibesys_args) + "\n")
@@ -213,7 +215,7 @@ def main() -> int:
     parser.add_argument("--timeout-seconds", type=int,
                         help="limit for the whole VibeSys run (default: one hour per round)")
     parser.add_argument("--gpu-partition", default="main")
-    parser.add_argument("--gpu-time", default="00:30:00", help="time limit of each GPU job")
+    parser.add_argument("--gpu-time", default="00:10:00", help="time limit of each GPU job (default: %(default)s)")
     parser.add_argument("--gpu-cpus", type=int, default=8)
     parser.add_argument("--gpu-mem", default="64G")
     parser.add_argument("--max-gpu-jobs", type=int, default=1,
@@ -228,6 +230,11 @@ def main() -> int:
                         help="rounds that run the full microbench phase; a later round runs it "
                              "only for open questions that the kernel timeline cannot settle "
                              "(-1: every round runs the full phase)")
+    parser.add_argument("--phase-agents", action="store_true",
+                        help="rounds after the full microbench rounds are phase rounds: the "
+                             "implementer coordinates one phase subagent per target phase "
+                             "(needs a round count: an unset or negative "
+                             "--microbench-full-rounds means 2)")
     parser.add_argument("--no-microbench-cache", dest="microbench_cache", action="store_false",
                         help="start without the rows that earlier runs of the case measured "
                              "(a clean comparison run)")
@@ -237,6 +244,8 @@ def main() -> int:
                         help="extra path that must be absent in the sandbox (repeat)")
     args = parser.parse_args()
 
+    if args.phase_agents and args.microbench_full_rounds < 0:
+        args.microbench_full_rounds = 2  # -1 means every round is a full round: no phase round
     run = args.run_dir.resolve()
     if run.exists():
         parser.error(f"{run} exists; use a new directory for each run")
@@ -267,6 +276,8 @@ def main() -> int:
                "--gpu-socket", str(run / "gpu/broker.sock"), "--gate-launcher", shlex.join(gate)]
     if args.regimes:
         command += ["--regimes", str(args.regimes.resolve())]
+    if args.phase_agents:
+        command += ["--phase-agents"]
     subprocess.run(command, check=True, cwd=run / "trusted",
                    env=os.environ | {"PYTHONPATH": str(run / "trusted")})
     if args.microbench_cache:

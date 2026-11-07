@@ -143,6 +143,25 @@ SUBMISSION = textwrap.dedent('''
 ''')
 
 
+class PhaseWindowTests(unittest.TestCase):
+    def test_windows_partition_the_span_along_the_critical_path(self) -> None:
+        def item(track, name, begin, end):
+            return timeline.Interval(track, name, begin * 1e3, end * 1e3)
+
+        decoded = timeline.Timeline((
+            item("t0", "load", 0, 10), item("t1", "load", 0, 14),
+            item("t0", "math", 14, 30), item("t1", "math", 15, 24),
+            item("t0", "load", 30, 35), item("t1", "load", 31, 33),
+            item("t0", "math", 35, 40), item("t1", "math", 35, 38)))
+        windows = timeline.phase_windows(decoded)
+        self.assertEqual(windows["load"]["occurrences"], 2)
+        self.assertAlmostEqual(windows["load"]["window_us"], 14 + 5)
+        self.assertAlmostEqual(windows["math"]["window_us"], 16 + 5)
+        self.assertAlmostEqual(windows["load"]["body_us"], 12 + 3.5)
+        self.assertAlmostEqual(windows["math"]["body_us"], 12.5 + 4)
+        self.assertAlmostEqual(sum(row["window_us"] for row in windows.values()), 40)
+
+
 class CaptureTests(unittest.TestCase):
     def test_probe_header_and_capture_tool_record_every_block_and_phase(self) -> None:
         import os

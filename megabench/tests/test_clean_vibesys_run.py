@@ -74,6 +74,30 @@ class AgentEnvironmentTests(unittest.TestCase):
             args.microbench_full_rounds = -1
             clean.write_launch(args, run, env, srun)
             self.assertNotIn("VIBESYS_MICROBENCH_FULL_ROUNDS", (run / "launch.sh").read_text())
+            self.assertNotIn("VIBESYS_PHASE_AGENTS", (run / "launch.sh").read_text())
+            # Phase agents: the flag and the round count sit on the VibeSys line, even without
+            # the microbench phase, and never on the broker line.
+            args.microbench_phase, args.microbench_full_rounds, args.phase_agents = False, 2, True
+            clean.write_launch(args, run, env, srun)
+            text = (run / "launch.sh").read_text()
+            line = next(l for l in text.splitlines() if "VIBESYS_PHASE_AGENTS=1" in l)
+            self.assertIn("VIBESYS_MICROBENCH_FULL_ROUNDS=2 ", line)
+            self.assertNotIn("VIBESYS_MICROBENCH_PHASE=1", line)
+            self.assertNotIn("gpu_broker", line)
+            self.assertEqual(text.count("VIBESYS_PHASE_AGENTS"), 1)
+
+    def test_help_shows_the_phase_agents_flag_and_the_gpu_time_default(self) -> None:
+        import contextlib
+        import io
+        import sys
+        from unittest import mock
+
+        text = io.StringIO()
+        with mock.patch.object(sys, "argv", ["x", "--help"]), contextlib.redirect_stdout(text):
+            with self.assertRaises(SystemExit):
+                clean.main()
+        self.assertIn("--phase-agents", text.getvalue())
+        self.assertIn("default: 00:10:00", " ".join(text.getvalue().split()))
 
     def test_subscription_token_replaces_the_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

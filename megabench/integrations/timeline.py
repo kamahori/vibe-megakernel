@@ -468,6 +468,38 @@ def phase_table(timeline: Timeline) -> list[dict[str, object]]:
     return rows
 
 
+def phase_windows(timeline: Timeline) -> dict[str, dict[str, float | int]]:
+    """Critical-path window of each phase.
+
+    The k-th occurrence of an event on every track forms one occurrence. Occurrences are
+    ordered by their latest end over all tracks; the window of an occurrence is its latest
+    end minus the latest end reached before it (the timeline start for the first), never
+    below zero, so the windows of all phases sum to the span. ``body_us`` is the mean
+    per-track duration, summed over occurrences. Both are summed per phase name.
+    """
+    per_track: dict[tuple[str, str], list[Interval]] = defaultdict(list)
+    for item in sorted(timeline.intervals, key=lambda value: value.begin_ns):
+        per_track[(item.name, item.track)].append(item)
+    occurrences: dict[tuple[str, int], list[Interval]] = defaultdict(list)
+    for (name, _track), items in per_track.items():
+        for k, item in enumerate(items):
+            occurrences[(name, k)].append(item)
+    cursor = min(item.begin_ns for item in timeline.intervals)
+    out: dict[str, dict[str, float | int]] = {}
+    for (name, _k), items in sorted(occurrences.items(),
+                                    key=lambda pair: (max(i.end_ns for i in pair[1]), pair[0])):
+        end = max(item.end_ns for item in items)
+        row = out.setdefault(name, {"window_us": 0.0, "body_us": 0.0, "occurrences": 0})
+        row["window_us"] += max(0.0, end - cursor) / 1e3
+        row["body_us"] += statistics.fmean(item.duration_ns for item in items) / 1e3
+        row["occurrences"] += 1
+        cursor = max(cursor, end)
+    for row in out.values():
+        row["window_us"] = round(row["window_us"], 3)
+        row["body_us"] = round(row["body_us"], 3)
+    return out
+
+
 def format_table(rows: Sequence[dict[str, object]]) -> str:
     """Render :func:`phase_table` rows as fixed-width text."""
     header = (f"{'event':<20} {'occ':>4} {'blocks':>6} {'wall':>10} {'slowest':>10} {'mean':>10} "

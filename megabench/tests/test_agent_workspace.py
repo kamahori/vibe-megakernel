@@ -116,6 +116,27 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertTrue(role["model"])
         self.assertTrue(role["reasoning_effort"])
 
+    def test_phase_agents_add_the_section_the_tool_and_the_subagent(self) -> None:
+        case = select_cases("p0")[0]
+        with tempfile.TemporaryDirectory() as directory:
+            plain = make_workspace(case.id, Path(directory) / "plain", agent="vibesys",
+                                   gpu_socket=Path("/s.sock"))
+            phased = make_workspace(case.id, Path(directory) / "phased", agent="vibesys",
+                                    gpu_socket=Path("/s.sock"), phase_agents=True)
+            self.assertNotIn("Phase table and phase rounds", (plain / "TASK.md").read_text())
+            self.assertFalse((plain / "phase_ab").exists())
+            self.assertFalse((plain / ".claude/agents/phase.md").exists())
+            task = (phased / "TASK.md").read_text()
+            self.assertIn("## Phase table and phase rounds", task)
+            self.assertIn("subagent_type: phase", task)
+            self.assertIn("progress/phases.md", task)
+            self.assertIn("/variants/", (phased / ".gitignore").read_text().splitlines())
+            self.assertIn("name: phase", (phased / ".claude/agents/phase.md").read_text())
+            wrapper = (phased / "phase_ab").read_text()
+            self.assertIn("megabench.integrations.phase_ab", wrapper)
+            self.assertIn("gpu_run", wrapper)
+            self.assertTrue(os.access(phased / "phase_ab", os.X_OK))
+
     def test_vibesys_task_uses_trusted_python_and_single_case(self) -> None:
         case = select_cases("p0")[0]
         with tempfile.TemporaryDirectory() as directory:

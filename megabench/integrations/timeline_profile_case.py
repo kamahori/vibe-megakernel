@@ -57,7 +57,8 @@ def _save(buffer, names: list[str], output: Path) -> str:
     (output / "trace.json").write_text(json.dumps(timeline.to_chrome_trace(decoded)))
     rows = timeline.phase_table(decoded)
     summary = timeline.summarize(decoded, top=len(rows) or 1)
-    (output / "summary.json").write_text(json.dumps({"phases": rows, "summary": summary}, indent=2))
+    (output / "summary.json").write_text(json.dumps({"phases": rows, "summary": summary,
+                                                     "windows": timeline.phase_windows(decoded)}, indent=2))
     return timeline.format_table(rows)
 
 
