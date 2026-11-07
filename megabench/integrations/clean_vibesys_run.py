@@ -215,7 +215,7 @@ def main() -> int:
     parser.add_argument("--timeout-seconds", type=int,
                         help="limit for the whole VibeSys run (default: one hour per round)")
     parser.add_argument("--gpu-partition", default="main")
-    parser.add_argument("--gpu-time", default="00:10:00", help="time limit of each GPU job (default: %(default)s)")
+    parser.add_argument("--gpu-time", default="00:20:00", help="time limit of each GPU job (default: %(default)s)")
     parser.add_argument("--gpu-cpus", type=int, default=8)
     parser.add_argument("--gpu-mem", default="64G")
     parser.add_argument("--max-gpu-jobs", type=int, default=1,

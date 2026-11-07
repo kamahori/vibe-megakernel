@@ -97,7 +97,7 @@ class AgentEnvironmentTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 clean.main()
         self.assertIn("--phase-agents", text.getvalue())
-        self.assertIn("default: 00:10:00", " ".join(text.getvalue().split()))
+        self.assertIn("default: 00:20:00", " ".join(text.getvalue().split()))
 
     def test_subscription_token_replaces_the_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
