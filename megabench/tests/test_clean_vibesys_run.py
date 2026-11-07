@@ -121,3 +121,40 @@ class AgentEnvironmentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SeedTests(unittest.TestCase):
+    def test_seed_copies_the_candidate_and_progress_and_moves_round_files(self) -> None:
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as directory:
+            src, ws = Path(directory) / "src", Path(directory) / "ws"
+            files = {"submission.py": "seed sub", "k.cu": "kernel", "TASK.md": "old task",
+                     "progress/microbench/open.md": "old ledger",
+                     "progress/plans/round-0002.json": "{}",
+                     "progress/microbench/answers/round-0002.md": "a",
+                     "progress/round-0002.md": "notes", ".build/x.so": "bin",
+                     "progress/microbench/.build-cache/k/o": "obj"}
+            for name, text in files.items():
+                (src / name).parent.mkdir(parents=True, exist_ok=True)
+                (src / name).write_text(text)
+            git = ["git", "-C", str(src), "-c", "user.name=t", "-c", "user.email=t@t"]
+            subprocess.run([*git, "init", "-q"], check=True)
+            subprocess.run([*git, "add", "-A", "-f"], check=True)
+            subprocess.run([*git, "commit", "-qm", "s"], check=True)
+            (src / "k.cu").write_text("later edit")
+            for name, text in {"TASK.md": "new task", "submission.py": "template",
+                               "progress/microbench/open.md": "header"}.items():
+                (ws / name).parent.mkdir(parents=True, exist_ok=True)
+                (ws / name).write_text(text)
+            clean.seed_workspace(ws, src, "HEAD")
+            self.assertEqual((ws / "submission.py").read_text(), "seed sub")
+            self.assertEqual((ws / "k.cu").read_text(), "kernel")
+            self.assertEqual((ws / "TASK.md").read_text(), "new task")
+            self.assertEqual((ws / "progress/microbench/open.md").read_text(), "old ledger")
+            self.assertFalse((ws / "progress/plans/round-0002.json").exists())
+            self.assertTrue((ws / "progress/prior/plans/round-0002.json").is_file())
+            self.assertTrue((ws / "progress/prior/microbench/answers/round-0002.md").is_file())
+            self.assertTrue((ws / "progress/prior/round-0002.md").is_file())
+            self.assertFalse((ws / ".build").exists())
+            self.assertFalse((ws / "progress/microbench/.build-cache").exists())

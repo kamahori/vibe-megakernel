@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -179,6 +180,40 @@ def preflight(args, run: Path, env: dict[str, str], claude: Path) -> bool:
     return not bad
 
 
+SEED_SKIP = (".build/", "progress/microbench/.build-cache/", "variants/")
+ROUND_FILE = re.compile(r"(^|/)round-\d+")
+
+
+def seed_workspace(workspace: Path, source: Path, ref: str) -> list[str]:
+    """Copy the candidate and the progress files of commit *ref* of the workspace *source*.
+
+    The new workspace keeps every file that the harness installed (TASK.md, tools, skills),
+    except submission.py, which comes from the seed. Files under progress/ come from the seed.
+    A progress file that belongs to one round of the earlier run (plans, microbench requests
+    and answers, round notes) goes to progress/prior/, so that the new run's rounds do not
+    find files of the same name. Build outputs are not copied.
+    """
+    names = subprocess.run(["git", "-C", str(source), "ls-tree", "-r", "-z", "--name-only", ref],
+                           capture_output=True, check=True).stdout.decode().split("\0")
+    copied = []
+    for name in filter(None, names):
+        if name.startswith(SEED_SKIP):
+            continue
+        installed = (workspace / name).exists()
+        if installed and name != "submission.py" and not name.startswith("progress/"):
+            continue
+        target = name
+        if name.startswith("progress/") and ROUND_FILE.search(name):
+            target = "progress/prior/" + name.removeprefix("progress/")
+        data = subprocess.run(["git", "-C", str(source), "show", f"{ref}:{name}"],
+                              capture_output=True, check=True).stdout
+        path = workspace / target
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        copied.append(target)
+    return copied
+
+
 def cache_rows(args, run: Path) -> int:
     """Copy the rows that earlier runs of the case measured into the new workspace."""
     from ..primdb import cache
@@ -235,6 +270,11 @@ def main() -> int:
                              "implementer coordinates one phase subagent per target phase "
                              "(needs a round count: an unset or negative "
                              "--microbench-full-rounds means 2)")
+    parser.add_argument("--seed-from", type=Path,
+                        help="workspace of an earlier run: start from its candidate and progress "
+                             "files at --seed-ref instead of an empty candidate")
+    parser.add_argument("--seed-ref", default="HEAD",
+                        help="commit of --seed-from to start from (default: %(default)s)")
     parser.add_argument("--no-microbench-cache", dest="microbench_cache", action="store_false",
                         help="start without the rows that earlier runs of the case measured "
                              "(a clean comparison run)")
@@ -280,6 +320,9 @@ def main() -> int:
         command += ["--phase-agents"]
     subprocess.run(command, check=True, cwd=run / "trusted",
                    env=os.environ | {"PYTHONPATH": str(run / "trusted")})
+    if args.seed_from:
+        copied = seed_workspace(run / args.case, args.seed_from.resolve(), args.seed_ref)
+        print(f"seed: {len(copied)} files from {args.seed_from} at {args.seed_ref}")
     if args.microbench_cache:
         cache_rows(args, run)
     settings = run / "home/.claude/settings.json"
