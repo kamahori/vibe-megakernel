@@ -165,6 +165,9 @@ class AgentWorkspaceTests(unittest.TestCase):
             # Every role reads the rule against a fallback to a design measured slower.
             task_text = (project / "TASK.md").read_text()
             self.assertIn("No fallback to a design measured slower", task_text)
+            rule = task_text.split("No fallback to a design measured slower")[1]
+            self.assertIn("An in-kernel measurement overrules the proxy rows", rule)
+            self.assertIn("built correctly in the same kernel and measured slower", rule)
             self.assertIn("Per-phase timing and measured rounds", task_text)
             for role in ("Candidate contract", "Implementer", "Orchestrator",
                          "Forecast miss", "Judge"):
