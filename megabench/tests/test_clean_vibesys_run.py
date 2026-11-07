@@ -134,7 +134,9 @@ class SeedTests(unittest.TestCase):
                      "progress/plans/round-0002.json": "{}",
                      "progress/microbench/answers/round-0002.md": "a",
                      "progress/round-0002.md": "notes", ".build/x.so": "bin",
-                     "progress/microbench/.build-cache/k/o": "obj"}
+                     "progress/microbench/.build-cache/k/o": "obj",
+                     ".agents/skills/s/SKILL.md": "skill", "some-skill/SKILL.md": "skill",
+                     "some-skill/notes.md": "n"}
             for name, text in files.items():
                 (src / name).parent.mkdir(parents=True, exist_ok=True)
                 (src / name).write_text(text)
@@ -147,6 +149,7 @@ class SeedTests(unittest.TestCase):
                                "progress/microbench/open.md": "header"}.items():
                 (ws / name).parent.mkdir(parents=True, exist_ok=True)
                 (ws / name).write_text(text)
+            subprocess.run(["git", "-C", str(ws), "init", "-q"], check=True)
             clean.seed_workspace(ws, src, "HEAD")
             self.assertEqual((ws / "submission.py").read_text(), "seed sub")
             self.assertEqual((ws / "k.cu").read_text(), "kernel")
@@ -158,3 +161,8 @@ class SeedTests(unittest.TestCase):
             self.assertTrue((ws / "progress/prior/round-0002.md").is_file())
             self.assertFalse((ws / ".build").exists())
             self.assertFalse((ws / "progress/microbench/.build-cache").exists())
+            self.assertFalse((ws / ".agents").exists())
+            self.assertFalse((ws / "some-skill").exists())
+            status = subprocess.run(["git", "-C", str(ws), "status", "--porcelain"],
+                                    capture_output=True, text=True, check=True).stdout
+            self.assertEqual(status, "", "the seeded workspace is committed")

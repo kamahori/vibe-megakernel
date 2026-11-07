@@ -195,9 +195,13 @@ def seed_workspace(workspace: Path, source: Path, ref: str) -> list[str]:
     """
     names = subprocess.run(["git", "-C", str(source), "ls-tree", "-r", "-z", "--name-only", ref],
                            capture_output=True, check=True).stdout.decode().split("\0")
+    names = list(filter(None, names))
+    # Skill folders and agent-tool folders are installed by the harness and VibeSys.
+    skills = {n.split("/", 1)[0] for n in names if n.count("/") == 1 and n.endswith("/SKILL.md")}
     copied = []
-    for name in filter(None, names):
-        if name.startswith(SEED_SKIP):
+    for name in names:
+        top = name.split("/", 1)[0]
+        if name.startswith(SEED_SKIP) or ("/" in name and (top.startswith(".") or top in skills)):
             continue
         installed = (workspace / name).exists()
         if installed and name != "submission.py" and not name.startswith("progress/"):
@@ -211,7 +215,18 @@ def seed_workspace(workspace: Path, source: Path, ref: str) -> list[str]:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
         copied.append(target)
+    commit_workspace(workspace, f"Seed from {source.name} at {ref}")
     return copied
+
+
+def commit_workspace(workspace: Path, message: str) -> None:
+    """Commit what setup added: VibeSys starts only from a clean repository."""
+    if not subprocess.run(["git", "status", "--porcelain"], cwd=workspace, capture_output=True,
+                          text=True, check=True).stdout.strip():
+        return
+    subprocess.run(["git", "add", "-A"], cwd=workspace, check=True)
+    subprocess.run(["git", "-c", "user.name=MegaBench", "-c", "user.email=megabench@example.invalid",
+                    "commit", "-q", "-m", message], cwd=workspace, check=True)
 
 
 def cache_rows(args, run: Path) -> int:
@@ -325,6 +340,7 @@ def main() -> int:
         print(f"seed: {len(copied)} files from {args.seed_from} at {args.seed_ref}")
     if args.microbench_cache:
         cache_rows(args, run)
+        commit_workspace(run / args.case, "Microbench rows of earlier runs of the case")
     settings = run / "home/.claude/settings.json"
     settings.parent.mkdir(parents=True)
     settings.write_text(json.dumps({"permissions": {"deny": list(DENIED_TOOLS)}}, indent=2))
