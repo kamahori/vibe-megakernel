@@ -67,6 +67,13 @@ class AgentEnvironmentTests(unittest.TestCase):
             clean.write_launch(args, run, env, srun)
             self.assertIn("VIBESYS_MICROBENCH_MINUTES=40 ", (run / "launch.sh").read_text())
             self.assertIn("VIBESYS_MEASUREMENT_DIR=reports ", (run / "launch.sh").read_text())
+            self.assertNotIn("VIBESYS_MICROBENCH_FULL_ROUNDS", (run / "launch.sh").read_text())
+            args.microbench_full_rounds = 2
+            clean.write_launch(args, run, env, srun)
+            self.assertIn("VIBESYS_MICROBENCH_FULL_ROUNDS=2 ", (run / "launch.sh").read_text())
+            args.microbench_full_rounds = -1
+            clean.write_launch(args, run, env, srun)
+            self.assertNotIn("VIBESYS_MICROBENCH_FULL_ROUNDS", (run / "launch.sh").read_text())
 
     def test_subscription_token_replaces_the_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

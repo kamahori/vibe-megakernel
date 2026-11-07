@@ -60,6 +60,22 @@ class GateTests(unittest.TestCase):
             (mb / "answers/round-0002.md").write_text(" ".join(f"P{i}" for i in range(1, n + 1)))
             self.assertEqual(check(ws), [])
 
+    def test_round_skipped_by_the_framework_needs_no_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            (ws / "progress/plans").mkdir(parents=True)
+            (ws / "progress/plans/round-0003.json").write_text(json.dumps(PAST_REJECTIONS[2]))
+            self.assertTrue(check(ws))
+            skipped = ws / "progress/microbench/skipped"
+            skipped.mkdir(parents=True)
+            (skipped / "round-0003.md").write_text("")
+            self.assertTrue(check(ws), "an empty skip record does not count")
+            (skipped / "round-0003.md").write_text("# round-0003: skipped\nreason\n")
+            self.assertEqual(check(ws), [])
+            (skipped / "round-0002.md").write_text("# other round\n")
+            (skipped / "round-0003.md").unlink()
+            self.assertTrue(check(ws), "a skip record of another round does not count")
+
     def test_ledger_needs_rows_measured_in_the_round(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             ws = Path(directory)

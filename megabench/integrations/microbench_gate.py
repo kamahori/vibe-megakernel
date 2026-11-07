@@ -11,7 +11,9 @@ that progress/microbench/open.md carries open from an earlier round was measured
 that `./primdb add` stamped with the round) or closed with row ids; one may be deferred. The
 carried question that has gone longest without a matched measurement (rows added with
 `--question Q<n> --conditions matched`) needs one this round. Without a
-plan there is nothing to check. ./check_candidate runs `check --build` first and stops on a failure:
+plan there is nothing to check. A round whose phase the framework skipped
+(progress/microbench/skipped/<round>.md: no question of the plan needed a new microbenchmark)
+needs none of these files. ./check_candidate runs `check --build` first and stops on a failure:
 --build also needs progress/microbench/build/<round>.md, the design each phase is built in; each
 engine-map phase with matched rows (p.phase, m.us) is built in the family of its fastest row.
 """
@@ -365,6 +367,11 @@ def check(workspace: Path, build: bool = False) -> list[str]:
         return []
     round_name = plan.stem
     problems = []
+    skipped = workspace / MICROBENCH / "skipped" / f"{round_name}.md"
+    if skipped.is_file() and skipped.read_text().strip():
+        # The framework skipped this round's phase: no question of the plan needed a new
+        # microbenchmark. The design of each phase still follows the measured rankings.
+        return check_build(workspace, round_name) if build else []
     request = workspace / MICROBENCH / "requests" / f"{round_name}.md"
     answer = workspace / MICROBENCH / "answers" / f"{round_name}.md"
     for path in (request, answer):

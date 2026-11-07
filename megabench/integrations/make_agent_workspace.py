@@ -159,7 +159,7 @@ ENGINE_MAP_TASK = (
     "round throws away.\n")
 
 MICROBENCH_TASK = (
-    "\n## Microbench phase (mandatory, each round)\n\n"
+    "\n## Microbench phase (mandatory in the opening rounds, then on open questions)\n\n"
     "A round plan starts as a draft. Before the implementer starts, the framework runs steps "
     "1-3 below on the draft, and the orchestrator revises the plan from the answers: the "
     "plan that the implementer receives already follows the measured rows. The implementer "
@@ -204,7 +204,17 @@ MICROBENCH_TASK = (
     "has rows measured this round (one may be deferred with a reason). If a new question comes "
     "up during the round, append it to the "
     "request file and give it to the subagent again. Keep these files under `progress/`: a "
-    "revert to an earlier round keeps them.\n")
+    "revert to an earlier round keeps them.\n\n"
+    "After the opening rounds, the per-phase timeline of the current kernel "
+    "(`./timeline_candidate`) is the default evidence for a plan, and the framework runs the "
+    "phase only for the open questions of the draft that the timeline and the existing rows do "
+    "not settle: a design that the kernel does not contain yet and that no matched row prices, "
+    "or a cost that no phase of the kernel shows. Then the request names only those "
+    "questions. When the draft has none, the framework writes "
+    "`progress/microbench/skipped/<round>.md` with the reason, and the gate needs no request, "
+    "answer or engine-map entry for that round. In such a round, cite the timeline rows of the "
+    "parent for each design choice, and add a question to `progress/microbench/open.md` when "
+    "the timeline cannot settle it, so that a later round measures it.\n")
 
 CACHE_ROWS = "progress/microbench/primdb_cache.jsonl"
 

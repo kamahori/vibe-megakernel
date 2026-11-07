@@ -138,7 +138,11 @@ def write_launch(args, run: Path, env: dict[str, str], srun: list[str]) -> None:
         f"env -i {passed} {key_env}=\"$key\" VIBESYS_MEASUREMENT_DIR=reports "
         + ("VIBESYS_MICROBENCH_PHASE=1 " if getattr(args, "microbench_phase", False) else "")
         + (f"VIBESYS_MICROBENCH_MINUTES={args.microbench_minutes:g} "
-           if getattr(args, "microbench_minutes", None) else "") + "\\\n  "
+           if getattr(args, "microbench_minutes", None) else "")
+        + (f"VIBESYS_MICROBENCH_FULL_ROUNDS={full_rounds} "
+           if getattr(args, "microbench_phase", False)
+           and (full_rounds := getattr(args, "microbench_full_rounds", None)) is not None
+           and full_rounds >= 0 else "") + "\\\n  "
         + " ".join(NO_GPU) + " timeout --signal=TERM --kill-after=60s "
         f"{timeout}s {q(args.vibesys)} "
         + " ".join(shlex.quote(a) for a in vibesys_args) + "\n")
@@ -220,6 +224,10 @@ def main() -> int:
     parser.add_argument("--microbench-minutes", type=float,
                         help="time limit of each pre-plan microbench phase; the agents get a "
                              "deadline and leave what they cannot measure open")
+    parser.add_argument("--microbench-full-rounds", type=int, default=2,
+                        help="rounds that run the full microbench phase; a later round runs it "
+                             "only for open questions that the kernel timeline cannot settle "
+                             "(-1: every round runs the full phase)")
     parser.add_argument("--no-microbench-cache", dest="microbench_cache", action="store_false",
                         help="start without the rows that earlier runs of the case measured "
                              "(a clean comparison run)")
