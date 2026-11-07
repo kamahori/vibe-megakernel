@@ -6,9 +6,13 @@
                                              fastest measured engine per tile family for a GEMM
   primdb explain ID                          one row in full, with how it was measured
   primdb add [FILE]                          normalize bench JSON lines into the local file
+  primdb reuse ID [ID ...] [--question Q<n> --conditions matched]
+                                             answer from cached rows: copy them into the local
+                                             file, stamped with this round, without measuring
 
 Filters: k=v, k=a,b,c (any of), k=lo..hi (inclusive). Rows from the local
-file (the workspace's own measurements) show origin=local.
+file (the workspace's own measurements) show origin=local; rows that earlier
+runs of this case measured show origin=cache (`explain` names the run and round).
 """
 
 from __future__ import annotations
@@ -149,6 +153,30 @@ def cmd_add(args, rows, out) -> int:
     return 0
 
 
+def cmd_reuse(args, rows, out) -> int:
+    cached = {r["id"]: r for r in rows if r.get("origin") == "cache"}
+    missing = [i for i in args.ids if i not in cached]
+    if missing:
+        print(f"no cached row {', '.join(missing)}; measure it and add it with `primdb add`",
+              file=out)
+        return 1
+    new = []
+    for i in args.ids:
+        row = {k: v for k, v in cached[i].items() if k != "origin"}
+        source = dict(row.get("source") or {})
+        source["reused"] = "cache"
+        if _round():
+            source["round"] = _round()
+        if args.question:
+            source["question"] = args.question
+            source["conditions"] = args.conditions
+        row["source"] = source
+        new.append(row)
+    n = append(new, Path(args.local) if args.local else None)
+    print(f"reused {n} cached rows into {args.local or local_path()}", file=out)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="primdb", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -172,6 +200,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--question", help="the ledger question (Q<n>) these rows measure")
     s.add_argument("--conditions", choices=("matched", "other"), default="other",
                    help="matched: the conditions that the question's `settles it` line names")
+    s = sub.add_parser("reuse")
+    s.add_argument("ids", nargs="+")
+    s.add_argument("--question", help="the ledger question (Q<n>) these rows answer")
+    s.add_argument("--conditions", choices=("matched", "other"), default="other",
+                   help="matched: the conditions that the question's `settles it` line names")
     return p
 
 
@@ -180,7 +213,7 @@ def main(argv: list[str] | None = None, out=None) -> int:
     out = out or sys.stdout
     rows = load(args.seed, local=Path(args.local) if args.local else None)
     return {"list": cmd_list, "q": cmd_q, "compare": cmd_compare,
-            "explain": cmd_explain, "add": cmd_add}[args.cmd](args, rows, out)
+            "explain": cmd_explain, "add": cmd_add, "reuse": cmd_reuse}[args.cmd](args, rows, out)
 
 
 if __name__ == "__main__":

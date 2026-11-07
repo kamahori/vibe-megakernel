@@ -179,7 +179,9 @@ MICROBENCH_TASK = (
     "3. Give the request file to the `microbench` subagent (Agent tool, "
     "`subagent_type: microbench`, `run_in_background: false`, so that you wait for its "
     "answers). It answers your items and each plan claim P1, P2, ... from "
-    "`./primdb` rows that match the conditions and from microbenchmarks, and it measures the "
+    "`./primdb` rows that match the conditions (including rows that earlier runs of this case "
+    "measured, origin `cache`) and from microbenchmarks of what no matched row covers, and it "
+    "measures the "
     "largest question still open in `progress/microbench/open.md`. It writes "
     "`progress/microbench/answers/<round>.md`, adds new measurements to the database, updates "
     "the ledger, and adds a status entry for the round to `progress/engine-map.md`.\n"
@@ -203,6 +205,8 @@ MICROBENCH_TASK = (
     "up during the round, append it to the "
     "request file and give it to the subagent again. Keep these files under `progress/`: a "
     "revert to an earlier round keeps them.\n")
+
+CACHE_ROWS = "progress/microbench/primdb_cache.jsonl"
 
 NO_FALLBACK_TASK = (
     "\n## No fallback to a design measured slower\n\n"
@@ -373,6 +377,7 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case,
         common + f"exec {python} -m megabench sol --case {case_id} {regimes_flag}\"$@\"\n")
     sol.chmod(0o755)
     local = shlex.quote(str(project / "progress/microbench/primdb_local.jsonl"))
+    cached = shlex.quote(str(project / CACHE_ROWS))
     for name, module, args in (("primdb", "megabench.primdb", ""),
                                ("engine_map", "megabench.primdb.engine_map", ""),
                                ("microbench_items", "megabench.integrations.microbench_gate",
@@ -380,7 +385,7 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case,
                                ("microbench_check", "megabench.integrations.microbench_gate",
                                 "check ")):
         tool = project / name
-        tool.write_text(common + f"export PRIMDB_LOCAL={local}\n"
+        tool.write_text(common + f"export PRIMDB_LOCAL={local}\nexport PRIMDB_CACHE={cached}\n"
                         f"exec {python} -m {module} {args}\"$@\"\n")
         tool.chmod(0o755)
     # nvcc with a content cache and a time limit; it runs in the caller's directory.

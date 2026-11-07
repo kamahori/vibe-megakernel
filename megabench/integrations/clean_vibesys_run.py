@@ -173,6 +173,19 @@ def preflight(args, run: Path, env: dict[str, str], claude: Path) -> bool:
     return not bad
 
 
+def cache_rows(args, run: Path) -> int:
+    """Copy the rows that earlier runs of the case measured into the new workspace."""
+    from ..primdb import cache
+
+    rows = cache.harvest(run.parent, args.case, exclude=(run.name,),
+                         store=getattr(args, "microbench_cache_store", None))
+    n = cache.write(rows, run / args.case / "progress/microbench/primdb_cache.jsonl")
+    if getattr(args, "microbench_cache_store", None):
+        cache.write(rows, args.microbench_cache_store)
+    print(f"microbench cache: {n} measured rows of {args.case} from earlier runs")
+    return n
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--case", required=True)
@@ -207,6 +220,11 @@ def main() -> int:
     parser.add_argument("--microbench-minutes", type=float,
                         help="time limit of each pre-plan microbench phase; the agents get a "
                              "deadline and leave what they cannot measure open")
+    parser.add_argument("--no-microbench-cache", dest="microbench_cache", action="store_false",
+                        help="start without the rows that earlier runs of the case measured "
+                             "(a clean comparison run)")
+    parser.add_argument("--microbench-cache-store", type=Path,
+                        help="file that keeps cached rows after run directories are deleted")
     parser.add_argument("--forbid", type=Path, action="append", default=[],
                         help="extra path that must be absent in the sandbox (repeat)")
     args = parser.parse_args()
@@ -243,6 +261,8 @@ def main() -> int:
         command += ["--regimes", str(args.regimes.resolve())]
     subprocess.run(command, check=True, cwd=run / "trusted",
                    env=os.environ | {"PYTHONPATH": str(run / "trusted")})
+    if args.microbench_cache:
+        cache_rows(args, run)
     settings = run / "home/.claude/settings.json"
     settings.parent.mkdir(parents=True)
     settings.write_text(json.dumps({"permissions": {"deny": list(DENIED_TOOLS)}}, indent=2))

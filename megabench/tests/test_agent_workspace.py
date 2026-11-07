@@ -14,6 +14,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from .. import primdb
 from ..cases import select_cases
 from ..integrations.make_agent_workspace import make_workspace
 from ..tasks.workloads import TASK_MODULES
@@ -154,6 +155,17 @@ class AgentWorkspaceTests(unittest.TestCase):
                 cwd=project, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["origin"], "seed")
+            # Rows that earlier runs of the case measured are read as origin `cache`.
+            cached = primdb.normalize({"family": "cache_probe", "primitive": "cache.probe",
+                                       "p.n": 1, "m.us": 2.0})
+            primdb.append([cached], project / "progress/microbench/primdb_cache.jsonl")
+            result = subprocess.run(
+                [str(project / "primdb"), "q", "cache.probe", "--json"],
+                cwd=project, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["origin"], "cache")
+            self.assertIn("primdb reuse",
+                          (project / ".claude/agents/microbench.md").read_text())
             self.assertTrue((project / ".claude/agents/microbench.md").is_file())
             self.assertTrue((project / "primbench/schema.md").is_file())
             self.assertIn("Microbench phase", (project / "TASK.md").read_text())

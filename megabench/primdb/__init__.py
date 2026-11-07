@@ -1,8 +1,9 @@
 """Measured B200 primitive costs, for sizing kernel work to hardware shapes.
 
-Rows live in JSONL files: the trusted seed next to this module and an
-optional local file (primdb_local.jsonl or $PRIMDB_LOCAL) that
-workspace benchmarks append to. See schema.md.
+Rows live in JSONL files: the trusted seed next to this module, an optional
+cache of rows that earlier runs of the case measured ($PRIMDB_CACHE, see
+cache.py), and an optional local file (primdb_local.jsonl or $PRIMDB_LOCAL)
+that workspace benchmarks append to. See schema.md.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from typing import Iterable, Iterator
 
 SEED = Path(__file__).with_name("seed.jsonl")
 LOCAL_ENV = "PRIMDB_LOCAL"
+CACHE_ENV = "PRIMDB_CACHE"
 KINDS = ("measure", "model", "fact")
 GEMM_FAMILIES = ("gemm", "gemm_phase")
 
@@ -84,13 +86,23 @@ def local_path() -> Path:
     return Path(os.environ.get(LOCAL_ENV, "primdb_local.jsonl"))
 
 
-def load(seed: Path = SEED, local: Path | None = None) -> list[dict]:
+def cache_path() -> Path | None:
+    value = os.environ.get(CACHE_ENV, "").strip()
+    return Path(value) if value else None
+
+
+def load(seed: Path = SEED, local: Path | None = None,
+         cache: Path | None = None) -> list[dict]:
     if not seed.is_file():
         raise FileNotFoundError(f"primdb seed {seed} is missing; a snapshot of the repository "
                                 "must include it (megabench/.gitignore ignores *.jsonl)")
     rows = list(read(seed, "seed"))
-    rows += read(local if local is not None else local_path(), "local")
-    return rows
+    mine = list(read(local if local is not None else local_path(), "local"))
+    cache = cache if cache is not None else cache_path()
+    if cache is not None:
+        reused = {r["id"] for r in mine}
+        rows += [r for r in read(cache, "cache") if r["id"] not in reused]
+    return rows + mine
 
 
 def append(rows: Iterable[dict], path: Path | None = None) -> int:

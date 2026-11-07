@@ -45,9 +45,20 @@ the data and what it shows, with its conditions.
      to a point that was not measured.
    - `./primdb compare gemm M=.. N=.. K=..` ranks the measured engines for a GEMM shape.
    - `./primdb explain <id>` shows how a row was measured, and its notes on how to read it.
+   - Rows with origin `cache` were measured by earlier runs of this same case, on the same
+     benchmark, before this run started (`source.cache_from` names the run). Look them up
+     like any other row. They are measurements, not answers: the answers, plans and
+     benchmark files of those runs are not here.
 3. Decide if the rows answer the item. A row answers it only when its conditions match the
    item's conditions (shape, data type, occupancy, cache state, concurrency, standalone or as
    one phase of a persistent kernel). A row from other conditions is a hint, not an answer.
+   A cached row whose conditions match answers the item directly: cite its id and do not
+   measure it again. Where a ledger question needs rows of this round, copy the matched
+   cached rows into this round with `./primdb reuse <id> ... --question Q<n> --conditions
+   matched`; they then count as this round's rows. Measure only the configurations (designs,
+   shapes, conditions) that no matched row covers, and add them as usual. Before you trust a
+   cached row for a decision, read how it was measured (`./primdb explain <id>`); if its
+   method does not fit the item, measure the item.
 4. If the rows do not answer the item, measure it:
    - Write the smallest benchmark that isolates the quantity, under
      `progress/microbench/bench/`. For an engine or shape question, prefer a proxy of the
