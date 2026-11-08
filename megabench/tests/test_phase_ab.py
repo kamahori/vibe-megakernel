@@ -140,6 +140,29 @@ class PhaseAbTests(unittest.TestCase):
                 phase_ab.main(args + ["--output", str(tmp / "o4"), "--rerun-of", str(first)],
                               backend_factory=factory)
 
+    def test_history_marks_a_whole_slow_run_and_keeps_the_best(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            for name, text in (("a", "a = 1\n"), ("b", "b = 1\n")):
+                (tmp / name).mkdir()
+                (tmp / name / "submission.py").write_text(text)
+            history = tmp / "reports/timing-history.jsonl"
+
+            def once(slow):
+                result, _ = phase_ab.run(tmp / "a", tmp / "b", output=tmp / "out", reps=2,
+                                         iters=1, warmup=0, names=None,
+                                         backend=Fake(CASE, slow=slow), case_id=CASE,
+                                         history=history, setup="r1")
+                return result
+
+            once(None)
+            result = once({0: "a", 1: "a", 2: "a"})
+        self.assertEqual(result["stability"]["a"]["verdict"], "slow")
+        self.assertEqual(result["stability"]["verdict"], "slow")
+        self.assertAlmostEqual(result["e2e"]["a_p50_ms"], 1.0)
+        self.assertAlmostEqual(result["e2e"]["diff_ms"], -0.1)
+        self.assertIn("SLOW", phase_ab.format_result(result))
+
     def test_all_phases_reported_without_the_filter(self) -> None:
         _, result, _ = invoke([])
         self.assertEqual([r["phase"] for r in result["phases"]], ["gemm", "norm"])

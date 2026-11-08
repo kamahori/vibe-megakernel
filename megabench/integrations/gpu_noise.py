@@ -227,7 +227,81 @@ def _load_case(case_id: str, regimes: Path | None):
 
 # ---------------------------------------------------------------- stability reruns
 
-MAX_RERUNS = 2  # stability reruns after one UNSTABLE result
+MAX_RERUNS = 2  # stability reruns after one UNSTABLE or SLOW result
+RERUNNABLE = ("unstable", "slow")
+
+# ---------------------------------------------------------------- timing history
+#
+# The slow mode only makes a run slower. So the best estimate of one code tree under one
+# measurement is the lowest fast-cluster p50 of all its runs, of any verdict: its score. A run
+# whose processes agree but which is slower than the tree's best earlier run is in the slow
+# mode as a whole (verdict SLOW); its score is the earlier best.
+
+HISTORY_FILE = "timing-history.jsonl"
+OFFICIAL_HISTORY_ENV = "MEGABENCH_OFFICIAL_TIMING_HISTORY"  # framework gates only
+
+
+def history_key(kind: str, case: str, setup: str, identity: str) -> str:
+    """One measurement of one code tree: tool, case, regimes or regime, tree digest."""
+    return "|".join((kind, case, setup or "", identity))
+
+
+def best_known(path: Path | None, key: str) -> tuple[float, int] | None:
+    """(lowest fast-cluster p50, number of runs) of *key* in the history file at *path*."""
+    if path is None or not path.is_file():
+        return None
+    values = []
+    for line in path.read_text().splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("key") == key and isinstance(row.get("fast_p50_ms"), (int, float)):
+            values.append(float(row["fast_p50_ms"]))
+    return (min(values), len(values)) if values else None
+
+
+def add_history(path: Path | None, key: str, stab: dict, source: str) -> None:
+    if path is None or stab.get("fast_p50_ms") is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as out:
+        out.write(json.dumps({"key": key, "fast_p50_ms": stab["fast_p50_ms"],
+                              "verdict": stab.get("verdict"), "source": source,
+                              "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}) + "\n")
+
+
+def score(stab: dict, best: tuple[float, int] | None,
+          tolerance_pct: float = DEFAULT_TOLERANCE_PCT) -> dict:
+    """Score of this run against the tree's earlier runs; updates the verdict in *stab*.
+
+    Adds score_ms (the lower of this fast-cluster p50 and the earlier best), best_known_ms,
+    earlier_runs, and sets the verdict to "slow" when all processes agree but the run is
+    slower than the earlier best by more than the tolerance.
+    """
+    fast = stab["fast_p50_ms"]
+    if best is None:
+        stab.update(score_ms=fast, best_known_ms=None, earlier_runs=0)
+        return stab
+    low, runs = best
+    stab.update(score_ms=min(fast, low), best_known_ms=low, earlier_runs=runs)
+    if fast > low * (1 + tolerance_pct / 100) and stab.get("verdict") == "stable":
+        stab["verdict"] = "slow"
+    return stab
+
+
+def score_line(stab: dict) -> str:
+    if stab.get("score_ms") is None:
+        return ""
+    if not stab.get("earlier_runs"):
+        return (f"  score: {stab['score_ms']:.4f} ms (first run of this code; later runs of the "
+                "same code can only lower it)")
+    line = (f"  score: {stab['score_ms']:.4f} ms (lowest fast-cluster p50 of this code over "
+            f"{stab['earlier_runs'] + 1} runs; earlier best {stab['best_known_ms']:.4f} ms)")
+    if stab.get("verdict") == "slow":
+        line += ("\n  SLOW: all processes agree, but they are slower than an earlier run of the "
+                 "same code; this run was in the slow mode, and the score keeps the earlier best")
+    return line
 
 
 SOURCE_SUFFIXES = {".py", ".cu", ".cuh", ".h", ".hpp", ".cpp", ".cc", ".c", ".json", ".toml"}
@@ -271,8 +345,8 @@ def rerun_status(prior: Path, identity: str) -> tuple[bool, str]:
     stab, prior_identity = _stability_of(prior)
     if stab is None:
         return False, f"{prior} has no timing stability record"
-    if stab.get("verdict") != "unstable":
-        return False, f"{prior} was {stab.get('verdict')}, not unstable"
+    if stab.get("verdict") not in RERUNNABLE:
+        return False, f"{prior} was {stab.get('verdict')}, not unstable or slow"
     if prior_identity != identity:
         return False, f"{prior} timed other code (the candidate files changed since)"
     depth, link = 1, stab.get("rerun_of")
@@ -286,7 +360,7 @@ def rerun_status(prior: Path, identity: str) -> tuple[bool, str]:
     return True, f"stability rerun {depth} of {MAX_RERUNS} for {prior}"
 
 
-RERUN_NOTE = ("stability rerun: this run repeats an UNSTABLE result on the same code; "
+RERUN_NOTE = ("stability rerun: this run repeats an UNSTABLE or SLOW result on the same code; "
               "it is not paid work and does not count against a paid-call cap")
 
 
@@ -328,9 +402,15 @@ def check(args: argparse.Namespace) -> int:
     stab = check_report(record, probes, args.tolerance_pct)
     stab["identity"] = identity
     stab["rerun_of"] = str(args.rerun_of) if args.rerun_of else None
+    history = Path(args.report).parent / HISTORY_FILE
+    key = history_key("check", args.case, args.regimes.name if args.regimes else "", identity)
+    score(stab, best_known(history, key), args.tolerance_pct)
+    add_history(history, key, stab, str(args.report))
     Path(args.report).with_suffix(".stability.json").write_text(json.dumps(stab, indent=2))
     print(format_stability("check", stab, stab["processes"], stab["note"]))
-    if stab["verdict"] == "unstable":
+    if score_line(stab):
+        print(score_line(stab))
+    if stab["verdict"] in RERUNNABLE:
         print(f"  to repeat it as a stability rerun: ./check_candidate --rerun-of {args.report}")
     if args.rerun_of:
         print(f"  {RERUN_NOTE}")

@@ -14,7 +14,10 @@ carried question that has gone longest without a matched measurement (rows added
 plan there is nothing to check. A round whose phase the framework skipped
 (progress/microbench/skipped/<round>.md: no question of the plan needed a new microbenchmark)
 needs none of these files, and neither does a round whose phase the framework stopped at its
-hard time limit (progress/microbench/deadline/<round>.md). A plan claim that cites a row id
+hard time limit (progress/microbench/deadline/<round>.md) or that ended with an error before
+it wrote its files (progress/microbench/stopped/<round>.md). A claim that only the revised plan
+makes (not its draft, progress/microbench/draft/<round>.json) and that cites no row goes to the
+next round's phase (progress/microbench/carried/<round>.md). A plan claim that cites a row id
 that the round's answers also cite counts as answered. ./check_candidate runs `check --build` first and stops on a failure:
 --build also needs progress/microbench/build/<round>.md, the design each phase is built in; each
 engine-map phase with matched rows (p.phase, m.us) is built in the family of its fastest row.
@@ -73,8 +76,51 @@ def plan_items(plan: dict) -> list[str]:
     return items
 
 
+DRAFT = MICROBENCH / "draft"
+CARRIED = MICROBENCH / "carried"
+
+
+def revised_only(workspace: Path, plan_path: Path, items: list[str]) -> list[str]:
+    """Claims of a revised plan that its draft did not make and that cite no row.
+
+    The framework copies the draft to progress/microbench/draft/<round>.json before the
+    revision. The microbench session of the round has closed by then, so such a claim goes to
+    the next round's phase (progress/microbench/carried/<round>.md) and does not block this
+    round.
+    """
+    draft = workspace / DRAFT / f"{plan_path.stem}.json"
+    if not draft.is_file():
+        return []
+    try:
+        before = set(plan_items(json.loads(draft.read_text())))
+    except ValueError:
+        return []
+    return [item for item in items if item not in before and not ROW_ID.search(item)]
+
+
+def carried_in(workspace: Path, round_name: str) -> list[str]:
+    """Claims that the newest earlier round carried to this round's phase."""
+    earlier = sorted(p for p in (workspace / CARRIED).glob("round-*.md") if p.stem < round_name)
+    if not earlier:
+        return []
+    return [line[2:].strip() for line in earlier[-1].read_text().splitlines()
+            if line.startswith("- ")]
+
+
 def write_items(workspace: Path, plan_path: Path) -> list[str]:
     items = plan_items(json.loads(plan_path.read_text()))
+    later = revised_only(workspace, plan_path, items)
+    items = [item for item in items if item not in later]
+    carried_file = workspace / CARRIED / f"{plan_path.stem}.md"
+    if later:
+        carried_file.parent.mkdir(parents=True, exist_ok=True)
+        carried_file.write_text(
+            f"# Claims of the revised plan of {plan_path.stem}, for the next microbench phase\n\n"
+            + "".join(f"- {item}\n" for item in later))
+    else:
+        carried_file.unlink(missing_ok=True)
+    items += [f"(carried from the previous revised plan) {item}"
+              for item in carried_in(workspace, plan_path.stem) if item not in items]
     open_questions = [e["tag"] for e in ledger(workspace) if e["status"] == "open"]
     if open_questions:
         items.append("The plan chose its target over the open questions "
@@ -376,7 +422,10 @@ def check(workspace: Path, build: bool = False) -> list[str]:
         return check_build(workspace, round_name) if build else []
     # The framework stopped this round's phase at its hard time limit: what was not answered
     # stays open, and the round goes on with the answers that exist.
-    cut = (workspace / MICROBENCH / "deadline" / f"{round_name}.md").is_file()
+    # The same holds when the phase ended with an error before it wrote its files
+    # (progress/microbench/stopped/<round>.md).
+    cut = any((workspace / MICROBENCH / marker / f"{round_name}.md").is_file()
+              for marker in ("deadline", "stopped"))
     request = workspace / MICROBENCH / "requests" / f"{round_name}.md"
     answer = workspace / MICROBENCH / "answers" / f"{round_name}.md"
     for path in (request, answer):

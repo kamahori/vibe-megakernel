@@ -87,6 +87,43 @@ class GateTests(unittest.TestCase):
             (cut / "round-0003.md").write_text("# stopped\n")
             self.assertEqual(check(ws), [])
 
+    def test_phase_that_failed_before_its_answers_needs_none(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            (ws / "progress/plans").mkdir(parents=True)
+            (ws / "progress/plans/round-0003.json").write_text(json.dumps(PAST_REJECTIONS[2]))
+            self.assertTrue(check(ws))
+            stopped = ws / "progress/microbench/stopped"
+            stopped.mkdir(parents=True)
+            (stopped / "round-0003.md").write_text("# failed\n")
+            self.assertEqual(check(ws), [])
+
+    def test_claim_only_in_revised_plan_goes_to_the_next_round(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            draft = {"reasoning": "Rejected: a split-K GEMM does not pay."}
+            revised = {"reasoning": draft["reasoning"] + " A fused epilogue is ruled out."}
+            (ws / "progress/plans").mkdir(parents=True)
+            (ws / "progress/plans/round-0002.json").write_text(json.dumps(revised))
+            (ws / "progress/engine-map.md").write_text("round-0002 round-0003\n")
+            mb = ws / "progress/microbench"
+            for kind in ("requests", "answers"):
+                (mb / kind).mkdir(parents=True)
+                (mb / kind / "round-0002.md").write_text("P1: measured\n")
+            self.assertTrue(check(ws), "without the draft copy the new claim is P2")
+            (mb / "draft").mkdir()
+            (mb / "draft/round-0002.json").write_text(json.dumps(draft))
+            self.assertEqual(check(ws), [])
+            carried = (mb / "carried/round-0002.md").read_text()
+            self.assertIn("fused epilogue", carried)
+            (ws / "progress/plans/round-0003.json").write_text(json.dumps({"reasoning": "x"}))
+            for kind in ("requests", "answers"):
+                (mb / kind / "round-0003.md").write_text("nothing\n")
+            problems = check(ws)
+            self.assertTrue(any("does not answer plan claims P1" in p for p in problems))
+            (mb / "answers/round-0003.md").write_text("P1: measured\n")
+            self.assertEqual(check(ws), [])
+
     def test_revised_claim_citing_answer_rows_is_answered(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             ws = Path(directory)

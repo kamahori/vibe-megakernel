@@ -89,6 +89,10 @@ class RerunTests(unittest.TestCase):
             {"verdict": verdict, "identity": ident, "rerun_of": rerun_of}))
         return path
 
+    def test_slow_same_code_is_a_rerun(self) -> None:
+        ok, _ = gpu_noise.rerun_status(self.report("s", "slow"), gpu_noise.tree_digest(self.root))
+        self.assertTrue(ok)
+
     def test_unstable_same_code_is_a_rerun(self) -> None:
         prior = self.report("a", "unstable")
         ok, _ = gpu_noise.rerun_status(prior, gpu_noise.tree_digest(self.root))
@@ -122,6 +126,93 @@ class RerunTests(unittest.TestCase):
         ok, why = gpu_noise.rerun_status(third, ident)
         self.assertFalse(ok)
         self.assertIn("at most", why)
+
+
+class ScoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.history = Path(self.tmp.name) / "reports" / gpu_noise.HISTORY_FILE
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def run_once(self, values, key="k"):
+        stab = gpu_noise.spread(values, 3.0)
+        gpu_noise.score(stab, gpu_noise.best_known(self.history, key), 3.0)
+        gpu_noise.add_history(self.history, key, stab, "test")
+        return stab
+
+    def test_first_run_scores_its_fast_cluster(self) -> None:
+        stab = self.run_once([1.0, 1.3, 1.0])
+        self.assertEqual(stab["verdict"], "unstable")
+        self.assertEqual(stab["score_ms"], 1.0)
+        self.assertEqual(stab["earlier_runs"], 0)
+
+    def test_whole_run_in_slow_mode_is_slow_and_keeps_the_best(self) -> None:
+        self.run_once([1.0, 1.0, 1.0])
+        stab = self.run_once([1.3, 1.3, 1.3])
+        self.assertEqual(stab["verdict"], "slow")
+        self.assertEqual(stab["score_ms"], 1.0)
+        self.assertEqual(stab["earlier_runs"], 1)
+        self.assertIn("SLOW", gpu_noise.score_line(stab))
+
+    def test_faster_run_lowers_the_score_and_stays_stable(self) -> None:
+        self.run_once([1.3, 1.3, 1.3])
+        stab = self.run_once([1.0, 1.0, 1.0])
+        self.assertEqual(stab["verdict"], "stable")
+        self.assertEqual(stab["score_ms"], 1.0)
+        self.assertEqual(gpu_noise.best_known(self.history, "k"), (1.0, 2))
+
+    def test_keys_do_not_mix(self) -> None:
+        self.run_once([1.0, 1.0, 1.0], key="a")
+        stab = self.run_once([1.3, 1.3, 1.3], key="b")
+        self.assertEqual(stab["verdict"], "stable")
+        self.assertEqual(gpu_noise.history_key("check", "c", "", "d"), "check|c||d")
+
+
+class OfficialHistoryTests(unittest.TestCase):
+    def test_official_run_in_slow_mode_keeps_the_best_official_time(self) -> None:
+        import os
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from ..integrations import vibesys_case_evaluator as ev
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ws").mkdir()
+            sub = root / "ws/submission.py"
+            sub.write_text("x = 1\n")
+            case = SimpleNamespace(gpus=1)
+
+            def official(p50, probe_p50s):
+                result = {"candidate_timing": {"cuda_event_p50_ms": p50},
+                          "speedup_vs_eager_cuda_event": 10.0 / p50}
+                probes = [{"p50_ms": v} for v in probe_p50s]
+                with mock.patch.object(ev.gpu_noise, "run_probes", return_value=probes), \
+                        mock.patch.object(ev.gpu_noise, "probe_command", return_value=[]):
+                    ev.stabilize(result, case, "c", sub, None)
+                return result
+
+            env = {"MEGABENCH_STABILITY_PROCESSES": "3",
+                   ev.gpu_noise.OFFICIAL_HISTORY_ENV: str(root / "state/official.jsonl")}
+            with mock.patch.dict(os.environ, env):
+                first = official(1.0, [1.0, 1.0])
+                slow = official(1.3, [1.3, 1.3])
+            self.assertEqual(first["candidate_timing"]["cuda_event_p50_ms"], 1.0)
+            self.assertEqual(slow["timing_stability"]["verdict"], "slow")
+            self.assertEqual(slow["candidate_timing"]["cuda_event_p50_ms"], 1.0)
+            self.assertAlmostEqual(slow["speedup_vs_eager_cuda_event"], 10.0)
+            with mock.patch.dict(os.environ, {"MEGABENCH_STABILITY_PROCESSES": "3"}):
+                os.environ.pop(ev.gpu_noise.OFFICIAL_HISTORY_ENV, None)
+                plain = official(1.3, [1.3, 1.3])
+            self.assertEqual(plain["candidate_timing"]["cuda_event_p50_ms"], 1.3,
+                             "without the framework history nothing changes")
 
 
 if __name__ == "__main__":

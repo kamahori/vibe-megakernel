@@ -82,10 +82,13 @@ def format_result(result: dict) -> str:
                                 if s["slow_processes"] else ""))
                 if s.get("note"):
                     lines.append(f"    {s['note']}")
+                if gpu_noise.score_line(s):
+                    lines.append(f"  {label}" + gpu_noise.score_line(s))
             if stab["verdict"] != "stable":
-                lines.append("  the p50s above are fast-cluster p50s; an unstable result is "
-                             "not evidence for or against the variant until a rerun agrees")
-                lines.append("  to repeat it as a stability rerun: add --rerun-of "
+                lines.append("  A and B above are scores: the slow mode only makes a run slower, "
+                             "so the fast cluster and the best earlier run of the same code give "
+                             "the time")
+                lines.append("  to repeat it as a free stability rerun: add --rerun-of "
                              "<this result.json> to the same phase_ab command")
         lines.append(f"{'phase':<20} {'A window':>10} {'B window':>10} {'B-A':>10}   (us, summed over occurrences)")
         for row in result["phases"]:
@@ -198,7 +201,8 @@ def stability(procs: list[dict], tolerance_pct: float) -> dict:
 def run(parent: Path, variant: Path, *, output: Path, reps: int, iters: int, warmup: int,
         names: list[str] | None, backend, case_id: str = "", processes: int = 3,
         tolerance_pct: float = gpu_noise.DEFAULT_TOLERANCE_PCT,
-        rerun_of: str | None = None) -> tuple[dict, int]:
+        rerun_of: str | None = None, history: Path | None = None,
+        setup: str = "") -> tuple[dict, int]:
     result: dict = {"case": case_id, "parent": str(parent), "variant": str(variant),
                     "reps": reps, "iters": iters, "order": interleave(reps),
                     "identity": pair_identity(parent, variant), "rerun_of": rerun_of}
@@ -214,7 +218,14 @@ def run(parent: Path, variant: Path, *, output: Path, reps: int, iters: int, war
         procs = [backend.time_process(parent, variant, reps, iters, warmup)
                  for _ in range(processes)]
         stab = stability(procs, tolerance_pct)
-        a, b = stab["a"]["fast_p50_ms"], stab["b"]["fast_p50_ms"]
+        for side, tree in (("a", parent), ("b", variant)):
+            key = gpu_noise.history_key("phase_ab", case_id, setup, gpu_noise.tree_digest(tree))
+            gpu_noise.score(stab[side], gpu_noise.best_known(history, key), tolerance_pct)
+            gpu_noise.add_history(history, key, stab[side], str(output / "result.json"))
+        if "slow" in (stab["a"]["verdict"], stab["b"]["verdict"]):
+            stab["verdict"] = "slow"
+        # The score of each side (its lowest fast-cluster p50 over all its runs) is its time.
+        a, b = stab["a"]["score_ms"], stab["b"]["score_ms"]
         result["e2e"] = {"a_ms": [x for p in procs for x in p["a_ms"]],
                          "b_ms": [x for p in procs for x in p["b_ms"]],
                          "a_p50_ms": a, "b_p50_ms": b,
@@ -244,7 +255,7 @@ def main(argv: list[str] | None = None, backend_factory=GpuBackend) -> int:
     parser.add_argument("--tolerance-pct", type=float, default=gpu_noise.DEFAULT_TOLERANCE_PCT,
                         help="per-process p50s further than this from the fastest are noise")
     parser.add_argument("--rerun-of", type=Path,
-                        help="an UNSTABLE phase_ab result.json of the same two directories; "
+                        help="an UNSTABLE or SLOW phase_ab result.json of the same two directories; "
                              "marks this run a stability rerun")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--output", type=Path,
@@ -285,7 +296,13 @@ def main(argv: list[str] | None = None, backend_factory=GpuBackend) -> int:
                        reps=args.reps, iters=args.iters, warmup=args.warmup,
                        names=args.phase or None, backend=backend, case_id=args.case,
                        processes=args.processes, tolerance_pct=args.tolerance_pct,
-                       rerun_of=str(args.rerun_of) if args.rerun_of else None)
+                       rerun_of=str(args.rerun_of) if args.rerun_of else None,
+                       # In a workspace, the history is the one ./check_candidate also keeps.
+                       history=(Path("reports") if Path("reports").is_dir()
+                                and Path("progress").is_dir() else args.output)
+                       / gpu_noise.HISTORY_FILE,
+                       setup="|".join(x for x in (args.regimes.name if args.regimes else "",
+                                                   args.regime or "") if x))
     print(format_result(result))
     print(f"result: {args.output}/result.json")
     return code

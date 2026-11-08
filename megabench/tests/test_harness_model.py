@@ -19,11 +19,18 @@ class TimingTests(unittest.TestCase):
         self.assertEqual(hm.timing_analysis(0.0, 2.0)["current"]["accept"], 1.0)
         self.assertEqual(hm.timing_analysis(0.0, -2.0)["current"]["accept"], 0.0)
 
-    def test_parent_all_slow_accepts_a_slower_candidate(self):
-        self.assertGreater(hm.timing_analysis(0.5, -2.0)["current"]["accept"], 0.05)
+    def test_score_rule_beats_the_verdict_rule(self):
+        t = hm.timing_analysis(0.5, -2.0, parent_history=2)
+        self.assertGreater(t["current"]["accept"], 0.05)
+        self.assertLess(t["digest_min"]["accept"], 0.01)
+        t = hm.timing_analysis(0.3, 2.0)
+        self.assertLess(t["wrong_digest_min"], t["wrong_current"] / 5)
 
 
 class PartTests(unittest.TestCase):
+    def test_gate_clean(self):
+        self.assertEqual([f.severity for f in hm.gate_findings()], ["ok"])
+
     def test_gate_and_broker_have_no_new_problem(self):
         findings = hm.gate_findings() + hm.broker_findings() + hm.timing_findings()
         self.assertEqual(hm.new_problems(findings), [])
@@ -38,10 +45,14 @@ class LoopTests(unittest.TestCase):
         findings = hm.LoopModel(max_rounds=2).findings()
         self.assertEqual(hm.new_problems(findings), [])
 
-    def test_crash_in_last_attempt_blocks_resume(self):
+    def test_crash_in_last_attempt_resumes(self):
         r = hm.LoopModel(max_rounds=2).explore()
-        self.assertTrue(r.dead)
-        self.assertIn("crash after mark-paid", r.trace(r.dead[0])[-2])
+        self.assertEqual(r.dead, [])
+        self.assertEqual(r.lost, [])
+
+    def test_failed_final_round_keeps_approved_work_at_any_cadence(self):
+        for every in (1, 3):
+            self.assertEqual(hm.LoopModel(max_rounds=3, official_every=every).explore().lost, [])
 
     def test_no_crash_no_dead_state(self):
         r = hm.LoopModel(max_rounds=2, max_crashes=0).explore()

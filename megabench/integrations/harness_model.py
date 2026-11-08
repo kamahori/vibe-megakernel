@@ -75,6 +75,7 @@ class LoopState:
     approved: tuple = ()          # (round, level) of trees the judge passed while correct
     records: tuple = ()           # (round, passed, official, disposition, retained, level)
     requested: bool = False       # plan.request_official_evaluation of this round
+    correct: tuple = ()           # (round, tree correct at close)
     crashes: int = 0
     winner: int | None = None     # level of the final tree (baseline is 0)
 
@@ -100,7 +101,7 @@ def _speed(level: int) -> float:
 class LoopModel:
     """Explicit-state search of `_MultiRun.execute` with injected agent behavior."""
 
-    def __init__(self, max_rounds: int = 3, max_retries: int = 3, official_every: int = 3,
+    def __init__(self, max_rounds: int = 3, max_retries: int = 3, official_every: int = 1,
                  judge_every: int = 3, max_crashes: int = 1, outcomes=OUTCOMES):
         self.v = _vibesys()
         self.config = self.v.HypothesisConfig(
@@ -143,9 +144,9 @@ class LoopModel:
             for requested in (False, True):
                 first = self.first_attempt(s)
                 if first > self.config.max_retries_per_round:
-                    # _run_attempts raises "round N exhausted its paid attempts"; the run fails
-                    # and every resume fails in the same place.
-                    yield f"r{s.rnd}: resume -> exhausted paid attempts", replace(s, phase="dead")
+                    # _run_attempts returns at once: the round closes as failed, the run goes on.
+                    yield (f"r{s.rnd}: resume with no paid attempt left, round closes failed",
+                           self.close(s, passed=False, official=False))
                     return
                 yield (f"r{s.rnd}: plan (official requested={requested})",
                        replace(s, phase="attempt", attempt=first, requested=requested))
@@ -189,7 +190,9 @@ class LoopModel:
                                                        disposition=disposition)
             return
         yield tag + ", judge FAIL", nxt
-        approved = nxt.approved + ((s.rnd, level),) if ok else nxt.approved
+        # The oracle: trees the judge approved as candidates (a discarded tree is not one).
+        candidate = disposition is v.Disposition.PARETO_FRONTIER
+        approved = nxt.approved + ((s.rnd, level),) if ok and candidate else nxt.approved
         passed = replace(nxt, approved=approved)
         ready = declared in {v.Outcome.SUPPORTED, v.Outcome.NOMINATED} or \
             disposition is v.Disposition.PARETO_FRONTIER
@@ -220,11 +223,22 @@ class LoopModel:
             retained = v.transitions.provisional_candidate_retained(disposition)
         record = (s.rnd, passed, official, disposition.value, retained, s.level)
         return replace(s, phase="round", rnd=s.rnd + 1, attempt=0, last_paid=None,
-                       records=s.records + (record,), requested=False)
+                       records=s.records + (record,), requested=False,
+                       correct=s.correct + ((s.rnd, s.ok),))
 
     def finish(self, s: LoopState) -> LoopState:
         winner = self.v.transitions.select_final_candidate(self.records(s), self.space)
         level = 0 if winner is None else next(r[5] for r in s.records if r[0] == winner.round_number)
+        # _MultiRun._newer_approved: the approved rounds after the winner without an official
+        # evaluation get the gates at the end, newest first; the first correct one wins when
+        # it is better.
+        floor = winner.round_number if winner is not None else 0
+        newer = [r for r in s.records if r[0] > floor and r[1] and not r[2] and r[4] is True]
+        passing = [r for r in newer if dict(s.correct).get(r[0], True)]
+        if passing:
+            newer_level = passing[-1][5]
+            if winner is None or newer_level > level:
+                level = newer_level
         return replace(s, phase="done", winner=level)
 
     # -- search ---------------------------------------------------------------------------
@@ -274,7 +288,7 @@ class LoopModel:
                 "loop", "a restart always resumes", "stall",
                 "a crash in the last paid attempt of a round makes every resume fail: "
                 "_first_attempt returns last_paid.turn+1, which is above max_retries_per_round, "
-                f"and _run_attempts raises 'exhausted its paid attempts' ({label}; "
+                f"and the resume cannot go on ({label}; "
                 f"{len(r.dead)} reachable states)", r.trace(shortest)))
         if r.lost:
             worst = max(r.lost, key=lambda s: (max(l for _, l in s.approved) - s.winner,
@@ -284,11 +298,8 @@ class LoopModel:
             out.append(Finding(
                 "loop", "the final tree is the fastest tree the judge approved", "wrong-winner",
                 f"{len(r.lost)} end states keep a slower tree than the fastest approved one "
-                f"({baseline} of them fall back to the input baseline). Only rounds with an "
-                "official evaluation can win, and official evaluation runs only at the cadence, "
-                "on request, or in the final round, so a failed final round loses the earlier "
-                f"approved gains ({label}). Example: approved level {best}, kept level "
-                f"{worst.winner}", r.trace(worst),
+                f"({baseline} of them fall back to the input baseline) ({label}). Example: "
+                f"approved level {best}, kept level {worst.winner}", r.trace(worst),
                 {"lost": len(r.lost), "to_baseline": baseline}))
         if not out:
             out.append(Finding("loop", "all loop rules", "ok", f"no violation ({label}, "
@@ -337,11 +348,13 @@ def timing_analysis(p_slow: float, delta_pct: float, slow_factor: float = 1.3,
                     parent_history: int = 1) -> dict:
     """Decision quality for a candidate that is delta_pct faster (negative: slower).
 
-    current: accept when both final results are STABLE and the candidate's fast-cluster p50
-             is lower; an UNSTABLE result after the reruns is inconclusive (keep the parent).
-    digest_min: the slow mode only makes a run slower, so the best estimate of a code tree is
-             the minimum fast-cluster p50 over all its runs, of any verdict; the parent also
-             keeps the minimum of its earlier runs (parent_history of them).
+    current: the rule before the score (kept for comparison): accept when both final results
+             are STABLE and the candidate's fast-cluster p50 is lower; an UNSTABLE result after
+             the reruns is inconclusive (keep the parent).
+    digest_min: the harness rule (gpu_noise.score): the slow mode only makes a run slower, so
+             the score of a code tree is the minimum fast-cluster p50 over all its runs, of
+             any verdict; the parent also keeps the minimum of its earlier runs
+             (parent_history of them).
     """
     parent_ms, cand_ms = 1.0, 1.0 * (1 - delta_pct / 100)
     rr = gpu_noise.MAX_RERUNS
@@ -391,27 +404,31 @@ def _history(A, n):
     return out
 
 
-def timing_findings(p_values=(0.1, 0.3, 0.5), deltas=(2.0, -2.0, 0.5)) -> list[Finding]:
-    rows = [timing_analysis(p, d) for p in p_values for d in deltas]
+def timing_findings(p_values=(0.1, 0.3, 0.5), deltas=(2.0, -2.0, 0.5),
+                    parent_history: int = 2) -> list[Finding]:
+    """Findings for the harness rule (digest_min); the old rule is in the data for contrast."""
+    rows = [timing_analysis(p, d, parent_history=parent_history)
+            for p in p_values for d in deltas]
     out = []
-    false_accept = [r for r in rows if not r["faster"] and r["current"]["accept"] > 0]
+    false_accept = [r for r in rows if not r["faster"] and r["digest_min"]["accept"] > 0]
     if false_accept:
-        r = max(false_accept, key=lambda r: r["current"]["accept"])
+        r = max(false_accept, key=lambda r: r["digest_min"]["accept"])
         out.append(Finding(
             "timing", "a slower candidate is never accepted", "wrong-winner",
-            "a STABLE verdict does not prove a fast measurement: when all processes of the "
-            "parent's run are slow, the parent reads slow and STABLE, and a slower candidate "
-            f"wins. Worst case p_slow={r['p_slow']}, candidate {-r['delta_pct']}% slower: "
-            f"accepted with probability {r['current']['accept']} (digest_min: "
-            f"{r['digest_min']['accept']})", [], {"rows": false_accept}))
+            "residual risk: a slower candidate wins only when every run of the parent so far "
+            f"was in the slow mode as a whole. Worst case p_slow={r['p_slow']}, candidate "
+            f"{-r['delta_pct']}% slower, {parent_history} earlier parent runs: probability "
+            f"{r['digest_min']['accept']} (the rule before the score: "
+            f"{r['current']['accept']}). Each run of the parent lowers it", [],
+            {"rows": false_accept}))
     lost = [r for r in rows if r["faster"]]
-    worst = max(lost, key=lambda r: r["wrong_current"])
+    worst = max(lost, key=lambda r: r["wrong_digest_min"])
     out.append(Finding(
         "timing", "a faster candidate is accepted", "cost",
-        f"a faster candidate is rejected or left inconclusive with probability up to "
-        f"{worst['wrong_current']} (p_slow={worst['p_slow']}, {worst['delta_pct']}% faster), "
-        f"mostly because an UNSTABLE result counts as no evidence although its fast cluster "
-        f"is the true time; digest_min: {worst['wrong_digest_min']}", [], {"rows": rows}))
+        f"residual risk: a faster candidate is rejected with probability up to "
+        f"{worst['wrong_digest_min']} (p_slow={worst['p_slow']}, {worst['delta_pct']}% faster): "
+        "its first run was in the slow mode as a whole and no earlier run shows it; a rerun "
+        f"finds it (the rule before the score: {worst['wrong_current']})", [], {"rows": rows}))
     return out
 
 
@@ -422,22 +439,29 @@ def timing_findings(p_values=(0.1, 0.3, 0.5), deltas=(2.0, -2.0, 0.5)) -> list[F
 ROUND = "round-0002"
 
 
+def _plan(text: str) -> str:
+    return json.dumps({"reasoning": text, "hypothesis": "h", "expected_effect": "e"})
+
+
 def _workspace(root: Path, plan_text: str, answers: str | None, request: bool = True,
-               marker: str | None = None) -> Path:
+               marker: str | None = None, draft: str | None = None,
+               round_name: str = ROUND) -> Path:
     mb = root / "progress/microbench"
-    (root / "progress/plans").mkdir(parents=True)
-    (root / "progress/plans" / f"{ROUND}.json").write_text(json.dumps(
-        {"reasoning": plan_text, "hypothesis": "h", "expected_effect": "e"}))
-    (root / "progress/engine-map.md").write_text(f"status {ROUND}: reviewed\n")
+    (root / "progress/plans").mkdir(parents=True, exist_ok=True)
+    (root / "progress/plans" / f"{round_name}.json").write_text(_plan(plan_text))
+    if draft is not None:  # turns.py copies the draft before the revision
+        (mb / "draft").mkdir(parents=True, exist_ok=True)
+        (mb / "draft" / f"{round_name}.json").write_text(_plan(draft))
+    (root / "progress/engine-map.md").write_text(f"status {round_name}: reviewed\n")
     if request:
-        (mb / "requests").mkdir(parents=True)
-        (mb / "requests" / f"{ROUND}.md").write_text("deadline: x\nP1 measure\n")
+        (mb / "requests").mkdir(parents=True, exist_ok=True)
+        (mb / "requests" / f"{round_name}.md").write_text("deadline: x\nP1 measure\n")
     if answers is not None:
         (mb / "answers").mkdir(parents=True, exist_ok=True)
-        (mb / "answers" / f"{ROUND}.md").write_text(answers)
+        (mb / "answers" / f"{round_name}.md").write_text(answers)
     if marker:
         (mb / marker).mkdir(parents=True, exist_ok=True)
-        (mb / marker / f"{ROUND}.md").write_text("# stopped\n")
+        (mb / marker / f"{round_name}.md").write_text("# stopped\n")
     return root
 
 
@@ -446,44 +470,43 @@ def gate_findings() -> list[Finding]:
     draft = "Rejected: a split design does not pay here."
     revised = draft + " The fused path is ruled out by register pressure."
     cases = [
-        # (name, plan, answers, request file, marker, the run can go on without the phase)
-        ("phase answered the draft", draft, "P1: measured, rows 0123456789\n", True, None, True),
-        ("hard time limit, no answers", draft, None, True, "deadline", True),
-        ("phase skipped by the framework", draft, None, False, "skipped", True),
-        ("phase raised an error before any answer", draft, None, False, None, False),
+        # (name, plan, answers, request file, marker, draft) -- each must pass the gate.
+        ("phase answered the draft", draft, "P1: measured, rows 0123456789\n", True, None, None),
+        ("hard time limit, no answers", draft, None, True, "deadline", None),
+        ("phase skipped by the framework", draft, None, False, "skipped", None),
+        # turns.py _mark_stopped writes stopped/ when the phase fails without answers.
+        ("phase raised an error before any answer", draft, None, False, "stopped", None),
         ("phase returned no summary, answers exist", draft, "P1: rows 0123456789\n", True,
-         None, True),
+         None, None),
         ("revised plan adds an uncited claim", revised, "P1: rows 0123456789\n", True, None,
-         False),
+         draft),
     ]
-    out, blocked = [], []
-    for name, plan, answers, request, marker, _ in cases:
+    out = []
+    for name, plan, answers, request, marker, draft_text in cases:
         with tempfile.TemporaryDirectory() as tmp:
-            ws = _workspace(Path(tmp), plan, answers, request, marker)
+            ws = _workspace(Path(tmp), plan, answers, request, marker, draft_text)
             problems = microbench_gate.check(ws)
         if problems:
-            blocked.append((name, problems))
-    for name, problems in blocked:
-        if name == "phase raised an error before any answer":
-            out.append(Finding(
-                "gate", "the framework never leaves the gate unanswerable", "stall",
-                "when the microbench phase raises an error (or its session dies) before it "
-                "writes the request and answers, turns.py writes no marker, so check_candidate "
-                "refuses every run of the round until the implementer writes the microbench "
-                "files itself; the hard time limit writes progress/microbench/deadline/, this "
-                "path does not", [f"gate: {p}" for p in problems]))
-        elif name == "revised plan adds an uncited claim":
-            out.append(Finding(
-                "gate", "every claim the gate asks for has a role that answers it", "lost-work",
-                "the revised plan replaces the draft after the microbench session closed; a new "
-                "design-excluding sentence in it becomes a new P-tag that no answer names, so "
-                "check_candidate refuses until the implementer answers it",
-                [f"gate: {p}" for p in problems]))
-        else:
-            out.append(Finding("gate", name, "stall", "gate refused an expected pass",
+            rule = {"phase raised an error before any answer":
+                    "the framework never leaves the gate unanswerable",
+                    "revised plan adds an uncited claim":
+                    "every claim the gate asks for has a role that answers it"}.get(name, name)
+            out.append(Finding("gate", rule, "stall", f"{name}: the gate refuses",
                                [f"gate: {p}" for p in problems]))
+    # The claim that only the revised plan made is asked in the next round's phase.
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(Path(tmp), revised, "P1: rows 0123456789\n", True, None, draft)
+        microbench_gate.check(ws)
+        _workspace(ws, "h", "nothing\n", True, None, None, "round-0003")
+        problems = microbench_gate.check(ws)
+    if not any("does not answer plan claims P1" in p for p in problems):
+        out.append(Finding("gate", "a claim of a revised plan is not dropped", "lost-work",
+                           "the claim that only the revised plan made is not asked in the next "
+                           "round's phase", [f"gate: {p}" for p in problems]))
     if not out:
-        out.append(Finding("gate", "all phase endings", "ok", "the gate passes each ending"))
+        out.append(Finding("gate", "all phase endings", "ok",
+                           "the gate passes each ending, and a claim that only the revised plan "
+                           "made is asked in the next round"))
     return out
 
 
@@ -573,12 +596,8 @@ def broker_findings(jobs: int = 6, slots: int = 2) -> list[Finding]:
 # Defects that the model found and that are not fixed yet, by (part, rule). A finding that is
 # not here is new: main() then exits 1. Remove an entry when its fix lands.
 KNOWN = {
-    ("loop", "a restart always resumes"),
-    ("loop", "the final tree is the fastest tree the judge approved"),
+    # Residual: only a run of the parent that is not in the slow mode removes it.
     ("timing", "a slower candidate is never accepted"),
-    ("timing", "a faster candidate is accepted"),
-    ("gate", "the framework never leaves the gate unanswerable"),
-    ("gate", "every claim the gate asks for has a role that answers it"),
 }
 
 
@@ -587,7 +606,7 @@ def new_problems(findings: list[Finding]) -> list[Finding]:
             and (f.part, f.rule) not in KNOWN]
 
 
-def run_all(official_every: int = 3) -> list[Finding]:
+def run_all(official_every: int = 1) -> list[Finding]:
     findings = LoopModel(official_every=official_every).findings()
     findings += timing_findings()
     findings += gate_findings()
@@ -598,7 +617,8 @@ def run_all(official_every: int = 3) -> list[Finding]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--official-every", type=int, default=3)
+    parser.add_argument("--official-every", type=int, default=1,
+                        help="--official-eval-every of the run (clean_vibesys_run passes 1)")
     args = parser.parse_args(argv)
     t0 = time.time()
     findings = run_all(args.official_every)

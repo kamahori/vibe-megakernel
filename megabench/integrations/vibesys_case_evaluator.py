@@ -62,8 +62,10 @@ def stabilize(result: dict, case, case_id: str, submission: Path,
     """Time the candidate in more fresh processes; a slow evaluate process is not scored.
 
     When the evaluate process is outside the fast cluster (``gpu_noise.spread``), its
-    candidate p50 is replaced by the fast-cluster p50 and the speedups are scaled to
-    match. The evaluate value and all process values stay in ``timing_stability``.
+    candidate p50 is replaced by the fast-cluster p50. With MEGABENCH_OFFICIAL_TIMING_HISTORY
+    set, the p50 is also capped by the best earlier official run of the same code tree. The
+    speedups are scaled to match. The evaluate value and all process values stay in
+    ``timing_stability``.
     """
     processes = int(os.environ.get("MEGABENCH_STABILITY_PROCESSES", "3"))
     timing = result.get("candidate_timing") or {}
@@ -73,8 +75,20 @@ def stabilize(result: dict, case, case_id: str, submission: Path,
         gpu_noise.probe_command(case_id, submission, regimes_path), processes - 1)
     stab = gpu_noise.check_report(result, probes, gpu_noise.DEFAULT_TOLERANCE_PCT)
     result["timing_stability"] = stab
-    if 0 in stab["slow_processes"]:
-        old, new = timing["cuda_event_p50_ms"], stab["fast_p50_ms"]
+    old = timing["cuda_event_p50_ms"]
+    new = stab["fast_p50_ms"] if 0 in stab["slow_processes"] else old
+    # The framework's own history (a path the agent cannot write): a run of a tree that is
+    # slower than its best earlier official run was in the slow mode as a whole.
+    raw = os.environ.get(gpu_noise.OFFICIAL_HISTORY_ENV)
+    history = Path(raw) if raw else None
+    if history is not None:
+        key = gpu_noise.history_key("official", case_id,
+                                    regimes_path.name if regimes_path else "",
+                                    gpu_noise.tree_digest(submission.parent))
+        gpu_noise.score(stab, gpu_noise.best_known(history, key))
+        gpu_noise.add_history(history, key, stab, "official")
+        new = min(new, stab["score_ms"])
+    if new != old:
         timing["cuda_event_p50_ms_evaluate_process"] = old
         timing["cuda_event_p50_ms"] = new
         for key in [k for k in result if k.startswith("speedup_vs_") and "cuda_event" in k]:

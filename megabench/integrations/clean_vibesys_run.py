@@ -111,7 +111,10 @@ def write_launch(args, run: Path, env: dict[str, str], srun: list[str]) -> None:
     project = run / args.case
     vibesys_args = ["--project", str(project), "--config", str(project / "agent.toml"),
                     "--outer-loop", "agent", "--inner-loop", "multi-agent",
-                    "--max-rounds", str(args.rounds), "--profiler", "ncu", "--local",
+                    "--max-rounds", str(args.rounds),
+                    # Each approved candidate gets the official gates, so a failed final round
+                    # cannot lose the gains of earlier rounds (only official rounds can win).
+                    "--official-eval-every", "1", "--profiler", "ncu", "--local",
                     "--backend", "cuda", "--headless", "--task", args.case]
     for skill in args.skills:
         vibesys_args += ["--skills-dir", str(args.vibesys_skills / skill)]
@@ -329,7 +332,9 @@ def main() -> int:
     # Gates keep cached baseline timings in state/, which the agent cannot see;
     # the shared HOME would let the agent edit them.
     gate = ["env", *(f"-u{name}" for name in CREDENTIAL_ENV),
-            f"MEGABENCH_BASELINE_CACHE={run / 'state/baseline-cache'}", *srun, "--job-name=vs-gate"]
+            f"MEGABENCH_BASELINE_CACHE={run / 'state/baseline-cache'}",
+            f"MEGABENCH_OFFICIAL_TIMING_HISTORY={run / 'state/official-timing.jsonl'}",
+            *srun, "--job-name=vs-gate"]
     command = [str(run / "trusted/.venv/bin/python"), "-m",
                "megabench.integrations.make_agent_workspace", "--case", args.case,
                "--output", str(run / args.case), "--agent", "vibesys",

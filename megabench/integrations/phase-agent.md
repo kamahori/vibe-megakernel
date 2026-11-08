@@ -33,18 +33,19 @@ Rules:
 - Score every variant in the foreground with `./phase_ab <parent> <variant> --phase <phase>`.
   One call builds both, checks the variant against the reference, times parent and variant
   alternately in several fresh processes, and records a timeline of each. A variant counts
-  only when it is correct, the timing verdict is `STABLE`, and neither its phase window nor
-  its end-to-end time gets worse than the parent's by more than the spread between repeated
-  runs of the same candidate (measure that spread when you do not know it, with `./phase_ab`
-  on two copies of the parent). Do not end your turn while a GPU command that you started
-  still runs.
-- Read the `timing stability` lines of each `phase_ab` result. A slow process is GPU noise
-  (see "Timing noise on the GPU" in the objective): the reported p50s already exclude it.
-  When the verdict is `UNSTABLE`, run the same `phase_ab` again with `--rerun-of <its
-  result.json>` before you decide. Such a stability rerun is not paid work and does not
-  count against a cap. Never
-  reject or keep a variant on an `UNSTABLE` result alone, and never edit a variant to
-  remove a slowdown that only one process showed.
+  only when it is correct, and neither its phase window nor its end-to-end score gets worse
+  than the parent's by more than the spread between repeated runs of the same candidate
+  (measure that spread when you do not know it, with `./phase_ab` on two copies of the
+  parent). Do not end your turn while a GPU command that you started still runs.
+- Read the `timing stability` lines of each `phase_ab` result (see "Timing noise on the GPU"
+  in the objective). The slow mode only makes a run slower, so the `score` of each side (the
+  lowest fast-cluster p50 of all runs of that code) is its time, and A, B and B-A are
+  scores. An `UNSTABLE` result is valid evidence: its fast cluster is the time. A `SLOW`
+  result was in the slow mode as a whole; the score keeps the earlier best. When a decision
+  depends on an `UNSTABLE` or `SLOW` result, run the same `phase_ab` again with
+  `--rerun-of <its result.json>` before you decide. Such a stability rerun is not paid work
+  and does not count against a cap. Never edit a variant to remove a slowdown that only one
+  process or one run showed.
 - Keep the variant directories small: no build outputs, no profiler captures.
 
 Return to the caller, and write the same to `progress/phases/<round>/<phase>.md`:
