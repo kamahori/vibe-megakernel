@@ -41,11 +41,13 @@ class ResultSizeTests(unittest.TestCase):
                   "reference_launch_audit": reference_audit} for rank in range(4)]
         result = {"status": "ok_provisional", "ranks": ranks,
                   "launch_audit": {"status": "within_budget", "per_rank": [candidate_audit] * 4},
-                  "speedup_vs_best_baseline_cuda_event": 28.5}
-        output = benchmark_output("glm53-flash-step", result, 1.9658)
+                  "speedup_vs_best_baseline_cuda_event": 28.5,
+                  "candidate_timing": {"cuda_event_p50_ms": 4.0}}
+        output = benchmark_output("glm53-flash-step", result)
         self.assertNotIn("ranks", output["result"])
         self.assertEqual(output["result"]["status"], "ok_provisional")
-        self.assertEqual(output["progress_score"], 1.9658)
+        self.assertEqual(output["kernel_latency_ms"], 4.0)
+        self.assertAlmostEqual(output["progress_score"], 1 + 28.5 / 29.5)
         self.assertLess(len(json.dumps(output)), VIBESYS_CAPTURE_CHARS)
 
 
