@@ -85,10 +85,14 @@ def format_result(result: dict) -> str:
             if stab["verdict"] != "stable":
                 lines.append("  the p50s above are fast-cluster p50s; an unstable result is "
                              "not evidence for or against the variant until a rerun agrees")
+                lines.append("  to repeat it as a stability rerun: add --rerun-of "
+                             "<this result.json> to the same phase_ab command")
         lines.append(f"{'phase':<20} {'A window':>10} {'B window':>10} {'B-A':>10}   (us, summed over occurrences)")
         for row in result["phases"]:
             lines.append(f"{row['phase'][:20]:<20} {row['a_window_us']:>10.3f} "
                          f"{row['b_window_us']:>10.3f} {row['diff_window_us']:>+10.3f}")
+    if result.get("rerun_of"):
+        lines.append(gpu_noise.RERUN_NOTE + f" (of {result['rerun_of']})")
     return "\n".join(lines)
 
 
@@ -162,6 +166,10 @@ class GpuBackend:
         return json.loads((output / "summary.json").read_text()).get("windows", {})
 
 
+def pair_identity(parent: Path, variant: Path) -> str:
+    return gpu_noise.tree_digest(parent) + ":" + gpu_noise.tree_digest(variant)
+
+
 def time_pair(backend, parent: Path, variant: Path, reps: int, iters: int, warmup: int) -> dict:
     """In this process: load both, warm both, time them alternately, time the canary."""
     cand = {"A": backend.load(parent), "B": backend.load(variant)}
@@ -189,9 +197,11 @@ def stability(procs: list[dict], tolerance_pct: float) -> dict:
 
 def run(parent: Path, variant: Path, *, output: Path, reps: int, iters: int, warmup: int,
         names: list[str] | None, backend, case_id: str = "", processes: int = 3,
-        tolerance_pct: float = gpu_noise.DEFAULT_TOLERANCE_PCT) -> tuple[dict, int]:
+        tolerance_pct: float = gpu_noise.DEFAULT_TOLERANCE_PCT,
+        rerun_of: str | None = None) -> tuple[dict, int]:
     result: dict = {"case": case_id, "parent": str(parent), "variant": str(variant),
-                    "reps": reps, "iters": iters, "order": interleave(reps)}
+                    "reps": reps, "iters": iters, "order": interleave(reps),
+                    "identity": pair_identity(parent, variant), "rerun_of": rerun_of}
     output.mkdir(parents=True, exist_ok=True)
     code = 0
     try:
@@ -233,6 +243,9 @@ def main(argv: list[str] | None = None, backend_factory=GpuBackend) -> int:
                         help="fresh processes that each time A and B alternately")
     parser.add_argument("--tolerance-pct", type=float, default=gpu_noise.DEFAULT_TOLERANCE_PCT,
                         help="per-process p50s further than this from the fastest are noise")
+    parser.add_argument("--rerun-of", type=Path,
+                        help="an UNSTABLE phase_ab result.json of the same two directories; "
+                             "marks this run a stability rerun")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--output", type=Path,
                         default=Path(f"reports/phase-ab-{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}"))
@@ -258,6 +271,12 @@ def main(argv: list[str] | None = None, backend_factory=GpuBackend) -> int:
     backend.case_args = (["--case", args.case]
                          + (["--regimes", str(args.regimes.resolve())] if args.regimes else [])
                          + (["--regime", args.regime] if args.regime else []))
+    if args.rerun_of is not None and not args.worker:
+        ok, reason = gpu_noise.rerun_status(
+            args.rerun_of, pair_identity(args.parent.resolve(), args.variant.resolve()))
+        if not ok:
+            parser.error(f"--rerun-of refused: {reason}")
+        print(f"{gpu_noise.RERUN_NOTE} ({reason})")
     if args.worker:
         print(json.dumps(time_pair(backend, args.parent.resolve(), args.variant.resolve(),
                                    args.reps, args.iters, args.warmup)))
@@ -265,7 +284,8 @@ def main(argv: list[str] | None = None, backend_factory=GpuBackend) -> int:
     result, code = run(args.parent.resolve(), args.variant.resolve(), output=args.output,
                        reps=args.reps, iters=args.iters, warmup=args.warmup,
                        names=args.phase or None, backend=backend, case_id=args.case,
-                       processes=args.processes, tolerance_pct=args.tolerance_pct)
+                       processes=args.processes, tolerance_pct=args.tolerance_pct,
+                       rerun_of=str(args.rerun_of) if args.rerun_of else None)
     print(format_result(result))
     print(f"result: {args.output}/result.json")
     return code

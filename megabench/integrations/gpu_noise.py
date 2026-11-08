@@ -225,6 +225,71 @@ def _load_case(case_id: str, regimes: Path | None):
     return replace(case, regimes=load_regimes(regimes)) if regimes else case
 
 
+# ---------------------------------------------------------------- stability reruns
+
+MAX_RERUNS = 2  # stability reruns after one UNSTABLE result
+
+
+SOURCE_SUFFIXES = {".py", ".cu", ".cuh", ".h", ".hpp", ".cpp", ".cc", ".c", ".json", ".toml"}
+NOT_CANDIDATE = {".build", "__pycache__", "reports", ".git", "progress", "roadmap", ".vibesys",
+                 ".claude", "megakernel_skills", "primbench", "reference", "state"}
+
+
+def tree_digest(directory: Path) -> str:
+    """Digest of the candidate's source files under *directory* (notes and records excluded)."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    for path in sorted(directory.rglob("*")):
+        rel = path.relative_to(directory)
+        if (path.is_file() and path.suffix in SOURCE_SUFFIXES
+                and not NOT_CANDIDATE & set(rel.parts)):
+            digest.update(str(rel).encode())
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _stability_of(prior: Path) -> tuple[dict | None, str | None]:
+    """The stability record and code identity of a check report or a phase_ab result."""
+    if prior.suffix == ".jsonl":
+        side = prior.with_suffix(".stability.json")
+        if not side.is_file():
+            return None, None
+        stab = json.loads(side.read_text())
+        return stab, stab.get("identity")
+    data = json.loads(prior.read_text())
+    stab = data.get("stability")
+    if stab is not None:
+        stab = {**stab, "rerun_of": data.get("rerun_of")}
+    return stab, data.get("identity")
+
+
+def rerun_status(prior: Path, identity: str) -> tuple[bool, str]:
+    """May this run count as a stability rerun of *prior*? (ok, reason)"""
+    if not prior.is_file():
+        return False, f"{prior} does not exist"
+    stab, prior_identity = _stability_of(prior)
+    if stab is None:
+        return False, f"{prior} has no timing stability record"
+    if stab.get("verdict") != "unstable":
+        return False, f"{prior} was {stab.get('verdict')}, not unstable"
+    if prior_identity != identity:
+        return False, f"{prior} timed other code (the candidate files changed since)"
+    depth, link = 1, stab.get("rerun_of")
+    while link:
+        depth += 1
+        stab, _ = _stability_of(Path(link)) if Path(link).is_file() else (None, None)
+        link = stab.get("rerun_of") if stab else None
+    if depth > MAX_RERUNS:
+        return False, (f"{prior} is already rerun {depth - 1} time(s); at most {MAX_RERUNS} "
+                       "stability reruns follow one unstable result")
+    return True, f"stability rerun {depth} of {MAX_RERUNS} for {prior}"
+
+
+RERUN_NOTE = ("stability rerun: this run repeats an UNSTABLE result on the same code; "
+              "it is not paid work and does not count against a paid-call cap")
+
+
 # ---------------------------------------------------------------- check wrapper
 
 def check_report(record: dict, probes: list[dict], tolerance_pct: float) -> dict:
@@ -243,6 +308,13 @@ def check_report(record: dict, probes: list[dict], tolerance_pct: float) -> dict
 
 
 def check(args: argparse.Namespace) -> int:
+    identity = tree_digest(args.submission.resolve().parent)
+    if args.rerun_of is not None:
+        ok, reason = rerun_status(args.rerun_of, identity)
+        if not ok:
+            print(f"check_candidate: --rerun-of refused: {reason}", file=sys.stderr)
+            return 2
+        print(f"{RERUN_NOTE} ({reason})")
     code = subprocess.run(args.evaluate).returncode
     try:
         lines = Path(args.report).read_text().splitlines()
@@ -254,8 +326,14 @@ def check(args: argparse.Namespace) -> int:
     probes = run_probes(probe_command(args.case, args.submission, args.regimes),
                         args.processes - 1)
     stab = check_report(record, probes, args.tolerance_pct)
+    stab["identity"] = identity
+    stab["rerun_of"] = str(args.rerun_of) if args.rerun_of else None
     Path(args.report).with_suffix(".stability.json").write_text(json.dumps(stab, indent=2))
     print(format_stability("check", stab, stab["processes"], stab["note"]))
+    if stab["verdict"] == "unstable":
+        print(f"  to repeat it as a stability rerun: ./check_candidate --rerun-of {args.report}")
+    if args.rerun_of:
+        print(f"  {RERUN_NOTE}")
     for err in stab["probe_errors"]:
         print(f"  probe failed: {err.strip().splitlines()[-1] if err.strip() else err}")
     print(f"stability: {Path(args.report).with_suffix('.stability.json')}")
@@ -401,6 +479,8 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--processes", type=int, default=3,
                    help="fresh processes in total, the evaluate process included")
     c.add_argument("--tolerance-pct", type=float, default=DEFAULT_TOLERANCE_PCT)
+    c.add_argument("--rerun-of", type=Path,
+                   help="an UNSTABLE check report of the same code; marks this run a rerun")
     c.add_argument("evaluate", nargs=argparse.REMAINDER, help="-- the evaluate command")
     args = parser.parse_args(argv)
     if args.mode == "probe":

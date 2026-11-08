@@ -274,12 +274,22 @@ TIMING_NOISE_TASK = (
     "How to use this:\n\n"
     "1. Compare candidates only by fast-cluster p50s, never by one process.\n"
     "2. Do not keep, revert or reject a change because of an `UNSTABLE` result. Run the "
-    "same command again. A result counts when two runs agree within the stated tolerance.\n"
-    "3. Do not change the kernel to chase a slow process. The same build was fast in "
+    "same command again as a stability rerun: `./check_candidate --rerun-of <report>` or "
+    "`./phase_ab ... --rerun-of <result.json>`, as the output says. A result counts when "
+    "two runs agree within the stated tolerance.\n"
+    "3. A stability rerun is not paid work. It does not count against a paid-call cap of "
+    "the plan, in any role: the orchestrator does not count it when it sets a cap, the "
+    "implementer and phase agents do not count it when they tally paid work, and the "
+    "judge does not count it when it audits the tally. The tool accepts `--rerun-of` only when the earlier result "
+    "was `UNSTABLE` and the candidate files did not change, and it allows a small number "
+    "of reruns after each `UNSTABLE` result. Each rerun report records `rerun_of`, so the "
+    "judge can verify it. Change nothing between the runs: an edit makes the next run "
+    "paid work again.\n"
+    "4. Do not change the kernel to chase a slow process. The same build was fast in "
     "another process, so the slowdown is not in the code.\n"
-    "4. In your notes and in the round result, give the verdict and the per-process values "
+    "5. In your notes and in the round result, give the verdict and the per-process values "
     "with each timing that you cite, and say when you excluded a slow process.\n"
-    "5. When results stay `UNSTABLE` over repeated runs, write it in your notes with the "
+    "6. When results stay `UNSTABLE` over repeated runs, write it in your notes with the "
     "GPU state of those jobs and continue with the next item of the plan. Do not stop the round "
     "for it.\n"
 )
@@ -425,9 +435,12 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case,
     check.write_text(
         common + f"{python} -m megabench.integrations.microbench_gate check || exit 3\n"
         "run_id=$(date -u +%Y%m%dT%H%M%S)-$$\n"
+        # --rerun-of REPORT (first): a stability rerun of an UNSTABLE check of the same code.
+        "rerun=\"\"\n"
+        "if [ \"${1:-}\" = \"--rerun-of\" ]; then rerun=\"--rerun-of $2\"; shift 2; fi\n"
         # The evaluate process, then more fresh processes: gpu_noise reports their spread.
         f"exec {gpu}{python} -m megabench.integrations.gpu_noise check --case {case_id} "
-        f"--submission {submission} " + regimes_flag
+        f"--submission {submission} $rerun " + regimes_flag
         + "--report \"reports/check-$run_id.jsonl\" -- "
         f"{python} -m megabench evaluate --case {case_id} "
         f"--submission {submission} --method local-check "

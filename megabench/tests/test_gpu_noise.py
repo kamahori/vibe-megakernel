@@ -65,5 +65,64 @@ class GpuNoiseTests(unittest.TestCase):
         self.assertIn("UNSTABLE", gpu_noise.format_stability("check", stab, stab["processes"]))
 
 
+class RerunTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "submission.py").write_text("x = 1\n")
+        (self.root / "progress").mkdir()
+        (self.root / "reports").mkdir()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def report(self, name, verdict, rerun_of=None):
+        import json
+
+        ident = gpu_noise.tree_digest(self.root)
+        path = self.root / "reports" / f"{name}.jsonl"
+        path.write_text("{}\n")
+        path.with_suffix(".stability.json").write_text(json.dumps(
+            {"verdict": verdict, "identity": ident, "rerun_of": rerun_of}))
+        return path
+
+    def test_unstable_same_code_is_a_rerun(self) -> None:
+        prior = self.report("a", "unstable")
+        ok, _ = gpu_noise.rerun_status(prior, gpu_noise.tree_digest(self.root))
+        self.assertTrue(ok)
+
+    def test_notes_do_not_change_identity(self) -> None:
+        ident = gpu_noise.tree_digest(self.root)
+        (self.root / "progress" / "round.md").write_text("notes")
+        (self.root / "reports" / "x.json").write_text("{}")
+        self.assertEqual(ident, gpu_noise.tree_digest(self.root))
+
+    def test_refusals(self) -> None:
+        stable = self.report("s", "stable")
+        ok, why = gpu_noise.rerun_status(stable, gpu_noise.tree_digest(self.root))
+        self.assertFalse(ok)
+        self.assertIn("not unstable", why)
+        prior = self.report("u", "unstable")
+        (self.root / "submission.py").write_text("x = 2\n")
+        ok, why = gpu_noise.rerun_status(prior, gpu_noise.tree_digest(self.root))
+        self.assertFalse(ok)
+        self.assertIn("other code", why)
+        ok, why = gpu_noise.rerun_status(self.root / "none.jsonl", "")
+        self.assertFalse(ok)
+
+    def test_rerun_limit(self) -> None:
+        first = self.report("r0", "unstable")
+        second = self.report("r1", "unstable", str(first))
+        third = self.report("r2", "unstable", str(second))
+        ident = gpu_noise.tree_digest(self.root)
+        self.assertTrue(gpu_noise.rerun_status(second, ident)[0])
+        ok, why = gpu_noise.rerun_status(third, ident)
+        self.assertFalse(ok)
+        self.assertIn("at most", why)
+
+
 if __name__ == "__main__":
     unittest.main()

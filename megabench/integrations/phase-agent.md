@@ -40,7 +40,9 @@ Rules:
   still runs.
 - Read the `timing stability` lines of each `phase_ab` result. A slow process is GPU noise
   (see "Timing noise on the GPU" in the objective): the reported p50s already exclude it.
-  When the verdict is `UNSTABLE`, run the same `phase_ab` again before you decide. Never
+  When the verdict is `UNSTABLE`, run the same `phase_ab` again with `--rerun-of <its
+  result.json>` before you decide. Such a stability rerun is not paid work and does not
+  count against a cap. Never
   reject or keep a variant on an `UNSTABLE` result alone, and never edit a variant to
   remove a slowdown that only one process showed.
 - Keep the variant directories small: no build outputs, no profiler captures.

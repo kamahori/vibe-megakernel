@@ -107,6 +107,39 @@ class PhaseAbTests(unittest.TestCase):
         self.assertEqual(result["stability"]["verdict"], "stable")
         self.assertEqual(result["stability"]["diffs_ms"], [-0.1, -0.1, -0.1])
 
+    def test_rerun_of_needs_an_unstable_result(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            for name in ("a", "b"):
+                (tmp / name).mkdir()
+                (tmp / name / "submission.py").write_text(name)
+            fakes = []
+
+            def factory(case, slow=None):
+                fakes.append(Fake(case, False, slow))
+                return fakes[-1]
+
+            args = [str(tmp / "a"), str(tmp / "b"), "--case", CASE, "--reps", "2"]
+            phase_ab.main(args + ["--output", str(tmp / "o1")],
+                          backend_factory=lambda c: factory(c, {1: "a"}))
+            first = tmp / "o1/result.json"
+            self.assertEqual(json.loads(first.read_text())["stability"]["verdict"], "unstable")
+            code = phase_ab.main(args + ["--output", str(tmp / "o2"), "--rerun-of", str(first)],
+                                 backend_factory=factory)
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads((tmp / "o2/result.json").read_text())["rerun_of"],
+                             str(first))
+            # A stable result cannot be rerun for free.
+            with self.assertRaises(SystemExit):
+                phase_ab.main(args + ["--output", str(tmp / "o3"), "--rerun-of",
+                                      str(tmp / "o2/result.json")], backend_factory=factory)
+            # Changed code cannot be rerun for free.
+            (tmp / "b" / "submission.py").write_text("changed")
+            with self.assertRaises(SystemExit):
+                phase_ab.main(args + ["--output", str(tmp / "o4"), "--rerun-of", str(first)],
+                              backend_factory=factory)
+
     def test_all_phases_reported_without_the_filter(self) -> None:
         _, result, _ = invoke([])
         self.assertEqual([r["phase"] for r in result["phases"]], ["gemm", "norm"])
