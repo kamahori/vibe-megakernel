@@ -76,6 +76,34 @@ class GateTests(unittest.TestCase):
             (skipped / "round-0003.md").unlink()
             self.assertTrue(check(ws), "a skip record of another round does not count")
 
+    def test_round_cut_at_the_hard_limit_needs_no_answers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            (ws / "progress/plans").mkdir(parents=True)
+            (ws / "progress/plans/round-0003.json").write_text(json.dumps(PAST_REJECTIONS[2]))
+            self.assertTrue(check(ws))
+            cut = ws / "progress/microbench/deadline"
+            cut.mkdir(parents=True)
+            (cut / "round-0003.md").write_text("# stopped\n")
+            self.assertEqual(check(ws), [])
+
+    def test_revised_claim_citing_answer_rows_is_answered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            (ws / "progress/plans").mkdir(parents=True)
+            plan = {"reasoning": "Rejected: a split-K GEMM, because row 0123456789 is slower. "
+                                 "Rejected: SIMT attention is too costly."}
+            (ws / "progress/plans/round-0002.json").write_text(json.dumps(plan))
+            mb = ws / "progress/microbench"
+            for kind in ("requests", "answers"):
+                (mb / kind).mkdir(parents=True)
+                (mb / kind / "round-0002.md").write_text("- q\n")
+            (ws / "progress/engine-map.md").write_text("### round-0002\n")
+            (mb / "answers/round-0002.md").write_text("P2: measured. Row 0123456789 is 4 us.\n")
+            self.assertEqual(check(ws), [])
+            (mb / "answers/round-0002.md").write_text("P2: measured.\n")
+            self.assertIn("P1", check(ws)[0])
+
     def test_ledger_needs_rows_measured_in_the_round(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             ws = Path(directory)

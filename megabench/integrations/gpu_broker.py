@@ -73,6 +73,64 @@ def request(socket_path: Path, argv: list[str]) -> int:
     return reply["returncode"]
 
 
+def _minutes(value: str) -> float:
+    """Minutes of a Slurm time limit (MM, HH:MM:SS, MM:SS or D-HH:MM:SS)."""
+    days, _, rest = value.rpartition("-")
+    parts = [float(x) for x in rest.split(":")]
+    if len(parts) == 3:
+        minutes = parts[0] * 60 + parts[1] + parts[2] / 60
+    elif len(parts) == 2:
+        minutes = parts[0] + parts[1] / 60
+    else:
+        minutes = parts[0]
+    return minutes + (float(days) * 1440 if days else 0)
+
+
+def missing_command(argv: list[str], cwd: str, env: dict) -> str | None:
+    """Why *argv* cannot start, found on the host before a job waits in the queue."""
+    import shutil
+
+    if not argv:
+        return "empty command"
+    program = argv[0]
+    if "/" in program:
+        path = Path(program) if Path(program).is_absolute() else Path(cwd) / program
+        if not path.exists():
+            return f"{program}: no such file (in {cwd})"
+        if not os.access(path, os.X_OK):
+            return f"{program}: not executable"
+        return None
+    if shutil.which(program, path=env.get("PATH", "")) is None:
+        return f"{program}: command not found on PATH"
+    return None
+
+
+def choose_partition(windows: dict, gpus: int, minutes: float,
+                     order: tuple[str, ...] = ("main", "priority")) -> str | None:
+    """The first partition of *order* where a job of *gpus* and *minutes* starts now.
+
+    *windows* is the JSON of ``slurm-windows --json``. None when no partition starts it now.
+    """
+    from datetime import datetime
+
+    now = datetime.fromisoformat(windows["now"])
+    for name in order:
+        part = next((p for p in windows.get("partitions", []) if p["partition"] == name), None)
+        if part is None:
+            continue
+        for group in part["groups"]:
+            if not group["gpus_min"] <= gpus <= group["gpus_max"]:
+                continue
+            for option in group["options"]:
+                if option["max_time"] != "unlimited" and _minutes(option["max_time"]) < minutes:
+                    continue
+                start = option["start"]
+                if start == "now" or datetime.fromisoformat(start) <= now:
+                    return name
+                break  # the first option that fits the time limit decides
+    return None
+
+
 class Broker:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -86,6 +144,28 @@ class Broker:
             self.project: Path | None = Path(json.loads(args.spec.read_text())["project"])
         except (OSError, ValueError, KeyError):
             self.project = None
+
+    def partitioned(self, srun: list[str]) -> list[str]:
+        """With --partition-policy auto: main when it starts the job now, else priority
+        when that starts it now, else main (the job then waits in main)."""
+        if self.args.partition_policy != "auto":
+            return srun
+        gpus, minutes = 1, None
+        for arg in srun:
+            if arg.startswith("--gres=gpu:"):
+                gpus = int(arg.rsplit(":", 1)[1])
+            elif arg.startswith("--time="):
+                minutes = _minutes(arg.split("=", 1)[1])
+        if minutes is None:
+            return srun
+        try:
+            out = subprocess.run(["slurm-windows", "--json"], capture_output=True, text=True,
+                                 timeout=30, env=self.env)
+            chosen = choose_partition(json.loads(out.stdout), gpus, minutes) or "main"
+        except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
+            return srun
+        return [arg if not arg.startswith("--partition=") else f"--partition={chosen}"
+                for arg in srun]
 
     def gpu_report(self, name: str, path: Path, t0: float, t1: float, fd: int, code: int,
                    argv: list[str]) -> None:
@@ -135,6 +215,9 @@ class Broker:
         conn.close()
 
     def run(self, conn: socket.socket, body: dict, fds: list[int]) -> dict:
+        problem = missing_command(body.get("argv", []), body.get("cwd", "."), body.get("env", {}))
+        if problem is not None:  # no GPU job: it would fail at once after its queue wait
+            return {"error": f"{problem}; no GPU job was started"}
         while not self.slots.acquire(timeout=1):
             if _client_gone(conn):
                 return {"error": "client went away while waiting for a slot"}
@@ -143,7 +226,8 @@ class Broker:
             name = f"vs-gpu-{self.tag}-{number}"
             path = self.args.requests / f"{name}.json"
             path.write_text(json.dumps(body))
-            command = [*self.args.srun, f"--job-name={name}", str(self.args.job_python),
+            command = [*self.partitioned(self.args.srun), f"--job-name={name}",
+                       str(self.args.job_python),
                        str(self.args.job_script), "run", str(self.args.spec), str(path)]
             self.log(f"{name} start {json.dumps(body['argv'])}")
             started, t0 = time.monotonic(), time.time()
@@ -203,6 +287,9 @@ def main(argv: list[str] | None = None) -> int:
     server.add_argument("--job-script", type=Path,
                         default=Path(__file__).with_name("gpu_job.py"))
     server.add_argument("--max-jobs", type=int, default=1)
+    server.add_argument("--partition-policy", choices=("auto", "fixed"), default="auto",
+                        help="auto: main if it starts the job now, else priority if that "
+                             "does, else main; fixed: the srun --partition as given")
     server.add_argument("--sample-ms", type=int, default=200,
                         help="nvidia-smi sampling period for the per-job GPU report (0: off)")
     server.add_argument("srun", nargs=argparse.REMAINDER,

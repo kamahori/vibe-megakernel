@@ -13,7 +13,9 @@ carried question that has gone longest without a matched measurement (rows added
 `--question Q<n> --conditions matched`) needs one this round. Without a
 plan there is nothing to check. A round whose phase the framework skipped
 (progress/microbench/skipped/<round>.md: no question of the plan needed a new microbenchmark)
-needs none of these files. ./check_candidate runs `check --build` first and stops on a failure:
+needs none of these files, and neither does a round whose phase the framework stopped at its
+hard time limit (progress/microbench/deadline/<round>.md). A plan claim that cites a row id
+that the round's answers also cite counts as answered. ./check_candidate runs `check --build` first and stops on a failure:
 --build also needs progress/microbench/build/<round>.md, the design each phase is built in; each
 engine-map phase with matched rows (p.phase, m.us) is built in the family of its fastest row.
 """
@@ -372,16 +374,25 @@ def check(workspace: Path, build: bool = False) -> list[str]:
         # The framework skipped this round's phase: no question of the plan needed a new
         # microbenchmark. The design of each phase still follows the measured rankings.
         return check_build(workspace, round_name) if build else []
+    # The framework stopped this round's phase at its hard time limit: what was not answered
+    # stays open, and the round goes on with the answers that exist.
+    cut = (workspace / MICROBENCH / "deadline" / f"{round_name}.md").is_file()
     request = workspace / MICROBENCH / "requests" / f"{round_name}.md"
     answer = workspace / MICROBENCH / "answers" / f"{round_name}.md"
     for path in (request, answer):
         if not path.is_file() or not path.read_text().strip():
             problems.append(f"{path.relative_to(workspace)} is missing")
     items = write_items(workspace, plan)
+    if cut:
+        return check_build(workspace, round_name) if build else []
     if answer.is_file():
         text = answer.read_text()
-        missing = [f"P{i}" for i in range(1, len(items) + 1)
-                   if not re.search(rf"\bP{i}\b", text)]
+        # A claim of a revised plan that cites rows which this round's answers cite is
+        # answered by them: the orchestrator revised the plan from those answers.
+        cited = set(ROW_ID.findall(text))
+        missing = [f"P{i}" for i, item in enumerate(items, 1)
+                   if not re.search(rf"\bP{i}\b", text)
+                   and not (set(ROW_ID.findall(item)) & cited)]
         if missing:
             problems.append(f"{answer.relative_to(workspace)} does not answer plan claims "
                             f"{', '.join(missing)} (see {MICROBENCH}/items/{round_name}.md)")

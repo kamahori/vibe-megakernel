@@ -125,7 +125,7 @@ def write_launch(args, run: Path, env: dict[str, str], srun: list[str]) -> None:
               "--spec", str(run / "gpu-spec.json"), "--job-python", str(args.vibesys.parent / "python"),
               "--job-script", str(run / "trusted/megabench/integrations/gpu_job.py"),
               "--max-jobs", str(args.max_gpu_jobs), "--", *srun]
-    timeout = args.timeout_seconds or args.rounds * 3600
+    timeout = args.timeout_seconds or args.rounds * 7200
     (run / "launch.sh").write_text(
         "#!/bin/bash\nset -euo pipefail\n"
         f"key=$(<{q(key_file)})\n"
@@ -263,23 +263,27 @@ def main() -> int:
     parser.add_argument("--venv", type=Path, default=REPO / ".venv")
     parser.add_argument("--cuda", type=Path, default=Path("/usr/local/cuda"))
     parser.add_argument("--timeout-seconds", type=int,
-                        help="limit for the whole VibeSys run (default: one hour per round)")
+                        help="limit for the whole VibeSys run (default: two hours per round)")
     parser.add_argument("--gpu-partition", default="main")
     parser.add_argument("--gpu-time", default="00:20:00", help="time limit of each GPU job (default: %(default)s)")
     parser.add_argument("--gpu-cpus", type=int, default=8)
     parser.add_argument("--gpu-mem", default="64G")
-    parser.add_argument("--max-gpu-jobs", type=int, default=1,
+    parser.add_argument("--max-gpu-jobs", type=int, default=8,
                         help="GPU jobs from the agent queued or running at a time")
-    parser.add_argument("--microbench-phase", action="store_true",
+    parser.add_argument("--microbench-phase", action=argparse.BooleanOptionalAction, default=True,
                         help="each round plan is a draft: VibeSys runs the microbench phase on it "
-                             "and the orchestrator revises the plan before the implementer starts")
-    parser.add_argument("--microbench-minutes", type=float,
+                             "and the orchestrator revises the plan before the implementer starts "
+                             "(default: on)")
+    parser.add_argument("--microbench-minutes", type=float, default=30,
                         help="time limit of each pre-plan microbench phase; the agents get a "
-                             "deadline and leave what they cannot measure open")
-    parser.add_argument("--microbench-full-rounds", type=int, default=2,
+                             "deadline and leave what they cannot measure open, and VibeSys "
+                             "stops the phase a grace period later (default: %(default)s; "
+                             "0: no limit)")
+    parser.add_argument("--microbench-full-rounds", type=int,
                         help="rounds that run the full microbench phase; a later round runs it "
                              "only for open questions that the kernel timeline cannot settle "
-                             "(-1: every round runs the full phase)")
+                             "(-1: every round runs the full phase; default: 1, or 0 with "
+                             "--seed-from, whose seed already has its opening rounds)")
     parser.add_argument("--phase-agents", action="store_true",
                         help="rounds after the full microbench rounds are phase rounds: the "
                              "implementer coordinates one phase subagent per target phase "
@@ -299,6 +303,8 @@ def main() -> int:
                         help="extra path that must be absent in the sandbox (repeat)")
     args = parser.parse_args()
 
+    if args.microbench_full_rounds is None:
+        args.microbench_full_rounds = 0 if args.seed_from else 1
     if args.phase_agents and args.microbench_full_rounds < 0:
         args.microbench_full_rounds = 2  # -1 means every round is a full round: no phase round
     run = args.run_dir.resolve()

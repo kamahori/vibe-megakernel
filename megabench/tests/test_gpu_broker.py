@@ -65,6 +65,15 @@ class BrokerTests(unittest.TestCase):
              "--socket", str(self.socket), "--", *command],
             cwd=self.work, env=env, capture_output=True, text=True, **kwargs)
 
+    def test_missing_command_fails_before_a_job(self) -> None:
+        out = self.client("./no_such_tool", "--x")
+        self.assertEqual(out.returncode, 125)
+        self.assertIn("no such file", out.stderr)
+        self.assertIn("no GPU job", out.stderr)
+        (self.work / "plain.txt").write_text("x")
+        self.assertIn("not executable", self.client("./plain.txt").stderr)
+        self.assertIn("not found", self.client("no-such-command-xyz").stderr)
+
     def test_output_status_cwd_and_environment(self) -> None:
         script = ("import json, os, sys; print(json.dumps([os.getcwd(), "
                   "os.environ.get('MARK'), os.environ.get('ANTHROPIC_API_KEY')])); "
@@ -111,3 +120,30 @@ class WorkspaceGpuTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PartitionTests(unittest.TestCase):
+    WINDOWS = {"now": "2026-11-07T17:00:00", "partitions": [
+        {"partition": "main", "groups": [{"gpus_min": 1, "gpus_max": 4, "options": [
+            {"max_time": "00:15:00", "start": "2026-11-07T17:00"},
+            {"max_time": "02:00:00", "start": "2026-11-07T18:00"}]}]},
+        {"partition": "priority", "groups": [{"gpus_min": 1, "gpus_max": 8, "options": [
+            {"max_time": "00:30:00", "start": "2026-11-07T17:00"}]}]}]}
+
+    def test_main_when_it_starts_now(self) -> None:
+        from megabench.integrations.gpu_broker import choose_partition
+        self.assertEqual(choose_partition(self.WINDOWS, 1, 10), "main")
+
+    def test_priority_when_main_waits(self) -> None:
+        from megabench.integrations.gpu_broker import choose_partition
+        self.assertEqual(choose_partition(self.WINDOWS, 1, 20), "priority")
+
+    def test_none_when_nothing_starts_now(self) -> None:
+        from megabench.integrations.gpu_broker import choose_partition
+        self.assertIsNone(choose_partition(self.WINDOWS, 1, 45))
+
+    def test_minutes(self) -> None:
+        from megabench.integrations.gpu_broker import _minutes
+        self.assertEqual(_minutes("00:20:00"), 20)
+        self.assertEqual(_minutes("1-00:00:00"), 1440)
+        self.assertEqual(_minutes("30"), 30)

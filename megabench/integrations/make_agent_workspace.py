@@ -285,6 +285,8 @@ TIMING_NOISE_TASK = (
     "of reruns after each `UNSTABLE` result. Each rerun report records `rerun_of`, so the "
     "judge can verify it. Change nothing between the runs: an edit makes the next run "
     "paid work again.\n"
+    "   Every role, the judge included, settles a doubt about a timing with these reruns, "
+    "not with separate timing scripts or many extra processes.\n"
     "4. Do not change the kernel to chase a slow process. The same build was fast in "
     "another process, so the slowdown is not in the code.\n"
     "5. In your notes and in the round result, give the verdict and the per-process values "
@@ -694,7 +696,9 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
            "on one GPU as a separate Slurm job and can wait in the queue first. "
            "`./check_candidate`, `./profile_candidate` and `./timeline_candidate` already "
            "use it. Keep inputs and outputs inside this workspace, because the job does "
-           "not see this shell's `/tmp`.\n" if gpu_socket is not None else "")
+           "not see this shell's `/tmp`. Compile in this shell (`./mb_build` and nvcc need "
+           "no GPU) and send only built programs to `./gpu_run`: a compile error inside a "
+           "GPU job costs its wait in the queue.\n" if gpu_socket is not None else "")
         + (ENGINE_MAP_TASK + MICROBENCH_TASK + NO_FALLBACK_TASK
            + TIMING_NOISE_TASK.replace("{gpu_jobs}", GPU_JOBS_NOTE if gpu_socket is not None else "")
            + PHASE_TIMING_TASK
