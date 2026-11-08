@@ -225,8 +225,12 @@ class Broker:
             number = next(self.count)
             name = f"vs-gpu-{self.tag}-{number}"
             path = self.args.requests / f"{name}.json"
+            srun = self.partitioned(self.args.srun)
+            limit = next((a.split("=", 1)[1] for a in srun if a.startswith("--time=")), None)
+            if limit:
+                body["job_limit_s"] = _minutes(limit) * 60  # gpu_job stops a hang before it
             path.write_text(json.dumps(body))
-            command = [*self.partitioned(self.args.srun), f"--job-name={name}",
+            command = [*srun, f"--job-name={name}",
                        str(self.args.job_python),
                        str(self.args.job_script), "run", str(self.args.spec), str(path)]
             self.log(f"{name} start {json.dumps(body['argv'])}")

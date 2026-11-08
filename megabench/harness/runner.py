@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from ..heartbeat import beat
 from ..cases import Case, load_regimes, select_cases
 from ..sol import (DEFAULT_B200_BANDWIDTH_SOURCE,
                    DEFAULT_B200_BANDWIDTH_TB_S, estimate_case)
@@ -66,6 +67,7 @@ def _contract_digest() -> str:
 
 
 def _load_submission(path: Path, case: Case, *, execution: dict | None = None) -> Callable:
+    beat("build and load the submission", allow=900, force=True)
     spec = importlib.util.spec_from_file_location("megabench_candidate", path)
     if spec is None or spec.loader is None:
         raise ValueError(f"cannot import submission {path}")
@@ -81,6 +83,7 @@ def _load_submission(path: Path, case: Case, *, execution: dict | None = None) -
     runner = build(contract)
     if not callable(runner):
         raise TypeError("build(case) must return a callable run(inputs)")
+    beat("submission loaded", force=True)
     return runner
 
 
@@ -186,6 +189,7 @@ def _evaluate_shape(case: Case, submission: Path, record: dict, *, device: str,
                     f"{type(exc).__name__}: {exc}")
         if (compiled_baselines or case.baselines) and torch.device(device).type == "cuda":
             from ..baselines import cached_timing_baselines
+            beat("compiled baselines", allow=1200, force=True)
             from ..workloads import oracle
 
             expected = reference(case, perf_inputs)

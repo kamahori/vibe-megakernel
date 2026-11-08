@@ -11,7 +11,8 @@ configuration, and writes them to FILE. A new run's ``./primdb`` reads FILE as
 origin ``cache``: its agents answer a question from a matched cached row and
 measure only what no row covers.
 
-Only measured data is kept. Plans, notes, answers, code and paths into other
+Only measured data is kept. Plans, notes (also a row's own ``note`` and other free-text
+fields), answers, code and paths into other
 run directories are not: a source path keeps its file name and the row says
 which run and round measured it (``source.cache_from``, ``source.cache_round``).
 """
@@ -26,7 +27,10 @@ from . import validate
 
 LOCAL = Path("progress/microbench/primdb_local.jsonl")
 KEEP = ("id", "kind", "family", "primitive", "params", "cond", "metrics", "n_reps", "cv",
-        "verified", "tuned", "note")
+        "verified", "tuned")
+# Free text that carries an earlier run's conclusions, not measured data. Dropped at
+# every level of a row, so a cached row gives a new run numbers and conditions only.
+TEXT_KEYS = ("note", "notes", "desc", "description", "comment", "conclusion", "why")
 # Conditions that vary between identical measurements, not between configurations.
 VOLATILE_COND = ("sm_clock_mhz", "clock_mhz", "job", "host", "date")
 
@@ -45,8 +49,14 @@ def _quality(row: dict, order: int) -> tuple:
     return (bool(row.get("verified")), -cv, reps, order)
 
 
+def _no_text(value):
+    if isinstance(value, dict):
+        return {k: _no_text(v) for k, v in value.items() if k not in TEXT_KEYS}
+    return value
+
+
 def _strip(row: dict, run: str) -> dict:
-    out = {k: row[k] for k in KEEP if k in row}
+    out = {k: _no_text(row[k]) for k in KEEP if k in row}
     source = row.get("source") or {}
     kept = {k: Path(str(v)).name for k, v in source.items() if k in ("file", "bench") and v}
     kept |= {k: v for k, v in source.items() if k in ("timer",)}

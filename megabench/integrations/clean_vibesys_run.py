@@ -245,7 +245,7 @@ def cache_rows(args, run: Path) -> int:
     return n
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--case", required=True)
     parser.add_argument("--run-dir", type=Path, required=True,
@@ -297,14 +297,21 @@ def main() -> int:
                              "files at --seed-ref instead of an empty candidate")
     parser.add_argument("--seed-ref", default="HEAD",
                         help="commit of --seed-from to start from (default: %(default)s)")
+    parser.add_argument("--microbench-cache", dest="microbench_cache", action="store_true",
+                        default=False,
+                        help="start with the measured rows of earlier runs of the case (numbers "
+                             "only, no notes). Off by default: a run measures what it needs")
     parser.add_argument("--no-microbench-cache", dest="microbench_cache", action="store_false",
-                        help="start without the rows that earlier runs of the case measured "
-                             "(a clean comparison run)")
+                        help="start without cached rows (the default)")
     parser.add_argument("--microbench-cache-store", type=Path,
                         help="file that keeps cached rows after run directories are deleted")
     parser.add_argument("--forbid", type=Path, action="append", default=[],
                         help="extra path that must be absent in the sandbox (repeat)")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     if args.microbench_full_rounds is None:
         args.microbench_full_rounds = 0 if args.seed_from else 1

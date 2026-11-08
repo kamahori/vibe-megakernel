@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
+from job_watchdog import IDLE_S, run_watched
 from vs_agent.host_resource_declarations import declare_agent_host_resources
 from vs_sandbox.api import build_host_sandbox
 
@@ -52,7 +54,13 @@ def run(spec: dict, request: dict) -> int:
         else:
             env.pop(name, None)
     argv = sandbox(spec).wrap(["/bin/bash", "-c", _IN_CWD, "gpu_run", str(cwd), *request["argv"]])
-    return subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, check=False).returncode
+    # The heartbeat file is in the project, the one place the sandbox and this
+    # process both see. It is removed when the command ends.
+    heartbeat = project / ".gpu_run" / f"{os.getpid()}.hb"
+    # Under a profiler or a sanitizer one call can take minutes: only the time rule applies.
+    slow_tool = re.search(r"\b(ncu|nsys|compute-sanitizer|cuda-gdb)\b", " ".join(request["argv"]))
+    return run_watched(argv, env, heartbeat, limit_s=request.get("job_limit_s"),
+                       idle_s=float("inf") if slow_tool else IDLE_S)
 
 
 def main(argv: list[str]) -> int:

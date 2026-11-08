@@ -59,6 +59,30 @@ class HarvestTests(unittest.TestCase):
         text = json.dumps(rows)
         self.assertNotIn("/runs/", text)
 
+    def test_free_text_of_earlier_runs_is_not_cached(self) -> None:
+        row = _row("one", 10.0, "r1", note="engine X loses, do not retry")
+        row["cond"]["note"] = "slow because of Y"
+        row["params"]["desc"] = "the winning design"
+        primdb.append([row], _local(self.root, "r1"))
+        store = self.root / "store.jsonl"
+        store.write_text(json.dumps(row | {"id": "f" * 10}) + "\n")
+        rows = cache.harvest(self.root, CASE, store=store)
+        text = json.dumps(rows)
+        for words in ("do not retry", "slow because", "winning design"):
+            self.assertNotIn(words, text)
+        self.assertTrue(all("note" not in r for r in rows))
+        self.assertEqual(rows[0]["metrics"]["us"], 10.0)
+
+    def test_cache_is_off_unless_asked(self) -> None:
+        base = ["--case", CASE, "--run-dir", "x", "--oauth-token-file", "t", "--vibesys", "v",
+                "--vibesys-skills", "s"]
+        parser = clean.build_parser()
+        known = parser.parse_known_args(base)[0]
+        self.assertFalse(known.microbench_cache)
+        self.assertTrue(parser.parse_known_args(base + ["--microbench-cache"])[0].microbench_cache)
+        self.assertFalse(parser.parse_known_args(base + ["--no-microbench-cache"])[0]
+                         .microbench_cache)
+
     def test_store_keeps_rows_after_the_run_directory_is_gone(self) -> None:
         primdb.append([_row("one", 10.0, "r1")], _local(self.root, "r1"))
         store = self.root / "store.jsonl"

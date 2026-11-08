@@ -28,6 +28,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from ..cases import load_regimes, select_cases
+from ..heartbeat import beat
 from . import gpu_noise
 
 
@@ -136,6 +137,7 @@ class GpuBackend:
                     fn(inputs)
                 end.record()
                 end.synchronize()
+                beat("timed window")
             return start.elapsed_time(end) / iters
 
         def warm(fn) -> None:
@@ -143,6 +145,7 @@ class GpuBackend:
                 for _ in range(warmup):
                     fn(inputs)
                 torch.cuda.synchronize(self.device)
+                beat("warm-up")
 
         return timer, warm
 

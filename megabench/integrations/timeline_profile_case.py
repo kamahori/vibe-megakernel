@@ -27,6 +27,8 @@ from . import timeline
 
 
 def _load_timeline_build(path: Path, contract: dict):
+    from ..heartbeat import beat
+    beat("build the timeline submission", allow=900, force=True)
     spec = importlib.util.spec_from_file_location("megabench_candidate_timeline", path)
     if spec is None or spec.loader is None:
         raise ValueError(f"cannot import submission {path}")

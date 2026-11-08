@@ -7,6 +7,7 @@ import time
 from typing import Callable
 
 from ..cases import Case
+from ..heartbeat import beat
 from ..tasks.workloads import make_inputs, oracle, reference
 
 
@@ -330,9 +331,12 @@ def check_trials(case: Case, candidate: Callable, device: str,
         expected = reference(case, inputs)
         exact = oracle(case, inputs)
         first_start = time.perf_counter() if trial_index == 0 else None
+        if trial_index == 0:
+            beat("first candidate call (may compile)", allow=900, force=True)
         actual = candidate(inputs)
         if torch.device(device).type == "cuda":
             torch.cuda.synchronize(device)
+        beat(f"correctness trial {trial_index}", force=True)
         if first_start is not None:
             first_call_ms = (time.perf_counter() - first_start) * 1000
         for name in inputs:
