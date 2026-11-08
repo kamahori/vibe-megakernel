@@ -32,18 +32,25 @@ Rules:
   you. Difficulty to build is not a reason to take a design that is ranked slower.
 - Score every variant in the foreground with `./phase_ab <parent> <variant> --phase <phase>`.
   One call builds both, checks the variant against the reference, times parent and variant
-  alternately, and records a timeline of each. A variant counts only when it is correct and
-  neither its phase window nor its end-to-end time gets worse than the parent's by more than
-  the spread between repeated runs of the same candidate (measure that spread when you do
-  not know it, with `./phase_ab` on two copies of the parent). Do not end your turn while a
-  GPU command that you started still runs.
+  alternately in several fresh processes, and records a timeline of each. A variant counts
+  only when it is correct, the timing verdict is `STABLE`, and neither its phase window nor
+  its end-to-end time gets worse than the parent's by more than the spread between repeated
+  runs of the same candidate (measure that spread when you do not know it, with `./phase_ab`
+  on two copies of the parent). Do not end your turn while a GPU command that you started
+  still runs.
+- Read the `timing stability` lines of each `phase_ab` result. A slow process is GPU noise
+  (see "Timing noise on the GPU" in the objective): the reported p50s already exclude it.
+  When the verdict is `UNSTABLE`, run the same `phase_ab` again before you decide. Never
+  reject or keep a variant on an `UNSTABLE` result alone, and never edit a variant to
+  remove a slowdown that only one process showed.
 - Keep the variant directories small: no build outputs, no profiler captures.
 
 Return to the caller, and write the same to `progress/phases/<round>/<phase>.md`:
 - the best variant directory and its diff against the parent (`diff -ru`, limited to the
   files you changed);
 - the path of its `phase_ab` result (`reports/phase-ab-*/result.json`) and its numbers: the
-  window of the phase and the end-to-end time, parent and variant;
+  window of the phase and the end-to-end time, parent and variant, and the timing verdict
+  with the per-process values;
 - every variant you tried and rejected, each with its numbers and the reason;
 - anything the contract blocked, and what it must change.
 If no variant beat the parent, say so, and name the best one anyway with its numbers.

@@ -28,6 +28,8 @@ import time
 import uuid
 from pathlib import Path
 
+from . import gpu_noise
+
 SECRET_ENV = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
 _HEADER = struct.Struct("!Q")
 
@@ -78,6 +80,36 @@ class Broker:
         self.count = itertools.count(1)
         self.tag = uuid.uuid4().hex[:8]
         self.env = {k: v for k, v in os.environ.items() if k not in SECRET_ENV}
+        self.sampler = (gpu_noise.NodeSampler(args.sample_ms).start()
+                        if args.sample_ms > 0 else None)
+        try:
+            self.project: Path | None = Path(json.loads(args.spec.read_text())["project"])
+        except (OSError, ValueError, KeyError):
+            self.project = None
+
+    def gpu_report(self, name: str, path: Path, t0: float, t1: float, fd: int, code: int,
+                   argv: list[str]) -> None:
+        """Tell the caller (and reports/gpu-jobs.jsonl) the GPU state during the job."""
+        gpu_file = path.with_suffix(".gpu")
+        try:
+            index = int(gpu_file.read_text().split(",")[0])
+        except (OSError, ValueError):
+            return
+        finally:
+            gpu_file.unlink(missing_ok=True)
+        summary = gpu_noise.summarize_window(
+            self.sampler.window(t0, t1) if self.sampler else [], index)
+        line = gpu_noise.format_window(name, summary)
+        self.log(line.removeprefix("gpu_run: "))
+        try:
+            os.write(fd, (line + "\n").encode())
+        except OSError:
+            pass
+        if self.project is not None and (self.project / "reports").is_dir():
+            row = {"job": name, "argv": argv, "exit": code, "seconds": round(t1 - t0, 1),
+                   "start_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t0)), **summary}
+            with (self.project / "reports/gpu-jobs.jsonl").open("a") as out:
+                out.write(json.dumps(row) + "\n")
 
     def log(self, message: str) -> None:
         print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}", flush=True)
@@ -114,7 +146,7 @@ class Broker:
             command = [*self.args.srun, f"--job-name={name}", str(self.args.job_python),
                        str(self.args.job_script), "run", str(self.args.spec), str(path)]
             self.log(f"{name} start {json.dumps(body['argv'])}")
-            started = time.monotonic()
+            started, t0 = time.monotonic(), time.time()
             proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=fds[0],
                                     stderr=fds[1], env=self.env)
             while True:
@@ -132,6 +164,7 @@ class Broker:
                             proc.kill()
                         return {"error": "client went away; job cancelled"}
             self.log(f"{name} exit {code} after {time.monotonic() - started:.0f}s")
+            self.gpu_report(name, path, t0, time.time(), fds[1], code, body["argv"])
             path.unlink(missing_ok=True)
             return {"returncode": code}
         finally:
@@ -170,6 +203,8 @@ def main(argv: list[str] | None = None) -> int:
     server.add_argument("--job-script", type=Path,
                         default=Path(__file__).with_name("gpu_job.py"))
     server.add_argument("--max-jobs", type=int, default=1)
+    server.add_argument("--sample-ms", type=int, default=200,
+                        help="nvidia-smi sampling period for the per-job GPU report (0: off)")
     server.add_argument("srun", nargs=argparse.REMAINDER,
                         help="-- srun and its arguments, for example: -- srun --gres=gpu:1")
     args = parser.parse_args(argv)

@@ -249,6 +249,41 @@ NO_FALLBACK_TASK = (
     "send it back with the phase, the row ids and the design to build. Record each such "
     "gap between proxy and kernel as an open question in `progress/microbench/open.md`.\n")
 
+GPU_JOBS_NOTE = (
+    "- Every GPU job ends with a line that starts with the job name: the GPU it ran on, "
+    "its SM and memory clocks, power, temperature, active throttle reasons, and how busy "
+    "the other GPUs of the node were. `reports/gpu-jobs.jsonl` keeps one row for each "
+    "job.\n")
+TIMING_NOISE_TASK = (
+    "\n## Timing noise on the GPU\n\n"
+    "A process (or one loaded candidate inside it) can run in a slow mode: every launch "
+    "in it is slower by a large, constant factor, and a fresh process of the same build "
+    "is not. The cause is outside the candidate. So one timing from one process is not "
+    "evidence.\n\n"
+    "- `./check_candidate` times the candidate in the evaluate process and then in more "
+    "fresh processes. It prints a `timing stability` block: the p50 of each process, the "
+    "verdict `STABLE` or `UNSTABLE`, the slow processes, and the fast-cluster p50. The "
+    "fast-cluster p50 is the candidate's time. It also writes "
+    "`reports/check-*.stability.json`.\n"
+    "- `./phase_ab` times parent and variant in several fresh processes and gives the same "
+    "verdict for each side, and the B-A difference of each process.\n"
+    "{gpu_jobs}"
+    "- A canary (a fixed GEMM and a fixed copy) runs in each fresh timing process. When a "
+    "slow process also has a slow canary, the GPU or node was slow. When the canary is "
+    "normal, the slow mode belongs to that loaded instance.\n\n"
+    "How to use this:\n\n"
+    "1. Compare candidates only by fast-cluster p50s, never by one process.\n"
+    "2. Do not keep, revert or reject a change because of an `UNSTABLE` result. Run the "
+    "same command again. A result counts when two runs agree within the stated tolerance.\n"
+    "3. Do not change the kernel to chase a slow process. The same build was fast in "
+    "another process, so the slowdown is not in the code.\n"
+    "4. In your notes and in the round result, give the verdict and the per-process values "
+    "with each timing that you cite, and say when you excluded a slow process.\n"
+    "5. When results stay `UNSTABLE` over repeated runs, write it in your notes with the "
+    "GPU state of those jobs and continue with the next item of the plan. Do not stop the round "
+    "for it.\n"
+)
+
 PHASE_TIMING_TASK = (
     "\n## Per-phase timing and measured rounds\n\n"
     "A round acts on measured time per phase, not on estimates of it. This rule binds every "
@@ -390,7 +425,11 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case,
     check.write_text(
         common + f"{python} -m megabench.integrations.microbench_gate check || exit 3\n"
         "run_id=$(date -u +%Y%m%dT%H%M%S)-$$\n"
-        f"exec {gpu}{python} -m megabench evaluate --case {case_id} "
+        # The evaluate process, then more fresh processes: gpu_noise reports their spread.
+        f"exec {gpu}{python} -m megabench.integrations.gpu_noise check --case {case_id} "
+        f"--submission {submission} " + regimes_flag
+        + "--report \"reports/check-$run_id.jsonl\" -- "
+        f"{python} -m megabench evaluate --case {case_id} "
         f"--submission {submission} --method local-check "
         "--session-id \"local-$run_id\" --device cuda:0 "
         "--trials 3 --warmup 1 --reps 3 --timeout 1200 "
@@ -643,7 +682,9 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
            "`./check_candidate`, `./profile_candidate` and `./timeline_candidate` already "
            "use it. Keep inputs and outputs inside this workspace, because the job does "
            "not see this shell's `/tmp`.\n" if gpu_socket is not None else "")
-        + (ENGINE_MAP_TASK + MICROBENCH_TASK + NO_FALLBACK_TASK + PHASE_TIMING_TASK
+        + (ENGINE_MAP_TASK + MICROBENCH_TASK + NO_FALLBACK_TASK
+           + TIMING_NOISE_TASK.replace("{gpu_jobs}", GPU_JOBS_NOTE if gpu_socket is not None else "")
+           + PHASE_TIMING_TASK
            + (PHASE_AGENTS_TASK if phase_agents else "") if agent == "vibesys" else ""))
     _write_tools(project, benchmark_root, case, gpu_socket, phase_agents)
     if agent == "vibesys":

@@ -13,8 +13,10 @@ CASE = "vla-action-step-pi05-b1"
 
 
 class Fake:
-    def __init__(self, case, fail=False) -> None:
+    def __init__(self, case, fail=False, slow=None) -> None:
         self.log, self.fail = [], fail
+        self.slow = slow or {}  # process number -> side that runs in the slow mode
+        self.process = -1
 
     def load(self, directory):
         self.log.append(("load", directory.name))
@@ -28,8 +30,16 @@ class Fake:
     def make_timer(self, iters, warmup):
         def timer(fn):
             self.log.append(("time", fn))
-            return 1.0 if fn == "a" else 0.9
+            base = 1.0 if fn == "a" else 0.9
+            return base * (1.3 if self.slow.get(self.process) == fn else 1.0)
         return timer, lambda fn: self.log.append(("warm", fn))
+
+    def time_process(self, parent, variant, reps, iters, warmup):
+        self.process += 1
+        return phase_ab.time_pair(self, parent, variant, reps, iters, warmup)
+
+    def canary(self):
+        return {"gemm_us": 100.0, "copy_us": 200.0}
 
     def timeline(self, directory, output):
         self.log.append(("timeline", directory.name))
@@ -38,11 +48,11 @@ class Fake:
                 "norm": {"window_us": 10.0, "body_us": 9.0, "occurrences": 2}}
 
 
-def invoke(args, fail=False):
+def invoke(args, fail=False, slow=None):
     holder = []
 
     def factory(case):
-        holder.append(Fake(case, fail))
+        holder.append(Fake(case, fail, slow))
         return holder[0]
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -62,7 +72,7 @@ class PhaseAbTests(unittest.TestCase):
         self.assertEqual("".join(phase_ab.interleave(3)), "ABABAB")
 
     def test_arguments_and_result_format(self) -> None:
-        code, result, fake = invoke(["--reps", "4", "--phase", "gemm"])
+        code, result, fake = invoke(["--reps", "4", "--phase", "gemm", "--processes", "1"])
         self.assertEqual(code, 0)
         self.assertTrue(result["correct"])
         self.assertEqual(result["order"], list("ABABABAB"))
@@ -74,6 +84,28 @@ class PhaseAbTests(unittest.TestCase):
         self.assertEqual(times, ["a", "b"] * 4)
         self.assertEqual([k for k, _ in fake.log if k == "timeline"], ["timeline", "timeline"])
         self.assertIn("gemm", phase_ab.format_result(result))
+
+    def test_processes_and_slow_mode(self) -> None:
+        code, result, fake = invoke(["--reps", "2"], slow={1: "a"})
+        self.assertEqual(code, 0)
+        self.assertEqual(result["processes"], 3)
+        self.assertEqual(len(result["e2e"]["a_ms"]), 6)
+        stab = result["stability"]
+        self.assertEqual(stab["verdict"], "unstable")
+        self.assertEqual(stab["a"]["slow_processes"], [1])
+        self.assertEqual(stab["b"]["verdict"], "stable")
+        # The slow process does not move the score: fast-cluster p50s.
+        self.assertAlmostEqual(result["e2e"]["a_p50_ms"], 1.0)
+        self.assertAlmostEqual(result["e2e"]["diff_ms"], -0.1)
+        self.assertIn("instance", stab["a"]["note"])
+        text = phase_ab.format_result(result)
+        self.assertIn("UNSTABLE", text)
+        self.assertIn("slow process(es) [1]", text)
+
+    def test_stable_when_processes_agree(self) -> None:
+        _, result, _ = invoke(["--reps", "2"])
+        self.assertEqual(result["stability"]["verdict"], "stable")
+        self.assertEqual(result["stability"]["diffs_ms"], [-0.1, -0.1, -0.1])
 
     def test_all_phases_reported_without_the_filter(self) -> None:
         _, result, _ = invoke([])

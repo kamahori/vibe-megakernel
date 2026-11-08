@@ -13,6 +13,7 @@ from dataclasses import replace
 from ..cases import load_regimes, select_cases
 from ..harness.correctness import check_trials
 from ..harness.runner import _load_submission, evaluate_case
+from . import gpu_noise
 
 
 def pinned_score(result: dict, pin_dir: Path | None, key: dict) -> tuple[float, dict | None]:
@@ -54,6 +55,30 @@ def pinned_score(result: dict, pin_dir: Path | None, key: dict) -> tuple[float, 
             "speedup_vs_pinned_baseline_cuda_event": speedup,
             "pinned_now": pinned_now, "file": str(path)}
     return 1.0 + speedup / (1.0 + speedup), info
+
+
+def stabilize(result: dict, case, case_id: str, submission: Path,
+              regimes_path: Path | None) -> None:
+    """Time the candidate in more fresh processes; a slow evaluate process is not scored.
+
+    When the evaluate process is outside the fast cluster (``gpu_noise.spread``), its
+    candidate p50 is replaced by the fast-cluster p50 and the speedups are scaled to
+    match. The evaluate value and all process values stay in ``timing_stability``.
+    """
+    processes = int(os.environ.get("MEGABENCH_STABILITY_PROCESSES", "3"))
+    timing = result.get("candidate_timing") or {}
+    if processes < 2 or case.gpus != 1 or timing.get("cuda_event_p50_ms") is None:
+        return
+    probes = gpu_noise.run_probes(
+        gpu_noise.probe_command(case_id, submission, regimes_path), processes - 1)
+    stab = gpu_noise.check_report(result, probes, gpu_noise.DEFAULT_TOLERANCE_PCT)
+    result["timing_stability"] = stab
+    if 0 in stab["slow_processes"]:
+        old, new = timing["cuda_event_p50_ms"], stab["fast_p50_ms"]
+        timing["cuda_event_p50_ms_evaluate_process"] = old
+        timing["cuda_event_p50_ms"] = new
+        for key in [k for k in result if k.startswith("speedup_vs_") and "cuda_event" in k]:
+            result[key] *= old / new
 
 
 def benchmark_output(case_id: str, result: dict, score: float) -> dict:
@@ -112,6 +137,7 @@ def main(case_id: str, argv: list[str] | None = None,
                                warmup=1, reps=3, graph_baseline=False)
     except Exception as exc:
         result = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"}
+    stabilize(result, case, case_id, submission, regimes_path)
     pin_dir = os.environ.get("MEGABENCH_BASELINE_CACHE")
     key = {"case": case.to_dict()}
     if pin_dir and result.get("status") == "ok_provisional":

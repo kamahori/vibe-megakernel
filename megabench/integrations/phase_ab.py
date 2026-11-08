@@ -2,11 +2,16 @@
 
 ``phase_ab PARENT_DIR VARIANT_DIR`` builds both candidates (each directory holds a complete
 candidate: ``submission.py`` and the kernel files it loads next to it), checks the variant
-against the reference, times parent and variant alternately (A B A B ...) with CUDA events,
-then records one per-block timeline of each. It prints the end-to-end p50 of both and, for
-each phase, the critical-path window of both (``timeline.phase_windows``), and writes
-``result.json`` under the output directory. It exits non-zero when the variant is not
-correct; the timings are then skipped.
+against the reference, times parent and variant alternately (A B A B ...) with CUDA events
+in ``--processes`` fresh processes, then records one per-block timeline of each. It prints
+the end-to-end p50 of both and, for each phase, the critical-path window of both
+(``timeline.phase_windows``), and writes ``result.json`` under the output directory. It
+exits non-zero when the variant is not correct; the timings are then skipped.
+
+A loaded candidate can land in a slow mode (``gpu_noise``): all its launches are slower by
+a constant factor while a fresh load is not. Each side's p50 is therefore taken per
+process; the reported p50 is the fast-cluster p50 over processes, and the result says
+``unstable`` when the processes disagree by more than the tolerance.
 """
 
 from __future__ import annotations
@@ -16,12 +21,14 @@ import contextlib
 import io
 import json
 import statistics
+import subprocess
 import sys
 import time
 from dataclasses import replace
 from pathlib import Path
 
 from ..cases import load_regimes, select_cases
+from . import gpu_noise
 
 
 def interleave(reps: int) -> list[str]:
@@ -60,7 +67,24 @@ def format_result(result: dict) -> str:
     if e2e:
         lines.append(f"end to end p50 (ms): A {e2e['a_p50_ms']:.4f}  B {e2e['b_p50_ms']:.4f}  "
                      f"B-A {e2e['diff_ms']:+.4f} ({e2e['diff_pct']:+.2f}%)  "
-                     f"[{result['reps']} pairs x {result['iters']} calls]")
+                     f"[{result.get('processes', 1)} processes x {result['reps']} pairs x "
+                     f"{result['iters']} calls]")
+        stab = result.get("stability")
+        if stab:
+            lines.append(f"timing stability: {stab['verdict'].upper()}; per-process B-A (ms): "
+                         + ", ".join(f"{d:+.4f}" for d in stab["diffs_ms"]))
+            for side, label in (("a", "A"), ("b", "B")):
+                s = stab[side]
+                lines.append(f"  {label} per-process p50 (ms): "
+                             + ", ".join(f"{v:.4f}" for v in s["values_ms"])
+                             + f"  spread {s['spread_pct']}%"
+                             + (f"  slow process(es) {s['slow_processes']}: GPU noise, excluded"
+                                if s["slow_processes"] else ""))
+                if s.get("note"):
+                    lines.append(f"    {s['note']}")
+            if stab["verdict"] != "stable":
+                lines.append("  the p50s above are fast-cluster p50s; an unstable result is "
+                             "not evidence for or against the variant until a rerun agrees")
         lines.append(f"{'phase':<20} {'A window':>10} {'B window':>10} {'B-A':>10}   (us, summed over occurrences)")
         for row in result["phases"]:
             lines.append(f"{row['phase'][:20]:<20} {row['a_window_us']:>10.3f} "
@@ -73,6 +97,7 @@ class GpuBackend:
 
     def __init__(self, case, device: str = "cuda:0") -> None:
         self.case, self.device = case, device
+        self.case_args: list[str] = []  # how a worker process selects the same case
 
     def load(self, directory: Path):
         from ..harness.runner import _load_submission
@@ -114,6 +139,21 @@ class GpuBackend:
 
         return timer, warm
 
+    def time_process(self, parent: Path, variant: Path, reps: int, iters: int,
+                     warmup: int) -> dict:
+        """One fresh process: load both, time them alternately, time the canary."""
+        cmd = [sys.executable, "-m", "megabench.integrations.phase_ab", str(parent),
+               str(variant), *self.case_args, "--reps", str(reps), "--iters", str(iters),
+               "--warmup", str(warmup), "--worker"]
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        lines = [x for x in out.stdout.splitlines() if x.startswith("{")]
+        if out.returncode != 0 or not lines:
+            raise RuntimeError(f"timing process failed: {(out.stderr or out.stdout)[-800:]}")
+        return json.loads(lines[-1])
+
+    def canary(self) -> dict:
+        return gpu_noise.canary(self.device)
+
     def timeline(self, directory: Path, output: Path) -> dict:
         from . import timeline_profile_case as tpc
 
@@ -122,27 +162,55 @@ class GpuBackend:
         return json.loads((output / "summary.json").read_text()).get("windows", {})
 
 
+def time_pair(backend, parent: Path, variant: Path, reps: int, iters: int, warmup: int) -> dict:
+    """In this process: load both, warm both, time them alternately, time the canary."""
+    cand = {"A": backend.load(parent), "B": backend.load(variant)}
+    timer, warm = backend.make_timer(iters, warmup)
+    for side in "AB":
+        warm(cand[side])
+    samples = time_alternating(cand, reps, timer)
+    return {"a_ms": samples["A"], "b_ms": samples["B"], "canary": backend.canary()}
+
+
+def stability(procs: list[dict], tolerance_pct: float) -> dict:
+    """Per side, compare the per-process p50s; the fast-cluster p50 is the side's time."""
+    out: dict = {"processes": len(procs)}
+    for side in "ab":
+        p50s = [statistics.median(p[f"{side}_ms"]) for p in procs]
+        out[side] = gpu_noise.spread(p50s, tolerance_pct)
+        out[side]["note"] = gpu_noise.canary_note([p.get("canary") for p in procs],
+                                                  out[side]["slow_processes"], tolerance_pct)
+    diffs = [statistics.median(p["b_ms"]) - statistics.median(p["a_ms"]) for p in procs]
+    out["diffs_ms"] = [round(d, 4) for d in diffs]
+    out["verdict"] = ("stable" if out["a"]["verdict"] == out["b"]["verdict"] == "stable"
+                      else "unstable")
+    return out
+
+
 def run(parent: Path, variant: Path, *, output: Path, reps: int, iters: int, warmup: int,
-        names: list[str] | None, backend, case_id: str = "") -> tuple[dict, int]:
+        names: list[str] | None, backend, case_id: str = "", processes: int = 3,
+        tolerance_pct: float = gpu_noise.DEFAULT_TOLERANCE_PCT) -> tuple[dict, int]:
     result: dict = {"case": case_id, "parent": str(parent), "variant": str(variant),
                     "reps": reps, "iters": iters, "order": interleave(reps)}
     output.mkdir(parents=True, exist_ok=True)
     code = 0
-    cand = {"A": backend.load(parent), "B": backend.load(variant)}
     try:
-        backend.check(cand["B"])
+        backend.check(backend.load(variant))
         result.update(correct=True, error=None)
     except Exception as exc:  # noqa: BLE001  # a wrong or crashing variant is a result, not a crash
         result.update(correct=False, error=f"{type(exc).__name__}: {exc}")
         code = 1
     if code == 0:
-        timer, warm = backend.make_timer(iters, warmup)
-        for side in "AB":
-            warm(cand[side])
-        samples = time_alternating(cand, reps, timer)
-        a, b = statistics.median(samples["A"]), statistics.median(samples["B"])
-        result["e2e"] = {"a_ms": samples["A"], "b_ms": samples["B"], "a_p50_ms": a, "b_p50_ms": b,
+        procs = [backend.time_process(parent, variant, reps, iters, warmup)
+                 for _ in range(processes)]
+        stab = stability(procs, tolerance_pct)
+        a, b = stab["a"]["fast_p50_ms"], stab["b"]["fast_p50_ms"]
+        result["e2e"] = {"a_ms": [x for p in procs for x in p["a_ms"]],
+                         "b_ms": [x for p in procs for x in p["b_ms"]],
+                         "a_p50_ms": a, "b_p50_ms": b,
                          "diff_ms": b - a, "diff_pct": 100.0 * (b - a) / a}
+        result["stability"] = stab
+        result["processes"] = processes
         windows = {side: backend.timeline(d, output / side) for side, d in
                    (("A", parent), ("B", variant))}
         result["phases"] = phase_rows(windows["A"], windows["B"], names)
@@ -161,11 +229,16 @@ def main(argv: list[str] | None = None, backend_factory=GpuBackend) -> int:
     parser.add_argument("--iters", type=int, default=20, help="calls timed per sample")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--phase", action="append", default=[], help="report only this phase (repeat)")
+    parser.add_argument("--processes", type=int, default=3,
+                        help="fresh processes that each time A and B alternately")
+    parser.add_argument("--tolerance-pct", type=float, default=gpu_noise.DEFAULT_TOLERANCE_PCT,
+                        help="per-process p50s further than this from the fastest are noise")
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--output", type=Path,
                         default=Path(f"reports/phase-ab-{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}"))
     args = parser.parse_args(argv)
-    if args.reps < 1 or args.iters < 1:
-        parser.error("--reps and --iters must be at least 1")
+    if args.reps < 1 or args.iters < 1 or args.processes < 1:
+        parser.error("--reps, --iters and --processes must be at least 1")
     for directory in (args.parent, args.variant):
         if not (directory / "submission.py").is_file():
             parser.error(f"no submission.py in {directory}")
@@ -181,9 +254,18 @@ def main(argv: list[str] | None = None, backend_factory=GpuBackend) -> int:
         case = pick[0]
     if case.gpus != 1:
         parser.error("phase_ab scores single-GPU cases only")
+    backend = backend_factory(case)
+    backend.case_args = (["--case", args.case]
+                         + (["--regimes", str(args.regimes.resolve())] if args.regimes else [])
+                         + (["--regime", args.regime] if args.regime else []))
+    if args.worker:
+        print(json.dumps(time_pair(backend, args.parent.resolve(), args.variant.resolve(),
+                                   args.reps, args.iters, args.warmup)))
+        return 0
     result, code = run(args.parent.resolve(), args.variant.resolve(), output=args.output,
                        reps=args.reps, iters=args.iters, warmup=args.warmup,
-                       names=args.phase or None, backend=backend_factory(case), case_id=args.case)
+                       names=args.phase or None, backend=backend, case_id=args.case,
+                       processes=args.processes, tolerance_pct=args.tolerance_pct)
     print(format_result(result))
     print(f"result: {args.output}/result.json")
     return code

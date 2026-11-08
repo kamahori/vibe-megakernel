@@ -61,6 +61,10 @@ def main(argv: list[str]) -> int:
     if mode == "probe":
         return probe(spec, rest)
     if mode == "run":
+        # The broker reads the job's GPU index from here for its GPU report.
+        gpus = os.environ.get("SLURM_STEP_GPUS") or os.environ.get("SLURM_JOB_GPUS")
+        if gpus:
+            Path(rest[0]).with_suffix(".gpu").write_text(gpus)
         return run(spec, json.loads(Path(rest[0]).read_text()))
     raise SystemExit(f"unknown mode: {mode}")
 
