@@ -6,7 +6,10 @@ selects for a phase, which rejects the other designs of that phase), each reject
 and each sentence that rules a design out, tagged P1, P2, ... It writes them to
 progress/microbench/items/<round>.md. The answer to a design item cites a tuned matched row of
 its phase or an open ledger question; a plan whose task has no Designs table gets an item that
-asks for one.
+asks for one. A phase of the Designs table that earlier rows rank but that has no floor row
+(an oracle: the proxy with the math removed) gets a floor item; its answer cites a floor row
+of the phase or an open ledger question. The items file ends with the ceiling of each phase
+with a floor: (best tuned row - floor) x calls per step.
 
 `check` passes when, for the newest plan's round, progress/microbench/requests/<round>.md and
 progress/microbench/answers/<round>.md exist, the answers name every item tag, and
@@ -191,6 +194,7 @@ def write_items(workspace: Path, plan_path: Path) -> list[str]:
         carried_file.unlink(missing_ok=True)
     items += [f"(carried from the previous revised plan) {item}"
               for item in carried_in(workspace, plan_path.stem) if item not in items]
+    items += [item for item in floor_items(workspace, plan_path) if item not in items]
     open_questions = [e["tag"] for e in ledger(workspace) if e["status"] == "open"]
     if open_questions:
         items.append("The plan chose its target over the open questions "
@@ -206,8 +210,114 @@ def write_items(workspace: Path, plan_path: Path) -> list[str]:
         lines.append(f"- P{i}{cited}: {item}")
     if not items:
         lines.append("(no rejected alternatives or design-excluding claims in this plan)")
+    lines += ceiling_lines(workspace)
     out.write_text("\n".join(lines) + "\n")
     return items
+
+
+FLOOR_ITEM = re.compile(r"^Floor of (E\d+): ")
+STEP_COUNT = re.compile(r"(?m)^###\s+(E\d+):.*?\b(\d+) per step\b")
+
+
+def phase_floors(workspace: Path, before: str | None = None) -> dict[str, tuple[float, str]]:
+    """For each phase tag, its lowest floor: (us, id) of a matched oracle row (is_floor) with
+    `p.phase` and `m.us`, from rounds before *before* when it is given.
+
+    A floor is the proxy of a design with the math removed (loads, reduction, barrier). No
+    design of the phase is faster than its floor, so the best arm minus the floor limits the
+    gain of every design of the phase that is not built yet.
+    """
+    floors: dict[str, tuple[float, str]] = {}
+    for row in local_rows(workspace).values():
+        src, par = row.get("source") or {}, row.get("params") or {}
+        us = (row.get("metrics") or {}).get("us")
+        if (src.get("conditions") != "matched" or not is_floor(row)
+                or not isinstance(us, (int, float)) or us <= 0
+                or (before and src.get("round", "") >= before)):
+            continue
+        for tag in PHASE_TAG.findall(str(par.get("phase", ""))):
+            if tag not in floors or us < floors[tag][0]:
+                floors[tag] = (float(us), row.get("id", "?"))
+    return floors
+
+
+def step_counts(workspace: Path) -> dict[str, int]:
+    """Calls of each engine-map phase in one step (`### E2: ..., 360 per step`)."""
+    path = workspace / ENGINE_MAP
+    return ({m.group(1): int(m.group(2)) for m in STEP_COUNT.finditer(path.read_text())}
+            if path.is_file() else {})
+
+
+def floor_items(workspace: Path, plan_path: Path) -> list[str]:
+    """One claim for each phase of the plan's Designs table that rows from earlier rounds rank
+    (tuned matched rows) but that has no floor row from those rounds.
+
+    The phases come from the draft plan when the framework saved one, so the items of a round
+    stay the same after the revision; the rows come from earlier rounds for the same reason.
+    """
+    draft = workspace / DRAFT / f"{plan_path.stem}.json"
+    try:
+        plan = json.loads((draft if draft.is_file() else plan_path).read_text())
+    except ValueError:
+        return []
+    tags = [t for row in plan_designs(plan) or [] for t in PHASE_TAG.findall(row["phase"])]
+    round_name = plan_path.stem
+    rounds = {i: (r.get("source") or {}).get("round", "") for i, r in local_rows(workspace).items()}
+    ranked = {r.tag for r in matched_phase_rows(workspace) if rounds.get(r.id, "") < round_name}
+    floors = phase_floors(workspace, before=round_name)
+    return [f"Floor of {t}: the plan designs {t}, which has tuned matched rows but no floor row. "
+            f"Measure the floor of its fastest design (the same proxy with the math removed: "
+            f"loads, the reduction its design needs, the barrier), add it with "
+            f"./primdb add --conditions matched, p.phase={t}, an `oracle_` engine name and m.us, "
+            f"and cite its row id; or cite the open ledger question that says why {t} has no floor"
+            for t in dict.fromkeys(tags) if t in ranked and t not in floors]
+
+
+def ceiling_lines(workspace: Path) -> list[str]:
+    """The price ceiling of each phase with a ranking and a floor, for the items file: (best
+    tuned row - floor) x calls per step. Information, not claims: a proxy ceiling, which the
+    kernel can move by its proxy/kernel ratio."""
+    ranking, floors, counts = phase_ranking(workspace), phase_floors(workspace), step_counts(workspace)
+    lines = []
+    for tag in sorted(set(ranking) & set(floors), key=lambda t: int(t[1:])):
+        design, us, row_id = ranking[tag]
+        floor, floor_id = floors[tag]
+        gap = max(us - floor, 0.0)
+        price = (f" x {counts[tag]} per step = at most {gap * counts[tag] / 1000:.2f} ms per step"
+                 if tag in counts else "")
+        lines.append(f"- {tag}: best {design} {us:g} us ({row_id}), floor {floor:g} us "
+                     f"({floor_id}): excess {gap:.2f} us{price}")
+    if not lines:
+        return []
+    return ["", "## Ceilings (information, not claims)", "",
+            "No design of a phase is faster than its floor. An estimate of the gain of a new "
+            "design at one phase above its ceiling needs the other phases, reductions or "
+            "barriers that the design removes, with their rows.", ""] + lines
+
+
+def floor_problems(workspace: Path, items: list[str], answers: str) -> list[str]:
+    """Each floor item answered by its own section cites a matched floor row of its phase or
+    an open ledger question."""
+    floors = {i for i, r in local_rows(workspace).items()
+              if is_floor(r) and (r.get("source") or {}).get("conditions") == "matched"}
+    rows = local_rows(workspace)
+    open_tags = {e["tag"] for e in ledger(workspace) if e["status"] == "open"}
+    problems = []
+    for n, item in enumerate(items, 1):
+        head = FLOOR_ITEM.match(item)
+        section = _item_section(answers, n) if head else ""
+        if not section:
+            continue
+        tag = head.group(1)
+        cited = {i for i in set(ROW_ID.findall(section)) & floors
+                 if tag in PHASE_TAG.findall(str((rows[i].get("params") or {}).get("phase", "")))}
+        if cited or open_tags & set(re.findall(r"\bQ\d+\b", section)):
+            continue
+        problems.append(
+            f"{MICROBENCH}/answers answers floor item P{n} ({tag}) without a matched floor row "
+            f"of {tag} (an `oracle_` engine, p.phase={tag}, m.us, --conditions matched) or an "
+            "open ledger question")
+    return problems
 
 
 def ledger(workspace: Path) -> list[dict]:
@@ -864,6 +974,7 @@ def check(workspace: Path, build: bool = False) -> list[str]:
             problems.append(f"{answer.relative_to(workspace)} does not answer plan claims "
                             f"{', '.join(missing)} (see {MICROBENCH}/items/{round_name}.md)")
         problems += design_problems(workspace, items, text)
+        problems += floor_problems(workspace, items, text)
         problems += check_ledger(workspace, round_name, text)
     space = workspace / "progress/design-space.md"
     if space.is_file() and f"### {round_name}" not in space.read_text():

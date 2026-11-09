@@ -44,6 +44,13 @@ the data and what it shows, with its conditions.
    phase (`p.phase` carries its tags) that rank the designs, or, when no such rows exist yet,
    with an open ledger question that prices the other designs, cited by its Q tag.
    `./microbench_check` refuses a design answer that cites neither.
+   A `Floor of <phase>` item names a phase that earlier rows rank but that has no floor row.
+   Answer it with a matched floor row of that phase (the proxy of its fastest design with the
+   math removed, an `oracle_` engine name, `p.phase`, `m.us`), or with an open ledger question
+   that says why the phase has no floor. The items file ends with the ceiling of each phase
+   that has a floor: (best tuned row - floor) x calls per step. A gain estimate for a new design
+   at one phase above that ceiling must name the other phases, reductions or barriers that the
+   design removes, with their rows.
 2. Query the database first:
    - `./engine_map M=.. N=.. K=..` lists the legal instruction mappings of a matrix-multiply
      phase with their measured rates and the nearest measured phase rows.

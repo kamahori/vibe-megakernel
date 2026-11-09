@@ -544,7 +544,7 @@ class RankingTests(unittest.TestCase):
     def workspace(self, directory: str, rows=ARCH_E2, round_name: str = "round-0001") -> Path:
         ws = Path(directory)
         mb = ws / "progress/microbench"
-        (mb / "build").mkdir(parents=True)
+        (mb / "build").mkdir(parents=True, exist_ok=True)
         (ws / "progress/engine-map.md").write_text(
             "### E2: mm M=50 N=4096 K=1024 batch=1 bfloat16, 360 per step\n\n"
             "| engine | mapping |\n|---|---|\n| mma.sync | x |\n| tcgen05 | y |\n")
@@ -607,6 +607,53 @@ class RankingTests(unittest.TestCase):
             # Full-K was measured once (24.09 us); before, the split-K sweep made it "tuned".
             self.assertEqual(tuned, {"mma_sync_swapab/split_k_warp_redadd",
                                      "tcgen05_swapab/stream_k_redadd"})
+
+    def test_floor_items_and_ceilings(self) -> None:
+        no_floor = [r for r in ARCH_E2 if not r[0].startswith("oracle")]
+        with tempfile.TemporaryDirectory() as directory:
+            ws = self.workspace(directory, no_floor)
+            mb = ws / "progress/microbench"
+            (ws / "progress/plans").mkdir(parents=True)
+            plan = ws / "progress/plans/round-0002.json"
+            plan.write_text(json.dumps({"task": DESIGNS_TASK}))
+            items = microbench_gate.write_items(ws, plan)
+            # E2 is ranked by round-0001 rows and has no floor; E3/E5 have no rows.
+            floors = [i for i in items if i.startswith("Floor of")]
+            self.assertEqual([i[:12] for i in floors], ["Floor of E2:"])
+            n = items.index(floors[0]) + 1
+            answers = "".join(f"## P{k}\n0000000001\n" for k in range(1, len(items) + 1))
+            problems = microbench_gate.floor_problems(ws, items, answers)
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn(f"floor item P{n} (E2)", problems[0])
+            # A floor row of E2 answers it, and the ceiling appears in the items file.
+            ws = self.workspace(directory, no_floor + [ARCH_E2[-1]])
+            rows = microbench_gate.local_rows(ws)
+            floor_id = next(i for i, r in rows.items() if microbench_gate.is_floor(r))
+            src = rows[floor_id]["source"]
+            answers = answers.replace(f"## P{n}\n0000000001", f"## P{n}\n{floor_id}")
+            self.assertEqual(microbench_gate.floor_problems(ws, items, answers), [])
+            self.assertEqual(src["round"], "round-0001")
+            # A floor from an earlier round: no floor item; the ceiling is shown.
+            items = microbench_gate.write_items(ws, plan)
+            self.assertFalse([i for i in items if i.startswith("Floor of")])
+            text = (mb / "items/round-0002.md").read_text()
+            self.assertIn("E2: best tcgen05_swapab/stream_k_redadd 6.49 us", text)
+            self.assertIn("floor 3.01 us", text)
+            self.assertIn("excess 3.48 us x 360 per step = at most 1.25 ms per step", text)
+
+    def test_floor_items_come_from_the_draft_plan(self) -> None:
+        no_floor = [r for r in ARCH_E2 if not r[0].startswith("oracle")]
+        with tempfile.TemporaryDirectory() as directory:
+            ws = self.workspace(directory, no_floor)
+            (ws / "progress/plans").mkdir(parents=True)
+            (ws / "progress/microbench/draft").mkdir(parents=True)
+            plan = ws / "progress/plans/round-0002.json"
+            (ws / "progress/microbench/draft/round-0002.json").write_text(
+                json.dumps({"task": "No table."}))
+            plan.write_text(json.dumps({"task": DESIGNS_TASK}))
+            # The revision added E2 after the microbench phase closed: no floor item now.
+            self.assertFalse([i for i in microbench_gate.write_items(ws, plan)
+                              if i.startswith("Floor of")])
 
 
 class EngineMapTests(unittest.TestCase):
