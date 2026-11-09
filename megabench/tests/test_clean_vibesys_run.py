@@ -166,3 +166,18 @@ class SeedTests(unittest.TestCase):
             status = subprocess.run(["git", "-C", str(ws), "status", "--porcelain"],
                                     capture_output=True, text=True, check=True).stdout
             self.assertEqual(status, "", "the seeded workspace is committed")
+
+
+class RestartRoundsTests(unittest.TestCase):
+    def test_rounds_done_reads_the_close_commit(self) -> None:
+        import subprocess, tempfile
+        from ..integrations.clean_vibesys_run import rounds_done
+        with tempfile.TemporaryDirectory() as tmp:
+            run = lambda *a: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                                             *a], cwd=tmp, check=True, capture_output=True)
+            run("init", "-q")
+            run("commit", "-q", "--allow-empty", "-m", "multi: close round 3")
+            self.assertEqual(rounds_done(Path(tmp), "HEAD"), 3)
+            run("commit", "-q", "--allow-empty", "-m", "implementer-session-turn-1")
+            self.assertIsNone(rounds_done(Path(tmp), "HEAD"))
+            self.assertEqual(rounds_done(Path(tmp), "HEAD~1"), 3)

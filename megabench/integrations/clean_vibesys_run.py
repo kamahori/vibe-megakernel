@@ -245,6 +245,14 @@ def cache_rows(args, run: Path) -> int:
     return n
 
 
+def rounds_done(workspace: Path, ref: str) -> int | None:
+    """K when *ref* of *workspace* is the commit that closes round K, else None."""
+    out = subprocess.run(["git", "log", "-1", "--format=%s", ref], cwd=workspace,
+                         capture_output=True, text=True)
+    m = re.fullmatch(r"multi: close round (\d+)", out.stdout.strip())
+    return int(m.group(1)) if out.returncode == 0 and m else None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--case", required=True)
@@ -301,6 +309,11 @@ def build_parser() -> argparse.ArgumentParser:
                         default=False,
                         help="start with the measured rows of earlier runs of the case (numbers "
                              "only, no notes). Off by default: a run measures what it needs")
+    parser.add_argument("--restart", action="store_true",
+                        help="continue the run of --seed-from after the round that --seed-ref "
+                             "closes ('multi: close round K'): --rounds and "
+                             "--microbench-full-rounds count the whole run, and the K rounds "
+                             "already done are subtracted")
     parser.add_argument("--no-microbench-cache", dest="microbench_cache", action="store_false",
                         help="start without cached rows (the default)")
     parser.add_argument("--microbench-cache-store", type=Path,
@@ -313,6 +326,19 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
 
+    if args.restart:
+        if not args.seed_from:
+            parser.error("--restart needs --seed-from")
+        done = rounds_done(args.seed_from, args.seed_ref)
+        if done is None:
+            parser.error("--restart: --seed-ref is not a 'multi: close round K' commit")
+        if args.rounds <= done:
+            parser.error(f"--restart: the seed already did {done} of the {args.rounds} rounds")
+        full = 1 if args.microbench_full_rounds is None else args.microbench_full_rounds
+        args.rounds -= done
+        args.microbench_full_rounds = max(full - done, 0) if full >= 0 else full
+        print(f"restart after round {done}: {args.rounds} rounds remain, "
+              f"{args.microbench_full_rounds} of them full microbench rounds")
     if args.microbench_full_rounds is None:
         args.microbench_full_rounds = 0 if args.seed_from else 1
     if args.phase_agents and args.microbench_full_rounds < 0:
