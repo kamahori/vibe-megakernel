@@ -112,6 +112,98 @@ class BrokerTests(unittest.TestCase):
         self.assertGreaterEqual(self.wait_s(), 5)
 
 
+FAKE_SALLOC = """#!/bin/sh
+echo "salloc $*" >> "$(dirname "$0")/slurm.log"
+sleep "${FAKE_SALLOC_SLEEP:-0}"
+echo "salloc: Pending job allocation 4242" >&2
+echo "salloc: Granted job allocation 4242" >&2
+"""
+FAKE_SCANCEL = """#!/bin/sh
+echo "scancel $*" >> "$(dirname "$0")/slurm.log"
+"""
+FAKE_SQUEUE = """#!/bin/sh
+echo RUNNING
+"""
+
+
+class HeldAllocationTests(unittest.TestCase):
+    """--hold-s: one allocation serves consecutive commands and is released when idle."""
+
+    def start(self, hold: str = "2", salloc_sleep: str = "0") -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = self.root = Path(self.tmp.name)
+        self.socket = root / "gpu/broker.sock"
+        self.socket.parent.mkdir()
+        for name, text in (("srun", FAKE_SRUN), ("salloc", FAKE_SALLOC),
+                           ("scancel", FAKE_SCANCEL), ("squeue", FAKE_SQUEUE)):
+            (root / name).write_text(text)
+            (root / name).chmod(0o755)
+        (root / "job.py").write_text(FAKE_JOB)
+        self.work = root / "work"
+        self.work.mkdir()
+        env = os.environ | {"PYTHONPATH": str(REPO), "FAKE_SALLOC_SLEEP": salloc_sleep}
+        self.server = subprocess.Popen(
+            [sys.executable, "-m", "megabench.integrations.gpu_broker", "serve",
+             "--socket", str(self.socket), "--requests", str(root / "requests"),
+             "--spec", str(root / "spec.json"), "--job-python", sys.executable,
+             "--job-script", str(root / "job.py"), "--partition-policy", "fixed",
+             "--hold-s", hold, "--min-left-s", "0",
+             "--", str(root / "srun"), "--partition=main", "--gres=gpu:1",
+             "--time=00:20:00", "--kill-on-bad-exit=1"],
+            env=env, stdout=open(root / "broker.log", "w"), stderr=subprocess.STDOUT)
+        for _ in range(100):
+            if self.socket.exists():
+                break
+            time.sleep(0.05)
+
+    def tearDown(self) -> None:
+        self.server.kill()
+        self.server.wait()
+        self.tmp.cleanup()
+
+    def client(self, *command: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-m", "megabench.integrations.gpu_broker", "run",
+             "--socket", str(self.socket), "--", *command],
+            cwd=self.work, env=os.environ | {"PYTHONPATH": str(REPO)},
+            capture_output=True, text=True, timeout=60)
+
+    def slurm(self) -> list[str]:
+        path = self.root / "slurm.log"
+        return path.read_text().splitlines() if path.exists() else []
+
+    def test_consecutive_commands_share_one_allocation(self) -> None:
+        self.start(hold="3")
+        self.assertEqual(self.client("echo", "a").stdout.strip(), "a")
+        self.assertEqual(self.client("echo", "b").stdout.strip(), "b")
+        sallocs = [l for l in self.slurm() if l.startswith("salloc")]
+        self.assertEqual(len(sallocs), 1)
+        self.assertIn("--no-shell", sallocs[0])
+        self.assertNotIn("--kill-on-bad-exit=1", sallocs[0])
+        self.assertNotIn("scancel 4242", self.slurm())
+        time.sleep(6)  # idle longer than --hold-s
+        self.assertIn("scancel 4242", self.slurm())
+        self.assertEqual(self.client("true").returncode, 0)  # a new allocation after release
+        self.assertEqual(len([l for l in self.slurm() if l.startswith("salloc")]), 2)
+
+    def test_status_passes_through(self) -> None:
+        self.start()
+        self.assertEqual(self.client(sys.executable, "-c", "raise SystemExit(4)").returncode, 4)
+
+    def test_waiting_for_the_allocation_is_queue_wait(self) -> None:
+        self.start(salloc_sleep="7")
+        self.assertEqual(self.client("true").returncode, 0)
+        time.sleep(6)
+        self.assertGreaterEqual(float((self.socket.parent / "queue_wait_s").read_text()), 5)
+
+    def test_stopping_the_broker_releases_held_allocations(self) -> None:
+        self.start(hold="600")
+        self.assertEqual(self.client("true").returncode, 0)
+        self.server.terminate()
+        self.server.wait(timeout=30)
+        self.assertIn("scancel 4242", self.slurm())
+
+
 class WorkspaceGpuTests(unittest.TestCase):
     def test_gpu_commands_use_gpu_run_and_gates_use_the_launcher(self) -> None:
         from ..integrations.make_agent_workspace import make_workspace

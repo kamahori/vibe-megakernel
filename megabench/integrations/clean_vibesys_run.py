@@ -127,7 +127,8 @@ def write_launch(args, run: Path, env: dict[str, str], srun: list[str]) -> None:
               "--socket", str(run / "gpu/broker.sock"), "--requests", str(run / "state/gpu"),
               "--spec", str(run / "gpu-spec.json"), "--job-python", str(args.vibesys.parent / "python"),
               "--job-script", str(run / "trusted/megabench/integrations/gpu_job.py"),
-              "--max-jobs", str(args.max_gpu_jobs), "--", *srun]
+              "--max-jobs", str(args.max_gpu_jobs),
+              "--hold-s", f"{getattr(args, 'gpu_hold_s', 0):g}", "--", *srun]
     timeout = args.timeout_seconds or args.rounds * 7200
     (run / "launch.sh").write_text(
         "#!/bin/bash\nset -euo pipefail\n"
@@ -280,6 +281,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu-time", default="00:20:00", help="time limit of each GPU job (default: %(default)s)")
     parser.add_argument("--gpu-cpus", type=int, default=8)
     parser.add_argument("--gpu-mem", default="64G")
+    parser.add_argument("--gpu-hold-s", type=float, default=120,
+                        help="the GPU broker keeps an allocation this many idle seconds after "
+                             "a command, for the next one (0: one Slurm job per command)")
     parser.add_argument("--max-gpu-jobs", type=int, default=8,
                         help="GPU jobs from the agent queued or running at a time")
     parser.add_argument("--microbench-phase", action=argparse.BooleanOptionalAction, default=True,

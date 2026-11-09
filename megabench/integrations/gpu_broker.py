@@ -10,12 +10,21 @@ status. ``gpu_job.py`` builds the agent's sandbox again inside the job.
 
 If the client goes away (for example a tool timeout), the broker cancels the
 job. At most ``--max-jobs`` jobs from one run are queued or running at a time.
+
+With ``--hold-s N`` the broker does not start one Slurm job per command. It gets an
+allocation with ``salloc --no-shell`` (the same options) and runs each command as a step
+(``srun --jobid``) in it. After a command ends, the broker keeps the allocation for N
+seconds, so that the next command of the run starts at once instead of waiting in the
+queue again. It releases the allocation after N idle seconds, or when less than
+``--min-left-s`` of its time limit is left.
 """
 
 from __future__ import annotations
 
 import argparse
 import itertools
+import re
+import tempfile
 import json
 import os
 import select
@@ -131,6 +140,22 @@ def choose_partition(windows: dict, gpus: int, minutes: float,
     return None
 
 
+def _option(args: list[str], name: str) -> str | None:
+    return next((a.split("=", 1)[1] for a in args if a.startswith(f"--{name}=")), None)
+
+
+class Alloc:
+    """A Slurm allocation that the broker holds between commands."""
+
+    def __init__(self, jobid: str, limit_s: float) -> None:
+        self.jobid, self.limit_s = jobid, limit_s
+        self.granted = time.monotonic()
+        self.idle_since: float | None = None
+
+    def left(self) -> float:
+        return self.granted + self.limit_s - time.monotonic()
+
+
 class Broker:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -152,6 +177,124 @@ class Broker:
         self.queue_wait = 0.0
         self.wait_file = Path(args.socket).parent / "queue_wait_s"
         threading.Thread(target=self._count_wait, daemon=True).start()
+        # Allocations held between commands (--hold-s).
+        self.idle: list[Alloc] = []
+        self.held: dict[str, Alloc] = {}  # every allocation the broker has, idle or busy
+        self.pool_lock = threading.Lock()
+        def tool(name: str) -> str:  # the Slurm tool next to the given srun, else on PATH
+            beside = Path(args.srun[0]).with_name(name)
+            return str(beside) if "/" in args.srun[0] and beside.exists() else name
+        self.salloc, self.scancel, self.squeue = tool("salloc"), tool("scancel"), tool("squeue")
+        if getattr(args, "hold_s", 0) > 0:
+            threading.Thread(target=self._reap, daemon=True).start()
+
+    def _min_left(self) -> float:
+        if getattr(self.args, "min_left_s", None) is not None:
+            return self.args.min_left_s
+        limit = _option(self.args.srun, "time")
+        return 0.5 * _minutes(limit) * 60 if limit else 300.0
+
+    def _release(self, alloc: Alloc, why: str) -> None:
+        with self.pool_lock:
+            if self.held.pop(alloc.jobid, None) is None:
+                return
+        self.log(f"release allocation {alloc.jobid} ({why})")
+        subprocess.run([self.scancel, alloc.jobid], check=False, env=self.env,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _reap(self, tick: float = 2.0) -> None:
+        while True:
+            time.sleep(tick)
+            now, drop = time.monotonic(), []
+            with self.pool_lock:
+                for alloc in list(self.idle):
+                    if now - (alloc.idle_since or now) >= self.args.hold_s:
+                        drop.append((alloc, "idle"))
+                    elif alloc.left() < self._min_left():
+                        drop.append((alloc, "time limit near"))
+                    else:
+                        continue
+                    self.idle.remove(alloc)
+            for alloc, why in drop:
+                self._release(alloc, why)
+
+    def _take(self) -> Alloc | None:
+        with self.pool_lock:
+            while self.idle:
+                alloc = self.idle.pop()
+                if alloc.left() >= self._min_left():
+                    alloc.idle_since = None
+                    return alloc
+                threading.Thread(target=self._release, args=(alloc, "time limit near"),
+                                 daemon=True).start()
+        return None
+
+    def _alive(self, alloc: Alloc) -> bool:
+        try:
+            out = subprocess.run([self.squeue, "-h", "-j", alloc.jobid, "-o", "%T"],
+                                 capture_output=True, text=True, timeout=30, env=self.env)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return out.stdout.strip() == "RUNNING"
+
+    def release_all(self) -> None:
+        with self.pool_lock:
+            held, self.idle = list(self.held.values()), []
+        for alloc in held:
+            self._release(alloc, "broker stops")
+
+    def _give_back(self, alloc: Alloc) -> None:
+        if alloc.left() < self._min_left():
+            self._release(alloc, "time limit near")
+            return
+        if not self._alive(alloc):
+            self.log(f"allocation {alloc.jobid} is no longer running; dropped")
+            with self.pool_lock:
+                self.held.pop(alloc.jobid, None)
+            return
+        alloc.idle_since = time.monotonic()
+        with self.pool_lock:
+            self.idle.append(alloc)
+
+    def _allocate(self, conn: socket.socket, name: str) -> Alloc | dict:
+        """A new allocation with the srun options, or an error reply."""
+        opts = [a for a in self.partitioned(self.args.srun)[1:]
+                if not a.startswith("--kill-on-bad-exit")]
+        limit = _option(opts, "time")
+        with tempfile.TemporaryFile("w+") as err:
+            proc = subprocess.Popen([self.salloc, "--no-shell", f"--job-name={name}", *opts],
+                                    stdin=subprocess.DEVNULL, stdout=err, stderr=err,
+                                    env=self.env)
+            self._state(name, "pending")
+            try:
+                while True:
+                    try:
+                        code = proc.wait(timeout=1)
+                        break
+                    except subprocess.TimeoutExpired:
+                        if _client_gone(conn):
+                            self.log(f"{name} client gone while waiting for a GPU; cancel")
+                            proc.terminate()
+                            subprocess.run([self.scancel, f"--name={name}"], check=False,
+                                           env=self.env)
+                            try:
+                                proc.wait(timeout=30)
+                            except subprocess.TimeoutExpired:
+                                proc.kill()
+                            return {"error": "client went away; job cancelled"}
+            finally:
+                self._state(name, None)
+            err.seek(0)
+            text = err.read()
+        found = re.search(r"Granted job allocation (\d+)", text)
+        if code != 0 or not found:
+            tail = "\n".join(text.strip().splitlines()[-5:])
+            return {"error": f"salloc failed (exit {code}): {tail}"}
+        self.log(f"{name} allocation {found.group(1)} granted")
+        alloc = Alloc(found.group(1), _minutes(limit) * 60 if limit else 1200.0)
+        with self.pool_lock:
+            self.held[alloc.jobid] = alloc
+        return alloc
 
     def _count_wait(self, tick: float = 1.0) -> None:
         last_write = 0.0
@@ -254,6 +397,8 @@ class Broker:
             if _client_gone(conn):
                 return {"error": "client went away while waiting for a slot"}
         try:
+            if getattr(self.args, "hold_s", 0) > 0:
+                return self._run_held(conn, body, fds)
             number = next(self.count)
             name = f"vs-gpu-{self.tag}-{number}"
             path = self.args.requests / f"{name}.json"
@@ -280,7 +425,7 @@ class Broker:
                 except subprocess.TimeoutExpired:
                     if _client_gone(conn):
                         self.log(f"{name} client gone; cancel")
-                        subprocess.run(["scancel", f"--name={name}"], check=False, env=self.env)
+                        subprocess.run([self.scancel, f"--name={name}"], check=False, env=self.env)
                         proc.terminate()
                         try:
                             proc.wait(timeout=30)
@@ -296,11 +441,67 @@ class Broker:
         finally:
             self.slots.release()
 
+    def _run_held(self, conn: socket.socket, body: dict, fds: list[int]) -> dict:
+        """Run the command as a step of a held allocation (a new one if none is idle)."""
+        number = next(self.count)
+        name = f"vs-gpu-{self.tag}-{number}"
+        path = self.args.requests / f"{name}.json"
+        alloc = self._take()
+        if alloc is None:
+            got = self._allocate(conn, name)
+            if isinstance(got, dict):
+                return got
+            alloc = got
+        else:
+            self.log(f"{name} reuses allocation {alloc.jobid} ({alloc.left():.0f}s left)")
+        body["job_limit_s"] = max(60.0, alloc.left() - 30)  # gpu_job stops a hang before it
+        path.write_text(json.dumps(body))
+        step = [self.args.srun[0], f"--jobid={alloc.jobid}", "--ntasks=1", "--nodes=1",
+                *(a for a in self.args.srun if a.startswith(("--cpus-per-task=", "--gres="))),
+                "--kill-on-bad-exit=1", f"--job-name={name}",
+                str(self.args.job_python), str(self.args.job_script), "run",
+                str(self.args.spec), str(path)]
+        self.log(f"{name} start {json.dumps(body['argv'])}")
+        started, t0 = time.monotonic(), time.time()
+        proc = subprocess.Popen(step, stdin=subprocess.DEVNULL, stdout=fds[0], stderr=fds[1],
+                                env=self.env)
+        self._state(name, "running")
+        try:
+            while True:
+                try:
+                    code = proc.wait(timeout=1)
+                    break
+                except subprocess.TimeoutExpired:
+                    if _client_gone(conn):
+                        self.log(f"{name} client gone; cancel")
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=30)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                        self._release(alloc, "client gone")
+                        return {"error": "client went away; job cancelled"}
+        finally:
+            self._state(name, None)
+        self.log(f"{name} exit {code} after {time.monotonic() - started:.0f}s")
+        self.gpu_report(name, path, t0, time.time(), fds[1], code, body["argv"])
+        path.unlink(missing_ok=True)
+        self._give_back(alloc)
+        return {"returncode": code}
+
 
 def serve(args: argparse.Namespace) -> int:
     args.requests.mkdir(parents=True, exist_ok=True)
     args.socket.unlink(missing_ok=True)
     broker = Broker(args)
+    import signal
+
+    def stop(signum, frame):  # held allocations must not outlive the broker
+        broker.release_all()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
         fd, address = _address(args.socket)
         server.bind(address)
@@ -329,6 +530,12 @@ def main(argv: list[str] | None = None) -> int:
     server.add_argument("--job-script", type=Path,
                         default=Path(__file__).with_name("gpu_job.py"))
     server.add_argument("--max-jobs", type=int, default=1)
+    server.add_argument("--hold-s", type=float, default=0,
+                        help="keep a Slurm allocation this many idle seconds after a command "
+                             "and run the next command in it (0: one job per command)")
+    server.add_argument("--min-left-s", type=float, default=None,
+                        help="reuse a held allocation only with this much time left "
+                             "(default: half its time limit)")
     server.add_argument("--partition-policy", choices=("auto", "fixed"), default="auto",
                         help="auto: main if it starts the job now, else priority if that "
                              "does, else main; fixed: the srun --partition as given")
