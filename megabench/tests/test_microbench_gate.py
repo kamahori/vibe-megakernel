@@ -515,6 +515,58 @@ class TunedTests(unittest.TestCase):
             self.assertIn("fastest matched row is 0000000000", problems[0])
 
 
+# The E2 rows of archC16-pi05-s1 (gate/up, M=50 N=4096 K=1024), in short: (engine, decomposition,
+# knob, us, tuned). mma.sync full-K (D1) is 3.6x its split-K (D2); tcgen05 stream-K (D3) is fastest.
+ARCH_E2 = [
+    ("mma_sync_swapab", "output_tile", {"ksl": 1024}, 24.09, True),
+    ("mma_sync_swapab", "split_k_warp_redadd", {"ksl": 128}, 6.67, True),
+    ("mma_sync_swapab", "split_k_warp_redadd", {"ksl": 128}, 6.71, True),
+    ("mma_sync_swapab", "split_k_warp_redadd", {"ksl": 128}, 6.62, True),
+    ("mma_sync_swapab", "split_k_warp_redadd", {"ksl": 256}, 7.93, True),
+    ("tcgen05_swapab", "stream_k_redadd", {"ring": 3}, 6.55, True),
+    ("tcgen05_swapab", "stream_k_redadd", {"ring": 3}, 6.51, True),
+    ("tcgen05_swapab", "stream_k_redadd", {"ring": 4}, 6.49, True),
+    ("tcgen05_swapab", "stream_k_redadd", {"ring": 4}, 6.53, True),
+    ("oracle_load_barrier_only", "split_k_warp_redadd", {"ksl": 128}, 3.01, False),
+]
+
+
+class RankingTests(unittest.TestCase):
+    """check_build on the archC16 E2 pattern: a sweep of one engine is not noise, and two
+    decompositions of one engine are two designs."""
+
+    def workspace(self, directory: str, rows=ARCH_E2, round_name: str = "round-0001") -> Path:
+        ws = Path(directory)
+        mb = ws / "progress/microbench"
+        (mb / "build").mkdir(parents=True)
+        (ws / "progress/engine-map.md").write_text(
+            "### E2: mm M=50 N=4096 K=1024 batch=1 bfloat16, 360 per step\n\n"
+            "| engine | mapping |\n|---|---|\n| mma.sync | x |\n| tcgen05 | y |\n")
+        (mb / "primdb_local.jsonl").write_text("".join(json.dumps(
+            {"id": f"{k:010x}", "family": "gemm_phase", "primitive": "gemm_phase.persistent",
+             "params": {"engine": e, "partition": d, "phase": "E2", "tuned": t, **knob},
+             "metrics": {"us": us},
+             "source": {"round": round_name, "question": "Q1", "conditions": "matched"}})
+            + "\n" for k, (e, d, knob, us, t) in enumerate(rows)))
+        return ws
+
+    def build(self, ws: Path, cell: str, notes: str = "", round_name: str = "round-0001") -> list[str]:
+        (ws / f"progress/microbench/build/{round_name}.md").write_text(
+            f"| phase | design built | notes |\n|---|---|---|\n| E2 gate/up | {cell} | {notes} |\n")
+        return microbench_gate.check_build(ws, round_name)
+
+    def test_noise_is_the_spread_of_repeats_not_of_a_sweep(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ws = self.workspace(directory)
+            rows = microbench_gate.matched_phase_rows(ws)
+            # The mma.sync rows spread 264% (a sweep); its repeats spread 1.4%; the floor wins.
+            self.assertAlmostEqual(microbench_gate.phase_noise(rows, "E2"), 0.02)
+            problems = self.build(ws, "mma.sync swap-AB split-K")
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn("2.0% slower (noise 2.0%)", problems[0])
+            self.assertEqual(self.build(ws, "tcgen05 swap-AB stream-K"), [])
+
+
 class EngineMapTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

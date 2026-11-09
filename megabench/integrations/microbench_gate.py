@@ -34,6 +34,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 MICROBENCH = Path("progress/microbench")
 ENGINE_MAP = Path("progress/engine-map.md")
@@ -529,8 +530,27 @@ BUILD_HELP = ("one table row per phase of the candidate: | phase | design built 
 PHASE_TAG = re.compile(r"\bE\d+\b")
 
 
-def matched_phase_rows(workspace: Path) -> list[tuple[str, str, float, str]]:
-    """(phase tag, design, us, id) of each matched row with `p.phase` and `m.us`.
+RUN_KEYS = ("tuned", "rep", "repeat", "seed", "run", "trial", "note", "notes")
+# Params that name a run of a setup, not the setup: rows equal in all other params are repeats.
+
+
+class PhaseRow(NamedTuple):
+    tag: str      # engine-map phase tag (E<n>)
+    design: str   # design_of the row
+    us: float     # phase time, m.us
+    id: str
+    setup: str    # the row's params without RUN_KEYS: equal setups are repeats
+
+
+def setup_of(row: dict) -> str:
+    """The setup a row measures: its family, primitive and params without RUN_KEYS."""
+    params = {k: v for k, v in (row.get("params") or {}).items() if k not in RUN_KEYS}
+    return json.dumps([row.get("family"), row.get("primitive"), params], sort_keys=True,
+                      default=str)
+
+
+def matched_phase_rows(workspace: Path) -> list[PhaseRow]:
+    """(phase tag, design, us, id, setup) of each matched row with `p.phase` and `m.us`.
 
     Rows count when `./primdb add` stored them with `--conditions matched`, a design
     (not an oracle), `p.phase` and the phase time `m.us`, and they are tuned (tuned_rows).
@@ -546,34 +566,35 @@ def matched_phase_rows(workspace: Path) -> list[tuple[str, str, float, str]]:
         if not design or not phase or not isinstance(us, (int, float)) or us <= 0:
             continue
         for tag in PHASE_TAG.findall(str(phase)):
-            out.append((tag, design, float(us), row_id))
+            out.append(PhaseRow(tag, design, float(us), row_id, setup_of(row)))
     return out
 
 
 def phase_ranking(workspace: Path) -> dict[str, tuple[str, float, str]]:
     """For each engine-map phase tag, the fastest matched row: (design, us, id)."""
     best: dict[str, tuple[str, float, str]] = {}
-    for tag, design, us, row_id in matched_phase_rows(workspace):
-        if tag not in best or us < best[tag][1]:
-            best[tag] = (design, us, row_id)
+    for r in matched_phase_rows(workspace):
+        if r.tag not in best or r.us < best[r.tag][1]:
+            best[r.tag] = (r.design, r.us, r.id)
     return best
 
 
-NOISE = 0.02  # relative gap treated as noise when no design of the phase was measured twice
+NOISE = 0.02  # relative gap treated as noise when no setup of the phase was measured twice
 
 
-def phase_noise(rows: list[tuple[str, str, float, str]], tag: str) -> float:
-    """The relative spread of repeated matched rows of one design for phase *tag*.
+def phase_noise(rows: list[PhaseRow], tag: str) -> float:
+    """The relative spread of repeated matched rows of one setup for phase *tag*.
 
-    Repeats of the same design under matched conditions show how far two times of one
-    design differ; a gap between designs inside that spread is not a ranking. With no
-    repeats, NOISE.
+    Repeats (rows equal in every param but RUN_KEYS) show how far two times of one setup
+    differ; a gap between designs inside that spread is not a ranking. Rows of one design
+    that differ in a knob (stage depth, ingress, tile, split) are a sweep, not repeats:
+    their spread is the effect of the knob. With no repeats, NOISE.
     """
-    by_design: dict[str, list[float]] = {}
-    for t, design, us, _ in rows:
-        if t == tag:
-            by_design.setdefault(design, []).append(us)
-    spreads = [(max(v) - min(v)) / min(v) for v in by_design.values() if len(v) > 1]
+    by_setup: dict[str, list[float]] = {}
+    for r in rows:
+        if r.tag == tag:
+            by_setup.setdefault(r.setup, []).append(r.us)
+    spreads = [(max(v) - min(v)) / min(v) for v in by_setup.values() if len(v) > 1]
     return max(spreads + [NOISE])
 
 
@@ -624,7 +645,7 @@ def check_build(workspace: Path, round_name: str) -> list[str]:
         return (family_of(name, families) if families else None) or _norm(name)
 
     for tag, (design, us, row_id) in sorted(ranking.items()):
-        if len({family(d) for t, d, _, _ in rows if t == tag}) < 2:
+        if len({family(r.design) for r in rows if r.tag == tag}) < 2:
             # One engine family tuned at this phase: nothing to rank it against yet.
             continue
         if tag not in built:
@@ -634,7 +655,7 @@ def check_build(workspace: Path, round_name: str) -> list[str]:
         name, notes = built[tag]
         if family(name) == family(design):
             continue
-        own = [u for t, d, u, _ in rows if t == tag and family(d) == family(name)]
+        own = [r.us for r in rows if r.tag == tag and family(r.design) == family(name)]
         noise = phase_noise(rows, tag)
         if own and (min(own) - us) / us <= noise:
             continue
