@@ -1,8 +1,12 @@
 """Microbench gate of a VibeSys workspace.
 
 `items` reads the newest plan (progress/plans/round-*.json) and lists the plan claims that the
-microbench phase must answer: each rejected alternative and each sentence that rules a design out,
-tagged P1, P2, ... It writes them to progress/microbench/items/<round>.md.
+microbench phase must answer: each row of the plan's Designs table (the design that the plan
+selects for a phase, which rejects the other designs of that phase), each rejected alternative
+and each sentence that rules a design out, tagged P1, P2, ... It writes them to
+progress/microbench/items/<round>.md. The answer to a design item cites a tuned matched row of
+its phase or an open ledger question; a plan whose task has no Designs table gets an item that
+asks for one.
 
 `check` passes when, for the newest plan's round, progress/microbench/requests/<round>.md and
 progress/microbench/answers/<round>.md exist, the answers name every item tag, and
@@ -54,11 +58,74 @@ def _sentences(text: str) -> list[str]:
     return [p.strip(" -*\n") for p in parts if p.strip(" -*\n")]
 
 
+DESIGNS_HELP = "| phase | design | decomposition | ingress | rows |"
+DESIGN_ITEM = re.compile(r"^Design of (.*?): ")
+NO_DESIGNS = ("The plan has no Designs table (" + DESIGNS_HELP + ") in its task: for each phase "
+              "that the task writes, name the design that the task selects (engine, "
+              "decomposition, ingress), and the tuned matched rows of that phase that rank it "
+              "fastest or the open ledger question that prices the other designs")
+
+
+def _cells(line: str) -> list[str] | None:
+    """The cells of a markdown table row, or None when *line* is not one."""
+    line = line.strip()
+    if not line.startswith("|"):
+        return None
+    return [c.strip() for c in line.strip("|").split("|")]
+
+
+def plan_designs(plan: dict) -> list[dict] | None:
+    """The rows of the plan's Designs table: the design that the plan selects for each phase.
+
+    The table is in the plan's `task` (the text the implementer receives), else in its
+    `reasoning`: a header row whose cells include `phase` and `design`, then one row per
+    phase. Each row gives {"phase", "design", "rest"}. None when the plan has no such table.
+    """
+    for field in ("task", "reasoning"):
+        lines = str(plan.get(field, "")).splitlines()
+        for i, line in enumerate(lines):
+            head = _cells(line)
+            if head is None:
+                continue
+            names = [_norm(c) for c in head]
+            if "phase" not in names or not any(n.startswith("design") for n in names):
+                continue
+            p, d = names.index("phase"), next(k for k, n in enumerate(names)
+                                             if n.startswith("design"))
+            rows = []
+            for row in lines[i + 1:]:
+                cells = _cells(row)
+                if cells is None:
+                    break
+                if all(set(c) <= set("-: ") for c in cells):
+                    continue
+                cells += [""] * (len(head) - len(cells))
+                rest = [c for k, c in enumerate(cells) if k not in (p, d) and c]
+                if cells[p] or cells[d]:
+                    rows.append({"phase": cells[p], "design": cells[d], "rest": rest})
+            return rows
+    return None
+
+
+def design_items(plan: dict) -> list[str]:
+    """One claim for each row of the Designs table: a selection rejects the other designs."""
+    designs = plan_designs(plan)
+    if designs is None:
+        return [NO_DESIGNS] if str(plan.get("task", "")).strip() else []
+    items = []
+    for row in designs:
+        detail = f" ({'; '.join(row['rest'])})" if row["rest"] else ""
+        items.append(f"Design of {row['phase']}: {row['design']}{detail}. The plan selects it "
+                     "over the other designs of this phase")
+    return items
+
+
 def plan_items(plan: dict) -> list[str]:
-    """Rejected alternatives and design-excluding sentences, in plan order, without repeats."""
+    """Design selections, then rejected alternatives and design-excluding sentences, in plan
+    order, without repeats."""
     texts = [str(plan.get(name, "")) for name in FIELDS]
     texts += [str(u.get("reason", "")) for u in plan.get("hypothesis_updates", []) or []]
-    items: list[str] = []
+    items: list[str] = [i for i in dict.fromkeys(design_items(plan))]
     for text in texts:
         in_rejected = False
         for sentence in _sentences(text):
@@ -593,6 +660,59 @@ def check_build(workspace: Path, round_name: str) -> list[str]:
     return problems
 
 
+def _item_section(text: str, n: int) -> str:
+    """The part of an answers file that answers plan item P<n>.
+
+    A heading that names the tag, else the text from the first mention of the tag to the
+    next mention of another P tag or the next heading.
+    """
+    section = _section(text, f"P{n}")
+    if section:
+        return section
+    match = re.search(rf"\bP{n}\b", text)
+    if not match:
+        return ""
+    end = re.search(rf"\bP(?!{n}\b)\d+\b|^#", text[match.end():], re.M)
+    return text[match.start():match.end() + end.start()] if end else text[match.start():]
+
+
+def design_problems(workspace: Path, items: list[str], answers: str) -> list[str]:
+    """Each design item answered by its own section cites evidence that can rank the phase.
+
+    The evidence is a tuned matched row of the item's phase (p.phase carries one of its
+    engine-map tags; any tuned matched row when the phase cell names no tag), or an open
+    ledger question. An item answered only through row ids that the plan and the answers both
+    cite is not checked here: the answers to the draft were.
+    """
+    rows = [r for r in local_rows(workspace).values()
+            if (r.get("source") or {}).get("conditions") == "matched"]
+    tuned = tuned_rows(rows)
+    open_tags = {e["tag"] for e in ledger(workspace) if e["status"] == "open"}
+    problems = []
+    for n, item in enumerate(items, 1):
+        head = DESIGN_ITEM.match(item)
+        if not head:
+            continue
+        section = _item_section(answers, n)
+        if not section:
+            continue
+        tags = set(PHASE_TAG.findall(head.group(1)))
+        ranked = {r.get("id") for r in tuned
+                  if not tags or tags & set(PHASE_TAG.findall(str((r.get("params") or {})
+                                                                  .get("phase", ""))))}
+        if ranked & set(ROW_ID.findall(section)):
+            continue
+        if open_tags & set(re.findall(r"\bQ\d+\b", section)):
+            continue
+        phase = ", ".join(sorted(tags)) or head.group(1)
+        problems.append(
+            f"{MICROBENCH}/answers answers design item P{n} ({phase}) without a tuned matched "
+            f"row of that phase or an open ledger question: cite the tuned matched rows "
+            f"(p.phase={phase}, tuned, two or more variants) that rank the designs of the phase, "
+            f"or open a question in {LEDGER} with a range for each other design and cite its tag")
+    return problems
+
+
 def check(workspace: Path, build: bool = False) -> list[str]:
     plan = newest_plan(workspace)
     if plan is None:
@@ -636,6 +756,7 @@ def check(workspace: Path, build: bool = False) -> list[str]:
         if missing:
             problems.append(f"{answer.relative_to(workspace)} does not answer plan claims "
                             f"{', '.join(missing)} (see {MICROBENCH}/items/{round_name}.md)")
+        problems += design_problems(workspace, items, text)
         problems += check_ledger(workspace, round_name, text)
     space = workspace / "progress/design-space.md"
     if space.is_file() and f"### {round_name}" not in space.read_text():

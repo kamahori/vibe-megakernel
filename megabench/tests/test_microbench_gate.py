@@ -30,6 +30,15 @@ PAST_REJECTIONS = [
 ]
 
 
+DESIGNS_TASK = (
+    "Rebuild the GEMM phases.\n\nDesigns:\n"
+    "| phase | design | decomposition | ingress | rows |\n"
+    "|---|---|---|---|---|\n"
+    "| E2 | tcgen05 swap-AB | stream-K, TMEM accumulator | cp.async ring 4 | 6ddb22f9a6 |\n"
+    "| E3/E5 | mma.sync swap-AB | warp split-K, red.add | ldg128 | |\n"
+    "\nThen run the check.")
+
+
 class PlanItemTests(unittest.TestCase):
     def test_past_tensor_core_rejections_become_items(self) -> None:
         for plan in PAST_REJECTIONS:
@@ -40,6 +49,19 @@ class PlanItemTests(unittest.TestCase):
 
     def test_plan_without_rejections_has_no_items(self) -> None:
         self.assertEqual(plan_items({"reasoning": "Profile first. The parent is HEAD."}), [])
+
+    def test_designs_table_rows_become_items_first(self) -> None:
+        plan = dict(PAST_REJECTIONS[2], task=DESIGNS_TASK)
+        items = plan_items(plan)
+        self.assertTrue(items[0].startswith("Design of E2: tcgen05 swap-AB (stream-K"), items)
+        self.assertTrue(items[1].startswith("Design of E3/E5: mma.sync"), items)
+        self.assertTrue(any("tcgen05/tensor-core GEMM" in i for i in items[2:]), items)
+        self.assertEqual(len(microbench_gate.plan_designs(plan)), 2)
+
+    def test_task_without_designs_table_asks_for_one(self) -> None:
+        items = plan_items({"task": "Fuse the residual into the down epilogue."})
+        self.assertEqual(items, [microbench_gate.NO_DESIGNS])
+        self.assertIsNone(microbench_gate.plan_designs({"task": "| a | b |\n| 1 | 2 |"}))
 
 
 class GateTests(unittest.TestCase):
@@ -67,6 +89,41 @@ class GateTests(unittest.TestCase):
             self.assertIn("P1", check(ws)[0])
             n = items.count("- P")
             (mb / "answers/round-0002.md").write_text(" ".join(f"P{i}" for i in range(1, n + 1)))
+            self.assertEqual(check(ws), [])
+
+    def test_design_items_need_rows_of_their_phase_or_an_open_question(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            (ws / "progress/plans").mkdir(parents=True)
+            plan = {"task": DESIGNS_TASK, "reasoning": "The parent is HEAD."}
+            (ws / "progress/plans/round-0002.json").write_text(json.dumps(plan))
+            mb = ws / "progress/microbench"
+            for kind in ("requests", "answers"):
+                (mb / kind).mkdir(parents=True)
+                (mb / kind / "round-0002.md").write_text("- q\n")
+            (ws / "progress/engine-map.md").write_text("## Status\n### round-0002\n")
+            answers = mb / "answers/round-0002.md"
+            # Named, but with no evidence that can rank the phase.
+            answers.write_text("## P1\nThe draft says so.\n## P2\nAlso.\n")
+            problems = check(ws)
+            self.assertEqual(len(problems), 2, problems)
+            self.assertIn("design item P1 (E2)", problems[0])
+            self.assertIn("design item P2 (E3, E5)", problems[1])
+            # A matched row of another phase does not answer E2; one of E2 does.
+            (mb / "primdb_local.jsonl").write_text("".join(json.dumps(
+                {"id": i, "params": {"engine": "tcgen05_swapab", "phase": p},
+                 "source": {"round": "round-0002", "conditions": "matched"}}) + "\n"
+                for i, p in (("aaaaaaaaaa", "E4"), ("bbbbbbbbbb", "E2"))))
+            answers.write_text("## P1\nRanked by aaaaaaaaaa.\n## P2\nOpen.\n")
+            self.assertIn("design item P1", check(ws)[0])
+            answers.write_text("## P1\nRanked by bbbbbbbbbb.\n## P2\nOpen, Q3.\n")
+            self.assertIn("design item P2", " ".join(check(ws)), "Q3 is not in the ledger")
+            (mb / "open.md").write_text("## Q3 · open · opened round-0002\n")
+            # The open question adds its own item (P3).
+            answers.write_text("## P1\nRanked by bbbbbbbbbb.\n## P2\nOpen, Q3.\n## P3\nQ3.\n")
+            self.assertEqual(check(ws), [])
+            # Answers without headings: the text after the tag answers it.
+            answers.write_text("P1: bbbbbbbbbb ranks it. P2: see Q3. P3: Q3.\n")
             self.assertEqual(check(ws), [])
 
     def test_round_skipped_by_the_framework_needs_no_files(self) -> None:

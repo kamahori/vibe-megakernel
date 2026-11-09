@@ -13,7 +13,8 @@ choose engines, instruction shapes and data paths from evidence and not from gue
 Inputs:
 - the request file that the caller names, `progress/microbench/requests/<round>.md`;
 - the plan claims, `progress/microbench/items/<round>.md` (run `./microbench_items` if it is
-  missing): rejected alternatives and sentences that rule a design out, tagged P1, P2, ...;
+  missing): the design that the plan selects for each phase (items that start with `Design
+  of`), rejected alternatives and sentences that rule a design out, tagged P1, P2, ...;
 - the plan itself, the newest profile or timeline under `progress/` and `reports/`,
   `progress/engine-map.md`, and the open-question ledger `progress/microbench/open.md`.
 
@@ -37,6 +38,12 @@ the data and what it shows, with its conditions.
    occupancy, the cache state, and the metric. For a plan claim, find the cost comparison the
    claim makes or implies (for example, an engine that "does not pay off" for a phase implies
    that its time at that phase's shape is not lower), and settle that comparison.
+   A `Design of <phase>` item is a selection: it claims that its design (engine,
+   decomposition, ingress) is the fastest of the designs that the engine map and the hardware
+   allow for that phase. Answer it in its own section with the tuned matched rows of that
+   phase (`p.phase` carries its tags) that rank the designs, or, when no such rows exist yet,
+   with an open ledger question that prices the other designs, cited by its Q tag.
+   `./microbench_check` refuses a design answer that cites neither.
 2. Query the database first:
    - `./engine_map M=.. N=.. K=..` lists the legal instruction mappings of a matrix-multiply
      phase with their measured rates and the nearest measured phase rows.
