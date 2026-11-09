@@ -159,6 +159,11 @@ decomposition of the phase, and the comparison is between those decompositions.
 - A comparison across different padding, ingress path, CTA count, cache state or tuning level is
   a hint, not an answer. Record it in the ledger as open until a matched pair exists. A row whose
   params say `tuned: false` is an upper bound on what that engine takes.
+- Only tuned rows decide. Set `p.tuned=true` only on rows of a design that you swept at that
+  phase: at least two variants of the knobs its engine allows (stage depth, ingress path, tile
+  and CTA shape, split of the reduction), each added as a matched row. The gate counts a design
+  in an engine comparison, and in the ranking that the build record follows, only through such
+  rows. A comparison with an untuned side stays open in the ledger.
 - The share of profile samples in an engine's math does not price the engine. Price it by the
   whole-design time, including the phases, reductions and barriers that its design removes.
 - For tensor-core proxies, start from `primbench/tc_mma.cu` (instruction issue, descriptors, TMEM

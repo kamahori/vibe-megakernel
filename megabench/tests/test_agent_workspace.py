@@ -250,10 +250,12 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertIn("deferred: <reason> <row ids>", (project / "TASK.md").read_text())
             self.assertIn("lower bound", (project / "TASK.md").read_text())
             (project / "progress/microbench/primdb_local.jsonl").write_text("".join(json.dumps(
-                {"id": i, "params": {"engine": e, "phase": "E1"}, "metrics": {"us": us}, "source": {"round": "round-0001", "question": "Q1",
-                                                              "conditions": "matched"}}) + "\n"
+                {"id": i, "params": {"engine": e, "phase": "E1", "tuned": True}, "metrics": {"us": us},
+                 "source": {"round": "round-0001", "question": "Q1", "conditions": "matched"}}) + "\n"
+                # Each design is a tuned sweep of two variants.
                 for i, e, us in (("eeeeeeeeee", "mma_sync_a", 6.0), ("eeeeeeeeef", "tcgen05_b", 4.0),
-                                 ("eeeeeeeeeg", "simt_c", 20.0))))
+                                 ("eeeeeeeeeg", "simt_c", 20.0), ("eeeeeeeee0", "mma_sync_a", 6.5),
+                                 ("eeeeeeeee1", "tcgen05_b", 4.5), ("eeeeeeeee2", "simt_c", 21.0))))
             (project / "progress/microbench/answers/round-0001.md").write_text(
                 "P1 P2: rows ...\n## Q1\neeeeeeeeee\n")
             with (project / "progress/engine-map.md").open("a") as f:

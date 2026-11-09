@@ -211,11 +211,29 @@ def family_of(design: str, families: list[str]) -> str | None:
     return None
 
 
+def tuned_rows(rows: list[dict]) -> list[dict]:
+    """The rows among *rows* that may decide an engine comparison or a build.
+
+    A row counts when its params say `tuned: true` and its design has at least two matched
+    rows for the same question or phase (the variants of a sweep). An untuned arm is an upper
+    bound on its engine: it can show that the engine is fast, never that it is slow.
+    """
+    def key(r: dict) -> tuple:
+        src, par = r.get("source") or {}, r.get("params") or {}
+        return design_of(r), src.get("question") or par.get("phase")
+    counts: dict[tuple, int] = {}
+    for r in rows:
+        if (r.get("source") or {}).get("conditions") == "matched" and design_of(r):
+            counts[key(r)] = counts.get(key(r), 0) + 1
+    return [r for r in rows if (r.get("params") or {}).get("tuned") is True
+            and design_of(r) and counts.get(key(r), 0) >= 2]
+
+
 def matched_comparison(workspace: Path, question: str, round_name: str) -> set[str]:
     """Ids of the matched rows for *question* in *round_name*, if they compare two designs.
 
-    A matched measurement compares designs under the same conditions, so the rows must
-    cover at least two designs; matched rows of one design alone are not a comparison.
+    A matched measurement compares tuned designs under the same conditions (see tuned_rows),
+    so the tuned rows must cover at least two designs; matched rows of one design alone are not a comparison.
     The question seeded from the engine map compares engines, so its rows must cover every
     engine family that the engine map lists, as its `settles it` line says; variants of one
     engine are not an engine comparison.
@@ -231,7 +249,8 @@ def matched_comparison(workspace: Path, question: str, round_name: str) -> set[s
     picked = [r for r in rows if (r.get("source") or {}).get("question") == question
               and (r.get("source") or {}).get("conditions") == "matched"
               and (r.get("source") or {}).get("round") == round_name]
-    designs = {d for d in map(design_of, picked) if d}
+    # Only tuned designs compare: an untuned arm that loses does not show its engine loses.
+    designs = {d for d in map(design_of, tuned_rows(picked)) if d}
     if len(designs) < 2:
         return set()
     seeded = any(e["tag"] == question and e["opened"] == SEEDED for e in ledger(workspace))
@@ -437,12 +456,13 @@ def matched_phase_rows(workspace: Path) -> list[tuple[str, str, float, str]]:
     """(phase tag, design, us, id) of each matched row with `p.phase` and `m.us`.
 
     Rows count when `./primdb add` stored them with `--conditions matched`, a design
-    (not an oracle), `p.phase` and the phase time `m.us`.
+    (not an oracle), `p.phase` and the phase time `m.us`, and they are tuned (tuned_rows).
     """
     out = []
-    for row_id, row in local_rows(workspace).items():
-        if (row.get("source") or {}).get("conditions") != "matched":
-            continue
+    rows = [r for r in local_rows(workspace).values()
+            if (r.get("source") or {}).get("conditions") == "matched"]
+    for row in tuned_rows(rows):
+        row_id = row.get("id", "?")
         design = design_of(row)
         phase = (row.get("params") or {}).get("phase")
         us = (row.get("metrics") or {}).get("us")
@@ -527,6 +547,9 @@ def check_build(workspace: Path, round_name: str) -> list[str]:
         return (family_of(name, families) if families else None) or _norm(name)
 
     for tag, (design, us, row_id) in sorted(ranking.items()):
+        if len({family(d) for t, d, _, _ in rows if t == tag}) < 2:
+            # One engine family tuned at this phase: nothing to rank it against yet.
+            continue
         if tag not in built:
             problems.append(f"{rel} has no row for phase {tag}, which has matched rows: name the "
                             "design the candidate computes it in")

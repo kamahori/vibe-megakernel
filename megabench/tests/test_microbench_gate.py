@@ -7,6 +7,9 @@ import unittest
 from pathlib import Path
 
 from megabench import primdb
+from unittest import mock
+
+from megabench.integrations import microbench_gate
 from megabench.integrations.microbench_gate import check, plan_items
 from megabench.primdb import engine_map, phases
 
@@ -40,6 +43,12 @@ class PlanItemTests(unittest.TestCase):
 
 
 class GateTests(unittest.TestCase):
+    # These tests write one row per design; TunedTests covers which rows count as tuned.
+    def setUp(self) -> None:
+        patcher = mock.patch.object(microbench_gate, "tuned_rows", lambda rows: list(rows))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_gate_needs_files_answers_and_map_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             ws = Path(directory)
@@ -363,6 +372,10 @@ class GateTests(unittest.TestCase):
             # Every phase with matched rows needs a row in the record.
             timed(("alpha_one_plain", "E1", 4.0, "matched"), ("beta_split", "E2", 3.0, "matched"),
                   ("gamma_ffma", "E1", 9.0, "matched"))
+            # A phase with one engine family measured has nothing to rank against.
+            self.assertEqual(check(ws, build=True), [])
+            timed(("alpha_one_plain", "E1", 4.0, "matched"), ("beta_split", "E2", 3.0, "matched"),
+                  ("gamma_ffma", "E1", 9.0, "matched"), ("gamma_ffma", "E2", 5.0, "matched"))
             self.assertIn("no row for phase E2", " ".join(check(ws, build=True)))
             record.write_text(head)
             self.assertIn("no phase rows", " ".join(check(ws, build=True)))
@@ -377,6 +390,51 @@ class GateTests(unittest.TestCase):
             check(ws)
             items = (ws / "progress/microbench/items/round-0002.md").read_text()
             self.assertIn("- P1: The plan chose its target over the open questions Q4", items)
+
+
+class TunedTests(unittest.TestCase):
+    """Only tuned rows (tuned: true, a design with a sweep of two or more matched rows)
+    settle an engine comparison or force the build of a phase."""
+
+    def test_untuned_side_does_not_settle_or_force(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            mb = ws / "progress/microbench"
+            (ws / "progress/plans").mkdir(parents=True)
+            (ws / "progress/plans/round-0001.json").write_text(json.dumps({"reasoning": "Go."}))
+            for kind in ("requests", "answers"):
+                (mb / kind).mkdir(parents=True)
+                (mb / kind / "round-0001.md").write_text("- q\n")
+            (ws / "progress/engine-map.md").write_text(
+                "| engine | mapping |\n|---|---|\n| alpha | x |\n| beta | y |\n\n### round-0001\n")
+            (mb / "open.md").write_text("## Q1 · open · opened round-0000\n")
+            (mb / "build").mkdir()
+            (mb / "build/round-0001.md").write_text(
+                "| phase | built | notes |\n|---|---|---|\n| E1 | beta_split | |\n")
+
+            def rows(*specs):
+                (mb / "primdb_local.jsonl").write_text("".join(json.dumps(
+                    {"id": f"{k:010d}", "params": {"engine": e, "phase": "E1", "tuned": t},
+                     "metrics": {"us": us},
+                     "source": {"round": "round-0001", "question": "Q1", "conditions": "matched"}})
+                    + "\n" for k, (e, us, t) in enumerate(specs)))
+                (mb / "answers/round-0001.md").write_text(
+                    "P1\n## Q1\n" + " ".join(f"{k:010d}" for k in range(len(specs))) + "\n")
+
+            # alpha is tuned (a sweep of two), beta is not: no comparison, no forced build.
+            rows(("alpha_a", 4.0, True), ("alpha_a", 4.5, True), ("beta_split", 6.0, False))
+            problems = check(ws, build=True)
+            self.assertIn("Q1 has gone longest", " ".join(problems))
+            self.assertNotIn("fastest matched row", " ".join(problems))
+            # A tuned flag on one row without a sweep does not count either.
+            rows(("alpha_a", 4.0, True), ("alpha_a", 4.5, True), ("beta_split", 6.0, True))
+            self.assertIn("Q1 has gone longest", " ".join(check(ws, build=True)))
+            # Both tuned with sweeps: the comparison settles and the build follows it.
+            rows(("alpha_a", 4.0, True), ("alpha_a", 4.5, True), ("beta_split", 6.0, True),
+                 ("beta_split", 6.5, True))
+            problems = check(ws, build=True)
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn("fastest matched row is 0000000000", problems[0])
 
 
 class EngineMapTests(unittest.TestCase):

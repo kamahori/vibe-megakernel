@@ -104,7 +104,12 @@ class HarvestTests(unittest.TestCase):
 
 class ReuseTests(unittest.TestCase):
     def test_reused_rows_count_as_this_rounds_matched_comparison(self) -> None:
+        from ..integrations import microbench_gate
         from ..integrations.make_agent_workspace import seeded_ledger
+        # Reuse, not tuning, is under test here (test_microbench_gate.TunedTests covers that).
+        stub = patch.object(microbench_gate, "tuned_rows", lambda rows: list(rows))
+        stub.start()
+        self.addCleanup(stub.stop)
         with tempfile.TemporaryDirectory() as directory:
             ws = Path(directory)
             mb = ws / "progress/microbench"
