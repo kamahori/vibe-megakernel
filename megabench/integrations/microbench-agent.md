@@ -121,8 +121,14 @@ the data and what it shows, with its conditions.
    that only hint). `./check_candidate` names that question when it is due.
    A matched row that measures a whole phase of the engine map carries the phase tag of the
    engine map as `p.phase` (for example the tag of its section) and the phase time in
-   microseconds as `m.us`, and names its design in `p.engine`. `./check_candidate` builds each
-   tagged phase in the design of its fastest matched row.
+   microseconds as `m.us`, and names its design in `p.engine` and `p.decomp`. `p.decomp` is a
+   short name for the decomposition (for example `output_tile`, `split_k_warp_redadd`,
+   `stream_k_redadd`); use the same name for each row of that decomposition. The gate treats
+   two decompositions of one engine as two designs. A row with the same params as another
+   (except `tuned`, `rep`, `seed`, `run`, `trial`, `notes`) is a repeat: put `p.rep` on
+   repeats, and keep a knob that differs on variants. The noise of a phase is the spread of
+   its repeats only. `./check_candidate` builds each tagged phase in the design of its
+   fastest matched row.
 
 The workspace seeds the ledger with one question opened `round-0000`: which engine design
 wins each dominant phase of the engine map. It cannot be deferred, so round 1 measures it:
@@ -167,8 +173,10 @@ decomposition of the phase, and the comparison is between those decompositions.
   a hint, not an answer. Record it in the ledger as open until a matched pair exists. A row whose
   params say `tuned: false` is an upper bound on what that engine takes.
 - Only tuned rows decide. Set `p.tuned=true` only on rows of a design that you swept at that
-  phase: at least two variants of the knobs its engine allows (stage depth, ingress path, tile
-  and CTA shape, split of the reduction), each added as a matched row. The gate counts a design
+  phase: at least two variants of the knobs its decomposition allows (stage depth, ingress
+  path, tile and CTA shape, split size), each added as a matched row with a different value of
+  that knob. Repeats of one setup are not a sweep, and each decomposition (`p.decomp`) needs
+  its own sweep. The gate counts a design
   in an engine comparison, and in the ranking that the build record follows, only through such
   rows. A comparison with an untuned side stays open in the ledger.
 - The share of profile samples in an engine's math does not price the engine. Price it by the

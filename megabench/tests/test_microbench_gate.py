@@ -490,15 +490,21 @@ class TunedTests(unittest.TestCase):
             (mb / "build/round-0001.md").write_text(
                 "| phase | built | notes |\n|---|---|---|\n| E1 | beta_split | |\n")
 
-            def rows(*specs):
+            def rows(*specs, repeat=False):
+                # Each row is another variant (stage depth) unless *repeat*.
                 (mb / "primdb_local.jsonl").write_text("".join(json.dumps(
-                    {"id": f"{k:010d}", "params": {"engine": e, "phase": "E1", "tuned": t},
+                    {"id": f"{k:010d}", "params": {"engine": e, "phase": "E1", "tuned": t,
+                                                   "stages": 1 if repeat else k},
                      "metrics": {"us": us},
                      "source": {"round": "round-0001", "question": "Q1", "conditions": "matched"}})
                     + "\n" for k, (e, us, t) in enumerate(specs)))
                 (mb / "answers/round-0001.md").write_text(
                     "P1\n## Q1\n" + " ".join(f"{k:010d}" for k in range(len(specs))) + "\n")
 
+            # Two repeats of one setup are not a sweep.
+            rows(("alpha_a", 4.0, True), ("alpha_a", 4.5, True), ("beta_split", 6.0, True),
+                 ("beta_split", 6.5, True), repeat=True)
+            self.assertIn("Q1 has gone longest", " ".join(check(ws, build=True)))
             # alpha is tuned (a sweep of two), beta is not: no comparison, no forced build.
             rows(("alpha_a", 4.0, True), ("alpha_a", 4.5, True), ("beta_split", 6.0, False))
             problems = check(ws, build=True)
@@ -564,7 +570,43 @@ class RankingTests(unittest.TestCase):
             problems = self.build(ws, "mma.sync swap-AB split-K")
             self.assertEqual(len(problems), 1, problems)
             self.assertIn("2.0% slower (noise 2.0%)", problems[0])
-            self.assertEqual(self.build(ws, "tcgen05 swap-AB stream-K"), [])
+            self.assertEqual(self.build(ws, "tcgen05 swap-AB stream-K, red.add"), [])
+
+    def test_decompositions_of_one_engine_are_two_designs(self) -> None:
+        mma = [r for r in ARCH_E2 if not r[0].startswith("tcgen05")]
+        # A second full-K variant makes full-K a tuned design too.
+        mma.append(("mma_sync_swapab", "output_tile", {"ksl": 1024, "stages": 2}, 23.5, True))
+        with tempfile.TemporaryDirectory() as directory:
+            ws = self.workspace(directory, mma + [("simt_ffma", "split_k_warp_redadd",
+                                                   {"ksl": k}, us, True)
+                                                  for k, us in ((128, 36.8), (256, 47.6))])
+            self.assertEqual(microbench_gate.phase_ranking(ws)["E2"][0],
+                             "mma_sync_swapab/split_k_warp_redadd")
+            # The fastest family, in its 3.6x slower decomposition: the engine alone passed.
+            problems = self.build(ws, "mma.sync swap-AB full-K output tile")
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn("fastest decomposition is split_k_warp_redadd", problems[0])
+            self.assertIn("output_tile", problems[0])
+            # The engine without its decomposition is not a design.
+            self.assertIn("does not name its decomposition", self.build(ws, "mma.sync swap-AB")[0])
+            self.assertEqual(self.build(ws, "mma.sync swap-AB warp split-K, red.add"), [])
+            # A deferral with a reason and rows holds for one round.
+            notes = "deferred: full-K first, split-K next round 0000000001"
+            self.assertEqual(self.build(ws, "mma.sync full-K output tile", notes), [])
+            (ws / "progress/microbench/build/round-0001.md").rename(
+                ws / "progress/microbench/build/round-0000.md")
+            self.assertIn("deferred in round-0000 too",
+                          self.build(ws, "mma.sync full-K output tile", notes, "round-0002")[0])
+
+    def test_one_row_of_a_decomposition_is_not_a_sweep(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ws = self.workspace(directory)
+            rows = [r for r in microbench_gate.local_rows(ws).values()
+                    if r["source"]["conditions"] == "matched"]
+            tuned = {microbench_gate.design_of(r) for r in microbench_gate.tuned_rows(rows)}
+            # Full-K was measured once (24.09 us); before, the split-K sweep made it "tuned".
+            self.assertEqual(tuned, {"mma_sync_swapab/split_k_warp_redadd",
+                                     "tcgen05_swapab/stream_k_redadd"})
 
 
 class EngineMapTests(unittest.TestCase):

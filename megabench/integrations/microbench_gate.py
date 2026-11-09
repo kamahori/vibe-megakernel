@@ -24,7 +24,9 @@ makes (not its draft, progress/microbench/draft/<round>.json) and that cites no 
 next round's phase (progress/microbench/carried/<round>.md). A plan claim that cites a row id
 that the round's answers also cite counts as answered. ./check_candidate runs `check --build` first and stops on a failure:
 --build also needs progress/microbench/build/<round>.md, the design each phase is built in; each
-engine-map phase with matched rows (p.phase, m.us) is built in the family of its fastest row.
+engine-map phase with matched rows (p.phase, m.us) is built in the family of its fastest row, and in
+that family's fastest decomposition (p.decomp) when the rows measure two or more. A design is
+its engine and its decomposition; the noise of a phase is the spread of its true repeats.
 """
 
 from __future__ import annotations
@@ -245,16 +247,45 @@ def local_sources(workspace: Path) -> list[tuple[str, dict]]:
     return out
 
 
-def design_of(row: dict) -> str | None:
-    """The design a row measures: its engine, else its arm, else its primitive.
+DECOMP_KEYS = ("decomp", "partition")  # the param that names a row's decomposition, in order
 
-    Rows that only load and synchronise (an oracle) set a floor; they are not a design.
-    """
+
+def _design_name(row: dict) -> str | None:
     params = row.get("params") or {}
     name = params.get("engine") or params.get("arm") or row.get("primitive")
-    if not name or str(name).lower().startswith("oracle"):
+    return str(name) if name else None
+
+
+def is_floor(row: dict) -> bool:
+    """A row that only loads and synchronises (an oracle): it sets a floor, not a design."""
+    name = _design_name(row)
+    return bool(name) and name.lower().startswith("oracle")
+
+
+def design_of(row: dict) -> str | None:
+    """The design a row measures: its engine (else its arm, else its primitive), then
+    `/<decomposition>` when `p.decomp` (else `p.partition`) names one.
+
+    Two decompositions of one engine are two designs: at archC16 E2, mma.sync with a full-K
+    output tile took 24.09 us and with warp split-K 6.67 us. Rows that only load and
+    synchronise (an oracle) set a floor; they are not a design.
+    """
+    name = _design_name(row)
+    if not name or is_floor(row):
         return None
-    return str(name)
+    params = row.get("params") or {}
+    decomp = next((params[k] for k in DECOMP_KEYS if params.get(k)), None)
+    return f"{name}/{decomp}" if decomp else name
+
+
+def engine_of(design: str) -> str:
+    """The engine part of a design name (design_of): the text before `/`."""
+    return design.split("/", 1)[0]
+
+
+def decomp_of(design: str) -> str | None:
+    """The decomposition part of a design name (design_of), if it has one."""
+    return design.split("/", 1)[1] if "/" in design else None
 
 
 def _norm(name: str) -> str:
@@ -272,7 +303,7 @@ def engine_families(workspace: Path) -> list[str]:
 
 def family_of(design: str, families: list[str]) -> str | None:
     """The engine-map family whose name begins the design name, the longest match first."""
-    d = _norm(design)
+    d = _norm(engine_of(design))
     for f in sorted(families, key=lambda f: -len(_norm(f))):
         if d.startswith(_norm(f)):
             return f
@@ -282,19 +313,21 @@ def family_of(design: str, families: list[str]) -> str | None:
 def tuned_rows(rows: list[dict]) -> list[dict]:
     """The rows among *rows* that may decide an engine comparison or a build.
 
-    A row counts when its params say `tuned: true` and its design has at least two matched
-    rows for the same question or phase (the variants of a sweep). An untuned arm is an upper
-    bound on its engine: it can show that the engine is fast, never that it is slow.
+    A row counts when its params say `tuned: true` and its design (engine and decomposition,
+    design_of) has matched rows of at least two setups for the same question or phase (the
+    variants of a sweep: another stage depth, ingress, tile or split size). Repeats of one
+    setup are not a sweep. An untuned arm is an upper bound on its engine: it can show that the
+    engine is fast, never that it is slow.
     """
     def key(r: dict) -> tuple:
         src, par = r.get("source") or {}, r.get("params") or {}
         return design_of(r), src.get("question") or par.get("phase")
-    counts: dict[tuple, int] = {}
+    setups: dict[tuple, set[str]] = {}
     for r in rows:
         if (r.get("source") or {}).get("conditions") == "matched" and design_of(r):
-            counts[key(r)] = counts.get(key(r), 0) + 1
+            setups.setdefault(key(r), set()).add(setup_of(r))
     return [r for r in rows if (r.get("params") or {}).get("tuned") is True
-            and design_of(r) and counts.get(key(r), 0) >= 2]
+            and design_of(r) and len(setups.get(key(r), ())) >= 2]
 
 
 def matched_comparison(workspace: Path, question: str, round_name: str) -> set[str]:
@@ -526,7 +559,9 @@ def check_ledger(workspace: Path, round_name: str, answers: str) -> list[str]:
 
 BUILD = MICROBENCH / "build"
 BUILD_HELP = ("one table row per phase of the candidate: | phase | design built | notes |, where "
-              "the phase cell names the engine-map tags (E1, E2, ...) that the phase computes")
+              "the phase cell names the engine-map tags (E1, E2, ...) that the phase computes and "
+              "the design cell names the engine, then the decomposition in the words of its "
+              "rows' p.decomp (for example `tcgen05 swap-AB, stream_k_redadd`)")
 PHASE_TAG = re.compile(r"\bE\d+\b")
 
 
@@ -622,10 +657,14 @@ def check_build(workspace: Path, round_name: str) -> list[str]:
 
     Each engine-map phase with matched rows is built in the engine family of its fastest
     matched row, or in a family whose own fastest matched row is within the noise of it.
-    Otherwise the notes cell of the phase defers the rebuild with `deferred:`, the reason and
-    the row ids it rests on. A phase deferred in the previous round's record cannot be
-    deferred again. A design that the implementer prefers becomes the fastest by its own
-    matched rows, not by a claim.
+    Inside the family it is built in, when the rows measure two or more decompositions
+    (design_of), the design cell names the decomposition (the words of its `p.decomp` or
+    `p.partition` value) whose fastest row is within the noise of the family's fastest row:
+    the engine alone does not make a design (archC16 E2: mma.sync full-K 24.09 us, split-K
+    6.67 us). Otherwise the notes cell of the phase defers the rebuild with `deferred:`, the
+    reason and the row ids it rests on. A phase deferred in the previous round's record
+    cannot be deferred again. A design that the implementer prefers becomes the fastest by its
+    own matched rows, not by a claim.
     """
     ranking = phase_ranking(workspace)
     path = workspace / BUILD / f"{round_name}.md"
@@ -642,43 +681,90 @@ def check_build(workspace: Path, round_name: str) -> list[str]:
     problems = []
 
     def family(name: str) -> str:
-        return (family_of(name, families) if families else None) or _norm(name)
+        return (family_of(name, families) if families else None) or _norm(engine_of(name))
 
-    for tag, (design, us, row_id) in sorted(ranking.items()):
-        if len({family(r.design) for r in rows if r.tag == tag}) < 2:
-            # One engine family tuned at this phase: nothing to rank it against yet.
-            continue
-        if tag not in built:
-            problems.append(f"{rel} has no row for phase {tag}, which has matched rows: name the "
-                            "design the candidate computes it in")
-            continue
-        name, notes = built[tag]
-        if family(name) == family(design):
-            continue
+    def family_problem(tag: str, name: str, design: str, us: float, row_id: str,
+                       noise: float) -> str | None:
         own = [r.us for r in rows if r.tag == tag and family(r.design) == family(name)]
-        noise = phase_noise(rows, tag)
-        if own and (min(own) - us) / us <= noise:
-            continue
+        if family(name) == family(design) or (own and (min(own) - us) / us <= noise):
+            return None
         gap = (f"its own fastest matched row is {min(own):g} us, {100 * (min(own) - us) / us:.1f}% "
                f"slower (noise {100 * noise:.1f}%)" if own else "it has no matched row for it")
+        return (f"{rel}: phase {tag} is built in {name}, but its fastest matched row is "
+                f"{row_id} ({design}, {us:g} us) and {gap}. Build {tag} in that design's engine "
+                "family (the verified proxies under progress/microbench/bench/ are a start), or "
+                "measure your design under matched conditions with p.phase="
+                f"{tag} (its rows then decide), or write `deferred: <reason> <row ids>` in the "
+                "notes cell of the phase (one round only)")
+
+    def decomp_problem(tag: str, name: str, noise: float) -> str | None:
+        best: dict[str, PhaseRow] = {}
+        for r in rows:
+            k = decomp_of(r.design)
+            if r.tag == tag and k and family(r.design) == family(name):
+                if k not in best or r.us < best[k].us:
+                    best[k] = r
+        if len(best) < 2:
+            return None
+        top = min(best.values(), key=lambda r: r.us)
+        named = decomp_named(name, list(best))
+        slugs = ", ".join(f"{k} ({best[k].us:g} us, {best[k].id})"
+                          for k in sorted(best, key=lambda k: best[k].us))
+        if named is None:
+            return (f"{rel}: phase {tag} is built in {name}, which does not name its "
+                    f"decomposition; the matched rows of its engine family measure {slugs}. Name "
+                    f"the decomposition built (the words of its p.decomp) in the design cell")
+        gap = (best[named].us - top.us) / top.us
+        if gap <= noise:
+            return None
+        return (f"{rel}: phase {tag} is built in {name} ({named}, fastest matched row "
+                f"{best[named].id}, {best[named].us:g} us), but its engine family's fastest "
+                f"decomposition is {decomp_of(top.design)} ({top.id}, {top.us:g} us), "
+                f"{100 * gap:.1f}% faster (noise {100 * noise:.1f}%). Build {tag} in that "
+                "decomposition, or measure yours tuned under matched conditions with p.phase="
+                f"{tag} and p.decomp (its rows then decide), or write `deferred: <reason> "
+                "<row ids>` in the notes cell of the phase (one round only)")
+
+    for tag, (design, us, row_id) in sorted(ranking.items()):
+        ranked = len({family(r.design) for r in rows if r.tag == tag}) >= 2
+        if tag not in built:
+            if ranked:
+                problems.append(f"{rel} has no row for phase {tag}, which has matched rows: name "
+                                "the design the candidate computes it in")
+            continue
+        name, notes = built[tag]
+        noise = phase_noise(rows, tag)
+        # One engine family tuned at this phase: no family to rank it against yet, but the
+        # decompositions of that family still rank.
+        problem = (family_problem(tag, name, design, us, row_id, noise) if ranked else None) \
+            or decomp_problem(tag, name, noise)
+        if problem is None:
+            continue
         deferral = DEFERRED.search(notes)
         if deferral and ROW_ID.search(deferral.group(1)) and len(ROW_ID.sub("", deferral.group(1)).strip(" ,;.:-")) > 0:
             if tag in previous and DEFERRED.search(previous[tag][1]):
                 problems.append(
                     f"{rel}: phase {tag} was deferred in {earlier[-1].stem} too. Build it in the "
-                    f"family of {row_id} ({design}, {us:g} us) this round, or measure your design "
+                    f"design of {row_id} ({design}, {us:g} us) this round, or measure your design "
                     f"under matched conditions with p.phase={tag}; its rows then decide")
             continue
-        problems.append(
-            f"{rel}: phase {tag} is built in {name}, but its fastest matched row is "
-            f"{row_id} ({design}, {us:g} us) and {gap}. Build {tag} in that design's engine "
-            "family (the verified proxies under progress/microbench/bench/ are a start), or "
-            "measure your design under matched conditions with p.phase="
-            f"{tag} (its rows then decide), or write `deferred: <reason> <row ids>` in the "
-            "notes cell of the phase (one round only)")
+        problems.append(problem)
     if not built:
         problems.append(f"{rel} has no phase rows: write {BUILD_HELP}")
     return problems
+
+
+def _words(text: str) -> list[str]:
+    return [w for w in re.split(r"[^a-z0-9]+", text.lower()) if w]
+
+
+def decomp_named(cell: str, decomps: list[str]) -> str | None:
+    """The decomposition among *decomps* that a build-record cell names: every word of it
+    appears in the cell (split_k_warp_redadd: "warp split-K, red.add"). With two, the one
+    with the most words."""
+    words = _norm(cell)
+    hits = [k for k in decomps if _words(k) and all(w in words for w in _words(k))]
+    return max(hits, key=lambda k: (len(_words(k)), len(k))) if hits else None
 
 
 def _item_section(text: str, n: int) -> str:
