@@ -22,6 +22,8 @@ exec "$@"
 FAKE_JOB = """
 import json, os, sys
 request = json.load(open(sys.argv[3]))
+if request["env"].get("STARTED"):  # gpu_job.py writes this file when the job starts
+    open(sys.argv[3].rsplit(".", 1)[0] + ".gpu", "w").write("0")
 os.chdir(request["cwd"])
 os.execvpe(request["argv"][0], request["argv"], request["env"])
 """
@@ -57,9 +59,10 @@ class BrokerTests(unittest.TestCase):
         self.server.wait()
         self.tmp.cleanup()
 
-    def client(self, *command: str, **kwargs) -> subprocess.CompletedProcess:
+    def client(self, *command: str, extra_env: dict | None = None,
+               **kwargs) -> subprocess.CompletedProcess:
         env = os.environ | {"PYTHONPATH": str(REPO), "ANTHROPIC_API_KEY": "secret",
-                            "MARK": "kept"}
+                            "MARK": "kept"} | (extra_env or {})
         return subprocess.run(
             [sys.executable, "-m", "megabench.integrations.gpu_broker", "run",
              "--socket", str(self.socket), "--", *command],
@@ -92,6 +95,21 @@ class BrokerTests(unittest.TestCase):
         time.sleep(7)
         self.assertFalse(marker.exists())
         self.assertEqual(self.client("true", timeout=60).returncode, 0)
+
+    def wait_s(self) -> float:
+        path = self.socket.parent / "queue_wait_s"
+        return float(path.read_text()) if path.exists() else 0.0
+
+    def test_queue_wait_counts_only_jobs_that_did_not_start(self) -> None:
+        sleep = [sys.executable, "-c", "import time; time.sleep(7)"]
+        out = self.client(*sleep, extra_env={"STARTED": "1"}, timeout=60)
+        self.assertEqual(out.returncode, 0)
+        time.sleep(6)
+        self.assertLess(self.wait_s(), 3)
+        out = self.client(*sleep, timeout=60)  # never writes .gpu: it waits in the "queue"
+        self.assertEqual(out.returncode, 0)
+        time.sleep(6)
+        self.assertGreaterEqual(self.wait_s(), 5)
 
 
 class WorkspaceGpuTests(unittest.TestCase):

@@ -148,6 +148,7 @@ def write_launch(args, run: Path, env: dict[str, str], srun: list[str]) -> None:
            and (full_rounds := getattr(args, "microbench_full_rounds", None)) is not None
            and full_rounds >= 0 else "")
         + ("VIBESYS_PHASE_AGENTS=1 " if getattr(args, "phase_agents", False) else "")
+        + f"VIBESYS_GPU_WAIT_FILE={q(run / 'gpu/queue_wait_s')} "
         + "\\\n  "
         + " ".join(NO_GPU) + " timeout --signal=TERM --kill-after=60s "
         f"{timeout}s {q(args.vibesys)} "

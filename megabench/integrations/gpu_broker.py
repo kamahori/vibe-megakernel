@@ -144,6 +144,38 @@ class Broker:
             self.project: Path | None = Path(json.loads(args.spec.read_text())["project"])
         except (OSError, ValueError, KeyError):
             self.project = None
+        # Queue wait: seconds in which a job of this run waits in the Slurm queue and none
+        # runs. A time limit on the agents' work (the microbench phase) adds it, so that a
+        # full node does not use up the time of a phase that measures on the GPU.
+        self.states: dict[str, str] = {}
+        self.state_lock = threading.Lock()
+        self.queue_wait = 0.0
+        self.wait_file = Path(args.socket).parent / "queue_wait_s"
+        threading.Thread(target=self._count_wait, daemon=True).start()
+
+    def _count_wait(self, tick: float = 1.0) -> None:
+        last_write = 0.0
+        while True:
+            time.sleep(tick)
+            with self.state_lock:
+                states = set(self.states.values())
+            if "pending" in states and "running" not in states:
+                self.queue_wait += tick
+            if time.monotonic() - last_write >= 5:
+                last_write = time.monotonic()
+                try:
+                    tmp = self.wait_file.with_suffix(".tmp")
+                    tmp.write_text(f"{self.queue_wait:.0f}\n")
+                    tmp.replace(self.wait_file)
+                except OSError:
+                    pass
+
+    def _state(self, name: str, state: str | None) -> None:
+        with self.state_lock:
+            if state is None:
+                self.states.pop(name, None)
+            else:
+                self.states[name] = state
 
     def partitioned(self, srun: list[str]) -> list[str]:
         """With --partition-policy auto: main when it starts the job now, else priority
@@ -237,7 +269,11 @@ class Broker:
             started, t0 = time.monotonic(), time.time()
             proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=fds[0],
                                     stderr=fds[1], env=self.env)
+            # gpu_job writes <request>.gpu when the job starts on its GPU.
+            self._state(name, "pending")
             while True:
+                if self.states.get(name) == "pending" and path.with_suffix(".gpu").exists():
+                    self._state(name, "running")
                 try:
                     code = proc.wait(timeout=1)
                     break
@@ -250,7 +286,9 @@ class Broker:
                             proc.wait(timeout=30)
                         except subprocess.TimeoutExpired:
                             proc.kill()
+                        self._state(name, None)
                         return {"error": "client went away; job cancelled"}
+            self._state(name, None)
             self.log(f"{name} exit {code} after {time.monotonic() - started:.0f}s")
             self.gpu_report(name, path, t0, time.time(), fds[1], code, body["argv"])
             path.unlink(missing_ok=True)
