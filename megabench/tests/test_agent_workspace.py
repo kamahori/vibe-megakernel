@@ -128,6 +128,9 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertFalse((plain / ".claude/agents/phase.md").exists())
             task = (phased / "TASK.md").read_text()
             self.assertIn("## Phase table and phase rounds", task)
+            # A background subagent stops when the implementer turn ends: start them in the foreground.
+            self.assertIn("`run_in_background: false`). Put all the Agent calls in one", task)
+            self.assertNotIn("subagent_type: phase`, `run_in_background: true`", task)
             self.assertIn("subagent_type: phase", task)
             self.assertIn("progress/phases.md", task)
             self.assertIn("/variants/", (phased / ".gitignore").read_text().splitlines())
