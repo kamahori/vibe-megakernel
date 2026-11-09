@@ -196,6 +196,17 @@ An estimate for a design that has no matched rows yet is a range. Its top assume
 removes every phase, reduction and barrier that it could remove, priced with the measured costs
 of those phases and barriers; show that arithmetic. Narrow the range only with matched rows.
 
+An estimate made by swapping the instruction inside one engine's decomposition is a lower bound
+on what the other engine gains. Do not use it as the top of a range or to rank the question low.
+Open or keep a question for the whole design of each engine (its accumulator home, whether a
+full-reduction tile fits, whether split-K is still needed, which neighbouring phase its epilogue
+absorbs, which barriers it removes), with the matched measurement that settles it.
+
+A question stays open until rows settle it. Rows that only run again the designs already
+measured for a question do not count for it: each round, add the matched comparison its
+`settles it` line names, or a design or arm not measured for it yet. A question that goes two
+rounds without a matched comparison blocks `./check_candidate` until it gets one.
+
 ## Design space
 
 `progress/design-space.md` is the tree that the orchestrator plans from. Keep one section per

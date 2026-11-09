@@ -128,7 +128,10 @@ ENGINE_MAP_TASK = (
     "the reduction is split and reduced in a separate pass, which neighbouring phase runs in its "
     "epilogue, how many grid barriers remain). A comparison that swaps the instruction inside "
     "one engine's decomposition, or that compares rows under different conditions, does not "
-    "settle the choice. The share of profile samples in a phase's math does not either.\n\n"
+    "settle the choice. The share of profile samples in a phase's math does not either. "
+    "An estimate made by swapping the instruction is a lower bound on what the other engine "
+    "gains: it opens a ledger question for the whole design of each engine, and a plan ranks "
+    "its targets by whole-design estimates, not by instruction-swap estimates.\n\n"
     "`progress/microbench/open.md` is the ledger of questions that measurements have not "
     "settled yet, each with an estimated end-to-end effect. When you plan a round, read it with "
     "the engine-map status. If the plan's target is not the open question with the largest "
@@ -189,7 +192,7 @@ MICROBENCH_TASK = (
     "passes only when they are complete. If it fails after the subagent returns, give the "
     "subagent its message and wait again. Then implement the plan. If later answers rank a "
     "phase's design differently from the code you already wrote, rebuild that phase in the "
-    "design they rank best before you run `./check_candidate`. In your notes, cite the answers that changed "
+    "design they rank best before you run `./check_candidate`. Before the check, write `progress/microbench/build/<round>.md`: one table row per phase of the candidate, `| phase | design built | notes |`, with the engine-map tags (E1, E2, ...) of the phase. `./check_candidate` refuses a phase built in another engine family than its fastest matched row, unless that family's own matched rows are within the run-to-run noise of it. To keep a slower design for one round, write `deferred: <reason> <row ids>` in the notes cell of the phase; the next round's record cannot defer the same phase. To keep a design for good, measure it under matched conditions; its rows then decide. In your notes, cite the answers that changed "
     "or confirmed a design choice. The plan's choice of design (engine, decomposition, data "
     "path) for a phase whose code this round writes or rewrites is a claim, not a constraint: "
     "if this round's matched rows rank another design best for that phase, build the phase in "
@@ -201,7 +204,12 @@ MICROBENCH_TASK = (
     "`./check_candidate` refuses to run until the request and answer files exist for the "
     "current round, the answers name every plan claim P1, P2, ..., the engine map has a "
     "status entry for the round, and each ledger question carried open from an earlier round "
-    "has rows measured this round (one may be deferred with a reason). If a new question comes "
+    "has rows measured this round (one may be deferred with a reason). Rows that only run "
+    "again the designs already measured for a question do not count: the rows must form a "
+    "matched comparison or add a design or arm not measured for it before. A question that "
+    "has gone two rounds without a matched comparison cannot be deferred. It also refuses a "
+    "build record that is missing or that builds a phase in a slower family without a "
+    "deferral. If a new question comes "
     "up during the round, append it to the "
     "request file and give it to the subagent again. Keep these files under `progress/`: a "
     "revert to an earlier round keeps them.\n\n"
@@ -359,7 +367,8 @@ PHASE_AGENTS_TASK = (
     "3. Wait for all subagents. Merge the winning diffs into the main candidate.\n"
     "4. Run `./check_candidate` and `./timeline_candidate` on the merged build in the "
     "foreground. Drop a diff whose gain does not hold in the merged build. Update "
-    "`progress/phases.md` from the new timeline.\n\n"
+    "`progress/phases.md` from the new timeline. Before the check, write the build record "
+    "`progress/microbench/build/<round>.md` as the microbench section says.\n\n"
     "The orchestrator plan of a phase round names the target phases from the timeline windows, "
     "largest gaps first, and the boundary items.\n")
 
@@ -448,7 +457,7 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case,
         gpu_run.chmod(0o755)
     check = project / "check_candidate"
     check.write_text(
-        common + f"{python} -m megabench.integrations.microbench_gate check || exit 3\n"
+        common + f"{python} -m megabench.integrations.microbench_gate check --build || exit 3\n"
         "run_id=$(date -u +%Y%m%dT%H%M%S)-$$\n"
         # --rerun-of REPORT (first): a stability rerun of an UNSTABLE or SLOW check of the same code.
         "rerun=\"\"\n"

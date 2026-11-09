@@ -68,6 +68,9 @@ Method:
   removes is not engine-independent.
 - The share of profile samples in the math of a phase does not bound what an engine change is
   worth; the phases, reductions and barriers that the other design removes count too.
+- An estimate made by swapping the instruction inside one engine's decomposition is a lower
+  bound on what the other engine gains, not a price. Treat it as an open question for the whole
+  design of each engine, and rank targets by whole-design estimates.
 - Put the row ids and numbers that you used into your plan or your notes on rejected
   alternatives. If a rejection does not cite numbers, it is a guess.
 - If no row matches your conditions (shape, data type, occupancy, cache state), measure the

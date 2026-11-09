@@ -75,6 +75,18 @@ class GateTests(unittest.TestCase):
             (skipped / "round-0002.md").write_text("# other round\n")
             (skipped / "round-0003.md").unlink()
             self.assertTrue(check(ws), "a skip record of another round does not count")
+            # A question overdue for a matched comparison blocks a skipped round too.
+            (skipped / "round-0003.md").write_text("# round-0003: skipped\nreason\n")
+            mb = ws / "progress/microbench"
+            (mb / "open.md").write_text("## Q1 · open · opened round-0001\n")
+            self.assertIn("Q1 has gone 2 or more rounds", check(ws)[0])
+            (mb / "answers").mkdir()
+            (mb / "answers/round-0003.md").write_text("## Q1\naaaaaaaaaa\n")
+            (mb / "primdb_local.jsonl").write_text("".join(json.dumps(
+                {"id": i, "params": {"engine": e},
+                 "source": {"round": "round-0003", "question": "Q1", "conditions": "matched"}})
+                + "\n" for i, e in (("aaaaaaaaaa", "one"), ("aaaaaaaaab", "two"))))
+            self.assertEqual(check(ws), [])
 
     def test_round_cut_at_the_hard_limit_needs_no_answers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -157,7 +169,11 @@ class GateTests(unittest.TestCase):
             answers = "P1\n## Q1\nstill estimated\n"
             (mb / "answers/round-0003.md").write_text(answers)
             problems = check(ws)
-            self.assertIn("Q1 (opened round-0001) has no rows", problems[0])
+            self.assertIn("Q1 has gone 2 or more rounds without a matched comparison", problems[0])
+            (mb / "open.md").write_text(
+                "# Open questions\n\n## Q1 · open · opened round-0002\n- settle: matched pair\n\n"
+                "## Q2 · open · opened round-0003\n- settle: new this round\n")
+            self.assertIn("Q1 (opened round-0002) has no rows", check(ws)[0])
             # A row measured in an earlier round does not count; one stamped with this round does.
             local = mb / "primdb_local.jsonl"
             local.write_text(json.dumps({"id": "aaaaaaaaaa", "source": {"round": "round-0002"}}) + "\n"
@@ -167,6 +183,20 @@ class GateTests(unittest.TestCase):
                                        for i, e in (("bbbbbbbbbb", "one"), ("bbbbbbbbbc", "two"))))
             (mb / "answers/round-0003.md").write_text("P1\n## Q1\nrow aaaaaaaaaa\n")
             self.assertIn("Q1", check(ws)[0])
+            # A row of a design measured for Q1 before, run again, does not count.
+            (mb / "answers/round-0002.md").write_text("## Q1\nbbbbbbbbbb\n")
+            (mb / "answers/round-0003.md").write_text("P1\n## Q1\nrow bbbbbbbbbb\n## Q2\n")
+            local.write_text(json.dumps({"id": "bbbbbbbbbb", "params": {"engine": "one"},
+                                         "source": {"round": "round-0003", "question": "Q1"}}) + "\n"
+                             + json.dumps({"id": "bbbbbbbbba", "params": {"engine": "one"},
+                                           "source": {"round": "round-0002", "question": "Q1"}}) + "\n")
+            self.assertIn("measure only designs measured for it before (one)", check(ws)[0])
+            (mb / "answers/round-0002.md").unlink()
+            local.write_text(json.dumps({"id": "aaaaaaaaaa", "source": {"round": "round-0002"}}) + "\n"
+                             + "".join(json.dumps({"id": i, "params": {"engine": e},
+                                                   "source": {"round": "round-0003", "question": "Q1",
+                                                              "conditions": "matched"}}) + "\n"
+                                       for i, e in (("bbbbbbbbbb", "one"), ("bbbbbbbbbc", "two"))))
             (mb / "answers/round-0003.md").write_text("P1\n## Q1\nrow bbbbbbbbbb\n## Q2\n")
             self.assertEqual(check(ws), [])
             # One carried question may be deferred; closing needs rows.
@@ -198,7 +228,7 @@ class GateTests(unittest.TestCase):
                 # Each matched spec also gets a second design, so that it is a comparison.
                 out = []
                 for i, r, q, c in specs:
-                    for k, engine in enumerate(("one", "two") if c == "matched" else ("one",)):
+                    for k, engine in enumerate(("one", "two") if c == "matched" else ("three",)):
                         out.append(json.dumps({"id": i[:-1] + str(k), "params": {"engine": engine},
                                                "source": {"round": r, "question": q,
                                                           "conditions": c}}) + "\n")
@@ -211,7 +241,8 @@ class GateTests(unittest.TestCase):
             (mb / "answers/round-0003.md").write_text("P1\n## Q1\nbbbbbbbbb0\n## Q2\nccccccccc0\n")
             problems = check(ws)
             self.assertEqual(len(problems), 1, problems)
-            self.assertIn("Q2 has gone longest", problems[0])
+            # Two rounds without a matched comparison: the due question is also overdue.
+            self.assertIn("Q2 has gone 2 or more rounds", problems[0])
             rows(("aaaaaaaaaa", "round-0002", "Q1", "matched"),
                  ("bbbbbbbbbb", "round-0003", "Q1", "other"),
                  ("cccccccccc", "round-0003", "Q2", "matched"))
@@ -219,14 +250,14 @@ class GateTests(unittest.TestCase):
             # An earlier answer measured under matching conditions also counts.
             rows(("bbbbbbbbbb", "round-0003", "Q1", "other"), ("cccccccccc", "round-0003", "Q2", "other"))
             (mb / "answers/round-0002.md").write_text("## Q2\n- Confidence: measured under matching conditions.\n")
-            self.assertIn("Q1 has gone longest", check(ws)[0])
+            self.assertIn("Q1 has gone 2 or more rounds", check(ws)[0])
             (mb / "answers/round-0002.md").unlink()
             rows(("aaaaaaaaaa", "round-0002", "Q1", "matched"),
                  ("bbbbbbbbbb", "round-0003", "Q1", "other"),
                  ("cccccccccc", "round-0003", "Q2", "matched"))
-            # Deferring the due question is the round's one deferral.
+            # An overdue question cannot be deferred.
             (mb / "answers/round-0003.md").write_text("P1\n## Q1\nbbbbbbbbb0\n## Q2\ndeferred: x\n")
-            self.assertEqual(check(ws), [])
+            self.assertIn("Q2 has gone 2 or more rounds", " ".join(check(ws)))
 
     def test_seeded_question_is_due_in_round_one_and_cannot_be_deferred(self) -> None:
         from megabench.integrations.make_agent_workspace import seeded_ledger
@@ -251,14 +282,14 @@ class GateTests(unittest.TestCase):
                 {"id": "dddddddddd", "source": {"round": "round-0001", "question": "Q1",
                                                 "conditions": "other"}}) + "\n")
             (mb / "answers/round-0001.md").write_text("P1\n## Q1\ndddddddddd\n")
-            self.assertIn("Q1 has gone longest", check(ws)[0])
+            self.assertIn("Q1 has gone longest", " ".join(check(ws)))
             matched = [{"id": "dddddddddd", "params": {"engine": "one"},
                         "source": {"round": "round-0001", "question": "Q1", "conditions": "matched"}},
                        {"id": "eeeeeeeeee", "params": {"engine": "oracle_load_only"},
                         "source": {"round": "round-0001", "question": "Q1", "conditions": "matched"}}]
             (mb / "primdb_local.jsonl").write_text("".join(json.dumps(r) + "\n" for r in matched))
             # Matched rows of one design and an oracle are not a comparison.
-            self.assertIn("Q1 has gone longest", check(ws)[0])
+            self.assertIn("Q1 has gone longest", " ".join(check(ws)))
             matched.append({"id": "ffffffffff", "params": {"engine": "two"},
                             "source": {"round": "round-0001", "question": "Q1",
                                        "conditions": "matched"}})
@@ -299,8 +330,8 @@ class GateTests(unittest.TestCase):
             self.assertIn("Q1 has gone longest", check(ws)[0])
             rows("alpha_one_plain", "beta_split", "gamma_ffma")
             self.assertEqual(check(ws), [])
-            # ./check_candidate also needs the build record of the round.
-            self.assertIn("build/round-0001.md is missing", check(ws, build=True)[0])
+            # Without matched phase rows no build record is needed.
+            self.assertEqual(check(ws, build=True), [])
             (mb / "build").mkdir()
             record = mb / "build/round-0001.md"
             head = "| phase | built | notes |\n|---|---|---|\n"
@@ -320,6 +351,9 @@ class GateTests(unittest.TestCase):
                   ("beta_split", "E1", 2.0, "other"))
             # The fastest matched row decides; an oracle and other-conditions rows do not.
             self.assertIn("fastest matched row is 0000000000", check(ws, build=True)[0])
+            record.unlink()
+            self.assertIn("build/round-0001.md is missing", check(ws, build=True)[0])
+            record.write_text(head + "| E1 qkv | beta_split | |\n")
             record.write_text(head + "| E1 qkv | alpha_one_tuned | |\n")
             self.assertEqual(check(ws, build=True), [])
             # A faster matched row of the built design changes the order.

@@ -247,6 +247,8 @@ class AgentWorkspaceTests(unittest.TestCase):
             result = subprocess.run([str(project / "check_candidate"), "--help"],
                                     cwd=project, capture_output=True, text=True)
             self.assertIn("Q1 has gone longest", result.stderr)
+            self.assertIn("deferred: <reason> <row ids>", (project / "TASK.md").read_text())
+            self.assertIn("lower bound", (project / "TASK.md").read_text())
             (project / "progress/microbench/primdb_local.jsonl").write_text("".join(json.dumps(
                 {"id": i, "params": {"engine": e, "phase": "E1"}, "metrics": {"us": us}, "source": {"round": "round-0001", "question": "Q1",
                                                               "conditions": "matched"}}) + "\n"
@@ -262,10 +264,26 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertIn("design-space.md has no reconcile entry", result.stderr)
             with (project / "progress/design-space.md").open("a") as f:
                 f.write("### round-0001\n")
-            # The answers pass, so ./check_candidate runs.
+            # The answers pass; ./check_candidate also needs the round's build record.
             result = subprocess.run([str(project / "microbench_check")],
                                     cwd=project, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
+            result = subprocess.run([str(project / "check_candidate"), "--help"],
+                                    cwd=project, capture_output=True, text=True)
+            self.assertIn("build/round-0001.md is missing", result.stderr)
+            (project / "progress/microbench/build").mkdir()
+            record = project / "progress/microbench/build/round-0001.md"
+            record.write_text("| phase | built | notes |\n|---|---|---|\n| E1 | mma_sync_a | |\n")
+            result = subprocess.run([str(project / "check_candidate"), "--help"],
+                                    cwd=project, capture_output=True, text=True)
+            self.assertIn("fastest matched row is eeeeeeeeef", result.stderr)
+            # A deferral with a reason and row ids keeps the slower design for this round.
+            record.write_text("| phase | built | notes |\n|---|---|---|\n"
+                              "| E1 | mma_sync_a | deferred: epilogue first, eeeeeeeeef eeeeeeeeee |\n")
+            result = subprocess.run([str(project / "check_candidate"), "--help"],
+                                    cwd=project, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record.write_text("| phase | built | notes |\n|---|---|---|\n| E1 | tcgen05_b | |\n")
             result = subprocess.run([str(project / "check_candidate"), "--help"],
                                     cwd=project, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)

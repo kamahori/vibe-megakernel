@@ -249,15 +249,44 @@ def rows_of_round(workspace: Path, round_name: str) -> set[str]:
     return {i for i, s in local_sources(workspace) if s.get("round") == round_name}
 
 
-def stalest_unmatched(workspace: Path, round_name: str) -> dict | None:
-    """The carried open question that has gone longest without a matched measurement.
+def local_rows(workspace: Path) -> dict[str, dict]:
+    """The rows that `./primdb add` put in the workspace, by id."""
+    path = workspace / MICROBENCH / "primdb_local.jsonl"
+    out = {}
+    if path.is_file():
+        for line in path.read_text().splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("id"):
+                out[row["id"]] = row
+    return out
 
-    A matched measurement is a row added with `./primdb add --question Q<n> --conditions matched`,
-    or an earlier answers section for the question whose confidence says "under matching".
-    Questions with none count from the round they were opened; ties go to the ledger order
-    (largest estimate first).
+
+def round_number(round_name: str) -> int:
+    match = re.search(r"(\d+)$", round_name)
+    return int(match.group(1)) if match else 0
+
+
+def earlier_designs(workspace: Path, tag: str, round_name: str) -> set[str]:
+    """The designs measured for question *tag* before *round_name*.
+
+    A row counts when `./primdb add --question` stamped it with the question, or when an
+    earlier answers section for the question cites it.
     """
-    last = {}
+    rows = local_rows(workspace)
+    ids = {i for i, r in rows.items() if (r.get("source") or {}).get("question") == tag
+           and (r.get("source") or {}).get("round", "") < round_name}
+    for path in (workspace / MICROBENCH / "answers").glob("round-*.md"):
+        if path.stem < round_name:
+            ids |= set(ROW_ID.findall(_section(path.read_text(), tag)))
+    return {d for d in (design_of(rows[i]) for i in ids if i in rows) if d}
+
+
+def last_matched(workspace: Path, round_name: str) -> dict[str, str]:
+    """For each question, the last round before *round_name* with a matched comparison."""
+    last: dict[str, str] = {}
     for _, s in local_sources(workspace):
         if s.get("conditions") == "matched" and s.get("round", "") < round_name:
             tag, rnd = s.get("question"), s.get("round", "")
@@ -270,10 +299,48 @@ def stalest_unmatched(workspace: Path, round_name: str) -> dict | None:
         for entry in ledger(workspace):
             if re.search(r"(?im)confidence\W[^\n]*\bunder matching\b", _section(text, entry["tag"])):
                 last[entry["tag"]] = max(last.get(entry["tag"], ""), path.stem)
+    return last
+
+
+OVERDUE_ROUNDS = 2  # rounds a carried question may go without a matched comparison
+
+
+def stalest_unmatched(workspace: Path, round_name: str) -> dict | None:
+    """The carried open question that has gone longest without a matched measurement.
+
+    A matched measurement is a row added with `./primdb add --question Q<n> --conditions matched`,
+    or an earlier answers section for the question whose confidence says "under matching".
+    Questions with none count from the round they were opened; ties go to the ledger order
+    (largest estimate first).
+    """
+    last = last_matched(workspace, round_name)
     carried = [e for e in ledger(workspace) if e["status"] == "open" and e["opened"] < round_name]
     if not carried:
         return None
     return min(carried, key=lambda e: last.get(e["tag"], e["opened"]))
+
+
+def overdue_questions(workspace: Path, round_name: str, answers: str = "") -> list[str]:
+    """Problems for the carried open questions that have gone OVERDUE_ROUNDS rounds without a
+    matched comparison and get none cited in *answers*."""
+    problems = []
+    last = last_matched(workspace, round_name)
+    new_rows = rows_of_round(workspace, round_name)
+    for entry in ledger(workspace):
+        if entry["status"] != "open" or entry["opened"] >= round_name:
+            continue
+        cited = new_rows & set(ROW_ID.findall(_section(answers, entry["tag"])))
+        if matched_comparison(workspace, entry["tag"], round_name) & cited:
+            continue
+        since = last.get(entry["tag"], entry["opened"])
+        if round_number(round_name) - round_number(since) >= OVERDUE_ROUNDS:
+            problems.append(
+                f"open question {entry['tag']} has gone {OVERDUE_ROUNDS} or more rounds without "
+                f"a matched comparison (last: {since}): build the designs its `settles it` line "
+                f"names under the same conditions, add the rows with ./primdb add --question "
+                f"{entry['tag']} --conditions matched and cite them in its section of "
+                f"{MICROBENCH}/answers/{round_name}.md. It cannot be deferred again")
+    return problems
 
 
 def check_ledger(workspace: Path, round_name: str, answers: str) -> list[str]:
@@ -284,13 +351,19 @@ def check_ledger(workspace: Path, round_name: str, answers: str) -> list[str]:
     per round may instead be deferred, with `deferred:` and the reason in its section, but not
     the same question in two rounds in a row. The carried question that has gone longest without
     a matched measurement must get one this round, unless it is the deferred one.
+
+    Rows that only repeat designs already measured for the question do not count: the cited
+    rows must form a matched comparison or add a design not measured for it before. A question
+    that has gone OVERDUE_ROUNDS rounds without a matched comparison blocks until it gets one.
     """
     problems = []
     new_rows = rows_of_round(workspace, round_name)
     earlier = sorted(p for p in (workspace / MICROBENCH / "answers").glob("round-*.md")
                      if p.stem < round_name)
     previous = earlier[-1].read_text() if earlier else ""
-    deferred = []
+    deferred, overdue = [], []
+    rows = local_rows(workspace)
+    last = last_matched(workspace, round_name)
     for entry in ledger(workspace):
         if entry["status"] != "open":
             if not ROW_ID.search(entry["body"].split("\n", 1)[-1]):
@@ -299,7 +372,29 @@ def check_ledger(workspace: Path, round_name: str, answers: str) -> list[str]:
         if entry["opened"] >= round_name:
             continue
         section = _section(answers, entry["tag"])
-        if new_rows & set(ROW_ID.findall(section)):
+        cited = new_rows & set(ROW_ID.findall(section))
+        matched = matched_comparison(workspace, entry["tag"], round_name) & cited
+        since = last.get(entry["tag"], entry["opened"])
+        if round_number(round_name) - round_number(since) >= OVERDUE_ROUNDS and not matched:
+            overdue.append(entry["tag"])
+            problems.append(
+                f"open question {entry['tag']} has gone {OVERDUE_ROUNDS} or more rounds without "
+                f"a matched comparison (last: {since}): build the designs its `settles it` line "
+                f"names under the same conditions, add the rows with ./primdb add --question "
+                f"{entry['tag']} --conditions matched and cite them in its section. It cannot "
+                "be deferred again")
+            continue
+        if cited:
+            known = earlier_designs(workspace, entry["tag"], round_name)
+            fresh = {design_of(rows[i]) for i in cited if i in rows} - known - {None}
+            if matched or fresh:
+                continue
+            problems.append(
+                f"open question {entry['tag']}: the rows cited this round ({', '.join(sorted(cited))}) "
+                f"measure only designs measured for it before ({', '.join(sorted(known)) or '-'}). "
+                "A run of the same benches again does not settle it: measure the comparison its "
+                "`settles it` line names under matched conditions, or a design or arm not "
+                "measured for it yet")
             continue
         if re.search(r"(?im)^\W*deferred:\s*\S", section):
             if entry["opened"] == SEEDED:
@@ -316,7 +411,7 @@ def check_ledger(workspace: Path, round_name: str, answers: str) -> list[str]:
             f"{round_name}: give it a section in the answers that cites rows added this round "
             "with ./primdb add, or close or refute it in the ledger with row ids")
     stale = stalest_unmatched(workspace, round_name)
-    if stale and stale["tag"] not in deferred:
+    if stale and stale["tag"] not in deferred + overdue:
         matched = matched_comparison(workspace, stale["tag"], round_name)
         if not matched & set(ROW_ID.findall(_section(answers, stale["tag"]))):
             problems.append(
@@ -338,21 +433,14 @@ BUILD_HELP = ("one table row per phase of the candidate: | phase | design built 
 PHASE_TAG = re.compile(r"\bE\d+\b")
 
 
-def phase_ranking(workspace: Path) -> dict[str, tuple[str, float, str]]:
-    """For each engine-map phase tag, the fastest matched row: (design, us, id).
+def matched_phase_rows(workspace: Path) -> list[tuple[str, str, float, str]]:
+    """(phase tag, design, us, id) of each matched row with `p.phase` and `m.us`.
 
     Rows count when `./primdb add` stored them with `--conditions matched`, a design
     (not an oracle), `p.phase` and the phase time `m.us`.
     """
-    path = workspace / MICROBENCH / "primdb_local.jsonl"
-    best: dict[str, tuple[str, float, str]] = {}
-    if not path.is_file():
-        return best
-    for line in path.read_text().splitlines():
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    out = []
+    for row_id, row in local_rows(workspace).items():
         if (row.get("source") or {}).get("conditions") != "matched":
             continue
         design = design_of(row)
@@ -361,25 +449,45 @@ def phase_ranking(workspace: Path) -> dict[str, tuple[str, float, str]]:
         if not design or not phase or not isinstance(us, (int, float)) or us <= 0:
             continue
         for tag in PHASE_TAG.findall(str(phase)):
-            if tag not in best or us < best[tag][1]:
-                best[tag] = (design, float(us), row.get("id", "?"))
+            out.append((tag, design, float(us), row_id))
+    return out
+
+
+def phase_ranking(workspace: Path) -> dict[str, tuple[str, float, str]]:
+    """For each engine-map phase tag, the fastest matched row: (design, us, id)."""
+    best: dict[str, tuple[str, float, str]] = {}
+    for tag, design, us, row_id in matched_phase_rows(workspace):
+        if tag not in best or us < best[tag][1]:
+            best[tag] = (design, us, row_id)
     return best
 
 
-def check_build(workspace: Path, round_name: str) -> list[str]:
-    """The build record of the round: the design each phase of the candidate is built in.
+NOISE = 0.02  # relative gap treated as noise when no design of the phase was measured twice
 
-    Each engine-map phase with matched rows is built in the engine family of its fastest
-    matched row. A design that the implementer prefers becomes the fastest by its own matched
-    rows, not by a claim.
+
+def phase_noise(rows: list[tuple[str, str, float, str]], tag: str) -> float:
+    """The relative spread of repeated matched rows of one design for phase *tag*.
+
+    Repeats of the same design under matched conditions show how far two times of one
+    design differ; a gap between designs inside that spread is not a ranking. With no
+    repeats, NOISE.
     """
-    path = workspace / BUILD / f"{round_name}.md"
-    rel = path.relative_to(workspace)
+    by_design: dict[str, list[float]] = {}
+    for t, design, us, _ in rows:
+        if t == tag:
+            by_design.setdefault(design, []).append(us)
+    spreads = [(max(v) - min(v)) / min(v) for v in by_design.values() if len(v) > 1]
+    return max(spreads + [NOISE])
+
+
+DEFERRED = re.compile(r"(?i)\bdeferred:\s*(.*)")
+
+
+def build_record(path: Path) -> dict[str, tuple[str, str]]:
+    """Phase tag -> (design built, notes) from a build record."""
+    built: dict[str, tuple[str, str]] = {}
     if not path.is_file():
-        return [f"{rel} is missing: write {BUILD_HELP}"]
-    families = engine_families(workspace)
-    ranking = phase_ranking(workspace)
-    built: dict[str, str] = {}
+        return built
     for line in path.read_text().splitlines():
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         if not line.lstrip().startswith("|") or len(cells) < 2:
@@ -387,7 +495,32 @@ def check_build(workspace: Path, round_name: str) -> list[str]:
         if _norm(cells[0]) in ("phase", "") or set(cells[0]) <= set("-: "):
             continue
         for tag in PHASE_TAG.findall(cells[0]):
-            built[tag] = cells[1]
+            built[tag] = (cells[1], " | ".join(cells[2:]))
+    return built
+
+
+def check_build(workspace: Path, round_name: str) -> list[str]:
+    """The build record of the round: the design each phase of the candidate is built in.
+
+    Each engine-map phase with matched rows is built in the engine family of its fastest
+    matched row, or in a family whose own fastest matched row is within the noise of it.
+    Otherwise the notes cell of the phase defers the rebuild with `deferred:`, the reason and
+    the row ids it rests on. A phase deferred in the previous round's record cannot be
+    deferred again. A design that the implementer prefers becomes the fastest by its own
+    matched rows, not by a claim.
+    """
+    ranking = phase_ranking(workspace)
+    path = workspace / BUILD / f"{round_name}.md"
+    rel = path.relative_to(workspace)
+    if not ranking:
+        return []
+    if not path.is_file():
+        return [f"{rel} is missing: write {BUILD_HELP}"]
+    families = engine_families(workspace)
+    rows = matched_phase_rows(workspace)
+    built = build_record(path)
+    earlier = sorted(p for p in (workspace / BUILD).glob("round-*.md") if p.stem < round_name)
+    previous = build_record(earlier[-1]) if earlier else {}
     problems = []
 
     def family(name: str) -> str:
@@ -397,13 +530,31 @@ def check_build(workspace: Path, round_name: str) -> list[str]:
         if tag not in built:
             problems.append(f"{rel} has no row for phase {tag}, which has matched rows: name the "
                             "design the candidate computes it in")
-        elif family(built[tag]) != family(design):
-            problems.append(
-                f"{rel}: phase {tag} is built in {built[tag]}, but its fastest matched row is "
-                f"{row_id} ({design}, {us:g} us). Build {tag} in that design's engine family (the "
-                "verified proxies under progress/microbench/bench/ are a start). If you expect "
-                "your design to be faster, measure it under matched conditions with p.phase="
-                f"{tag}; its rows then decide")
+            continue
+        name, notes = built[tag]
+        if family(name) == family(design):
+            continue
+        own = [u for t, d, u, _ in rows if t == tag and family(d) == family(name)]
+        noise = phase_noise(rows, tag)
+        if own and (min(own) - us) / us <= noise:
+            continue
+        gap = (f"its own fastest matched row is {min(own):g} us, {100 * (min(own) - us) / us:.1f}% "
+               f"slower (noise {100 * noise:.1f}%)" if own else "it has no matched row for it")
+        deferral = DEFERRED.search(notes)
+        if deferral and ROW_ID.search(deferral.group(1)) and len(ROW_ID.sub("", deferral.group(1)).strip(" ,;.:-")) > 0:
+            if tag in previous and DEFERRED.search(previous[tag][1]):
+                problems.append(
+                    f"{rel}: phase {tag} was deferred in {earlier[-1].stem} too. Build it in the "
+                    f"family of {row_id} ({design}, {us:g} us) this round, or measure your design "
+                    f"under matched conditions with p.phase={tag}; its rows then decide")
+            continue
+        problems.append(
+            f"{rel}: phase {tag} is built in {name}, but its fastest matched row is "
+            f"{row_id} ({design}, {us:g} us) and {gap}. Build {tag} in that design's engine "
+            "family (the verified proxies under progress/microbench/bench/ are a start), or "
+            "measure your design under matched conditions with p.phase="
+            f"{tag} (its rows then decide), or write `deferred: <reason> <row ids>` in the "
+            "notes cell of the phase (one round only)")
     if not built:
         problems.append(f"{rel} has no phase rows: write {BUILD_HELP}")
     return problems
@@ -418,8 +569,15 @@ def check(workspace: Path, build: bool = False) -> list[str]:
     skipped = workspace / MICROBENCH / "skipped" / f"{round_name}.md"
     if skipped.is_file() and skipped.read_text().strip():
         # The framework skipped this round's phase: no question of the plan needed a new
-        # microbenchmark. The design of each phase still follows the measured rankings.
-        return check_build(workspace, round_name) if build else []
+        # microbenchmark. The design of each phase still follows the measured rankings, and
+        # a question overdue for a matched comparison still blocks: run the microbench
+        # subagent on it (steps 1-3) and cite its rows in the round's answers.
+        answer = workspace / MICROBENCH / "answers" / f"{round_name}.md"
+        problems = overdue_questions(workspace, round_name,
+                                     answer.read_text() if answer.is_file() else "")
+        if build and not problems:
+            problems += check_build(workspace, round_name)
+        return problems
     # The framework stopped this round's phase at its hard time limit: what was not answered
     # stays open, and the round goes on with the answers that exist.
     # The same holds when the phase ended with an error before it wrote its files
