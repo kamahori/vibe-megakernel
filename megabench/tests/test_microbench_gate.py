@@ -268,6 +268,27 @@ class GateTests(unittest.TestCase):
             (mb / "answers/round-0003.md").write_text("P1\n## Q1\nbbbbbbbbb0\n## Q2\ndeferred: x\n")
             self.assertIn("Q2 has gone 2 or more rounds", " ".join(check(ws)))
 
+    def test_only_the_largest_overdue_question_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            mb = ws / "progress/microbench"
+            (ws / "progress/plans").mkdir(parents=True)
+            (ws / "progress/plans/round-0003.json").write_text(json.dumps({"reasoning": "Go."}))
+            for kind in ("requests", "answers"):
+                (mb / kind).mkdir(parents=True)
+                (mb / kind / "round-0003.md").write_text("- q\n")
+            (ws / "progress/engine-map.md").write_text("### round-0003\n")
+            # Ledger order is the estimate order: Q2 first.
+            (mb / "open.md").write_text("## Q2 · open · opened round-0001\n\n"
+                                        "## Q1 · open · opened round-0001\n")
+            (mb / "primdb_local.jsonl").write_text("".join(json.dumps(
+                {"id": i, "params": {"engine": e}, "source": {"round": "round-0003", "question": q}})
+                + "\n" for i, e, q in (("aaaaaaaaaa", "one", "Q1"), ("bbbbbbbbbb", "two", "Q2"))))
+            (mb / "answers/round-0003.md").write_text("P1\n## Q1\naaaaaaaaaa\n## Q2\nbbbbbbbbbb\n")
+            problems = check(ws)
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn("Q2 has gone 2 or more rounds", problems[0])
+
     def test_seeded_question_is_due_in_round_one_and_cannot_be_deferred(self) -> None:
         from megabench.integrations.make_agent_workspace import seeded_ledger
         ledger = seeded_ledger("# Engine map\n\n### E1: mm M=50 N=4096 K=1024\n\n"

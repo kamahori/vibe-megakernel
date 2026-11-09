@@ -339,27 +339,41 @@ def stalest_unmatched(workspace: Path, round_name: str) -> dict | None:
     return min(carried, key=lambda e: last.get(e["tag"], e["opened"]))
 
 
-def overdue_questions(workspace: Path, round_name: str, answers: str = "") -> list[str]:
-    """Problems for the carried open questions that have gone OVERDUE_ROUNDS rounds without a
-    matched comparison and get none cited in *answers*."""
-    problems = []
+def due_overdue(workspace: Path, round_name: str) -> dict | None:
+    """The overdue question of the round: the first open question in ledger order (largest
+    estimate first) that has gone OVERDUE_ROUNDS rounds without a matched comparison.
+
+    One question per round, so that a ledger with many open questions cannot ask for more
+    matched comparisons than one microbench phase can build.
+    """
     last = last_matched(workspace, round_name)
-    new_rows = rows_of_round(workspace, round_name)
     for entry in ledger(workspace):
         if entry["status"] != "open" or entry["opened"] >= round_name:
             continue
-        cited = new_rows & set(ROW_ID.findall(_section(answers, entry["tag"])))
-        if matched_comparison(workspace, entry["tag"], round_name) & cited:
-            continue
         since = last.get(entry["tag"], entry["opened"])
         if round_number(round_name) - round_number(since) >= OVERDUE_ROUNDS:
-            problems.append(
-                f"open question {entry['tag']} has gone {OVERDUE_ROUNDS} or more rounds without "
-                f"a matched comparison (last: {since}): build the designs its `settles it` line "
-                f"names under the same conditions, add the rows with ./primdb add --question "
-                f"{entry['tag']} --conditions matched and cite them in its section of "
-                f"{MICROBENCH}/answers/{round_name}.md. It cannot be deferred again")
-    return problems
+            return dict(entry, since=since)
+    return None
+
+
+def overdue_problem(entry: dict, round_name: str) -> str:
+    return (f"open question {entry['tag']} has gone {OVERDUE_ROUNDS} or more rounds without a "
+            f"matched comparison (last: {entry['since']}) and has the largest estimate of the "
+            f"overdue questions: build the designs its `settles it` line names under the same "
+            f"conditions, tuned, add the rows with ./primdb add --question {entry['tag']} "
+            f"--conditions matched and cite them in its section of "
+            f"{MICROBENCH}/answers/{round_name}.md. It cannot be deferred")
+
+
+def overdue_questions(workspace: Path, round_name: str, answers: str = "") -> list[str]:
+    """The problem for the round's overdue question, if *answers* cite no matched comparison."""
+    due = due_overdue(workspace, round_name)
+    if due is None:
+        return []
+    cited = rows_of_round(workspace, round_name) & set(ROW_ID.findall(_section(answers, due["tag"])))
+    if matched_comparison(workspace, due["tag"], round_name) & cited:
+        return []
+    return [overdue_problem(due, round_name)]
 
 
 def check_ledger(workspace: Path, round_name: str, answers: str) -> list[str]:
@@ -383,6 +397,7 @@ def check_ledger(workspace: Path, round_name: str, answers: str) -> list[str]:
     deferred, overdue = [], []
     rows = local_rows(workspace)
     last = last_matched(workspace, round_name)
+    due = due_overdue(workspace, round_name)
     for entry in ledger(workspace):
         if entry["status"] != "open":
             if not ROW_ID.search(entry["body"].split("\n", 1)[-1]):
@@ -394,14 +409,9 @@ def check_ledger(workspace: Path, round_name: str, answers: str) -> list[str]:
         cited = new_rows & set(ROW_ID.findall(section))
         matched = matched_comparison(workspace, entry["tag"], round_name) & cited
         since = last.get(entry["tag"], entry["opened"])
-        if round_number(round_name) - round_number(since) >= OVERDUE_ROUNDS and not matched:
+        if due and entry["tag"] == due["tag"] and not matched:
             overdue.append(entry["tag"])
-            problems.append(
-                f"open question {entry['tag']} has gone {OVERDUE_ROUNDS} or more rounds without "
-                f"a matched comparison (last: {since}): build the designs its `settles it` line "
-                f"names under the same conditions, add the rows with ./primdb add --question "
-                f"{entry['tag']} --conditions matched and cite them in its section. It cannot "
-                "be deferred again")
+            problems.append(overdue_problem(due, round_name))
             continue
         if cited:
             known = earlier_designs(workspace, entry["tag"], round_name)
