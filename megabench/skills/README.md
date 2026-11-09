@@ -2,6 +2,9 @@
 
 Method guidance for megakernel work, one skill per directory:
 
+- `megakernel-design`: list the design options for synchronization, overlap, fusion, residency,
+  GEMV and GEMM, attention, sequential inner loops and work distribution, with the questions that
+  decide among them.
 - `megakernel-phase-profiling`: split the kernel into phases, time them, and gate codegen
   changes (`scripts/codegen_gate.py` on cuda, `scripts/codegen_gate_amd.py` on rocm).
 - `megakernel-microbench`: study the slowest or furthest-from-floor phase in isolated
