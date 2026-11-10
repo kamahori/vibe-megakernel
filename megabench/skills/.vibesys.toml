@@ -17,3 +17,8 @@ domains = ["kernel-writing"]
 path = "megakernel-regimes"
 backends = ["cuda", "rocm"]
 domains = ["kernel-writing"]
+
+[[rule]]
+path = "megakernel-design"
+backends = ["cuda", "rocm"]
+domains = ["kernel-writing"]
