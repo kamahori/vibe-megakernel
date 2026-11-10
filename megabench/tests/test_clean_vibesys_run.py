@@ -192,3 +192,18 @@ class LabelledRoundsTests(unittest.TestCase):
             (ws / "progress/open.md").write_text("## Q1 · open · opened round-0003\n")
             self.assertEqual(clean.labelled_rounds(ws), 3)
             self.assertEqual(clean.labelled_rounds(ws / "missing"), 0)
+
+
+class GpuShareTests(unittest.TestCase):
+    def test_share_from_partition_defaults(self):
+        import os
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as directory:
+            fake = Path(directory) / "scontrol"
+            fake.write_text("#!/bin/sh\necho 'PartitionName=main DefCpuPerGPU=4 DefMemPerCPU=1000'\n")
+            fake.chmod(0o755)
+            with mock.patch.dict(os.environ, {"PATH": f"{directory}:{os.environ['PATH']}"}):
+                self.assertEqual(clean.gpu_share("main"), (4, "4000M"))
+            fake.write_text("#!/bin/sh\necho 'PartitionName=main'\n")
+            with mock.patch.dict(os.environ, {"PATH": f"{directory}:{os.environ['PATH']}"}):
+                self.assertIsNone(clean.gpu_share("main"))

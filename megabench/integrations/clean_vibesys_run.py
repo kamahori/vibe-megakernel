@@ -104,6 +104,20 @@ def agent_env(args, run: Path, claude: Path, key: str) -> dict[str, str]:
     }
 
 
+def gpu_share(partition: str) -> tuple[int, str] | None:
+    """(CPUs, memory) that Slurm gives one GPU of *partition* by default, if it says."""
+    try:
+        out = subprocess.run(["scontrol", "show", "partition", partition], capture_output=True,
+                             text=True, timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    cpus = re.search(r"DefCpuPerGPU=(\d+)", out)
+    mem = re.search(r"DefMemPerCPU=(\d+)", out)
+    if not cpus or not mem:
+        return None
+    return int(cpus.group(1)), f"{int(cpus.group(1)) * int(mem.group(1))}M"
+
+
 def srun_command(args, gpus: int) -> list[str]:
     return ["srun", f"--partition={args.gpu_partition}", f"--gres=gpu:{gpus}", "--nodes=1",
             "--ntasks=1", f"--cpus-per-task={args.gpu_cpus}", f"--mem={args.gpu_mem}",
@@ -303,8 +317,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="limit for the whole VibeSys run (default: two hours of work and one hour of GPU queue per round)")
     parser.add_argument("--gpu-partition", default="main")
     parser.add_argument("--gpu-time", default="00:20:00", help="time limit of each GPU job (default: %(default)s)")
-    parser.add_argument("--gpu-cpus", type=int, default=8)
-    parser.add_argument("--gpu-mem", default="64G")
+    parser.add_argument("--gpu-cpus", type=int,
+                        help="CPUs of each GPU job (default: the partition's CPUs per GPU, else 8)")
+    parser.add_argument("--gpu-mem",
+                        help="host memory of each GPU job (default: the partition's share of one "
+                             "GPU, CPUs per GPU x memory per CPU, else 64G); a gate that loads a "
+                             "large model's reference needs more than a small fixed amount")
     parser.add_argument("--gpu-hold-s", type=float, default=120,
                         help="the GPU broker keeps an allocation this many idle seconds after "
                              "a command, for the next one (0: one Slurm job per command)")
@@ -354,6 +372,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.gpu_cpus is None or args.gpu_mem is None:
+        cpus, mem = gpu_share(args.gpu_partition) or (8, "64G")
+        args.gpu_cpus = cpus if args.gpu_cpus is None else args.gpu_cpus
+        args.gpu_mem = mem if args.gpu_mem is None else args.gpu_mem
 
     if args.restart:
         if not args.seed_from:
