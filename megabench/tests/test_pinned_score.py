@@ -63,7 +63,7 @@ class PinnedScoreTest(unittest.TestCase):
             res = result(10.0, 150.0)
             score, info = pinned_score(res, Path(tmp), KEY)
             res["score_baseline"] = info
-            out = benchmark_output("c", res, score)
+            out = benchmark_output("c", res)
             self.assertIn("score_baseline", out["result"])
 
 

@@ -44,12 +44,22 @@ def capture(rank: int, contract: dict, submission: str, seed: int, rendezvous: s
             torch.cuda.synchronize(device)
             if rendezvous:
                 dist.barrier()
-            torch.cuda.cudart().cudaProfilerStart()
-            try:
-                candidate(inputs)
-                torch.cuda.synchronize(device)
-            finally:
-                torch.cuda.cudart().cudaProfilerStop()
+            if torch.version.hip:
+                # ROCm: rocprofv3 selects the warmed call by kernel iteration, and the
+                # roctx range (--marker-trace) marks the same window.
+                torch.cuda.nvtx.range_push("megabench_profile")
+                try:
+                    candidate(inputs)
+                    torch.cuda.synchronize(device)
+                finally:
+                    torch.cuda.nvtx.range_pop()
+            else:
+                torch.cuda.cudart().cudaProfilerStart()
+                try:
+                    candidate(inputs)
+                    torch.cuda.synchronize(device)
+                finally:
+                    torch.cuda.cudart().cudaProfilerStop()
     finally:
         if rendezvous:
             dist.destroy_process_group()

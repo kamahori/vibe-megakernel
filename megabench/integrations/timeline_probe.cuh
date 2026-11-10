@@ -11,6 +11,7 @@
 //                      S = num_blocks * num_groups;
 //                      low 32 bits  = type (bits 0-1) | event (2-11) | block (12-23) | sm (24-31)
 //                      high 32 bits = %globaltimer_lo, nanoseconds
+//                      (AMD/HIP: raw wall_clock64() ticks; the decoder scales them by --tick-ns)
 //
 // Size the buffer as megabench_timeline_words(blocks, groups, events per writer) and zero
 // it before the launch; writes past the end are dropped.
@@ -43,7 +44,11 @@ struct Writer {
     if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0)
       buffer[0] = uint64_t(gridDim.x) | (uint64_t(num_groups) << 32);
     uint32_t sm;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    sm = __smid();  // AMD: compute-unit id from HW_ID (low 8 bits kept)
+#else
     asm volatile("mov.u32 %0, %%smid;" : "=r"(sm));
+#endif
     next = buffer + 1 + uint64_t(blockIdx.x) * num_groups + group;
     end = buffer + words;
     stride = gridDim.x * num_groups;
@@ -54,7 +59,15 @@ struct Writer {
   __device__ void record(uint32_t event, uint32_t type) {
     if (!on) return;
     uint32_t now;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    // AMD: wall_clock64() is a constant-rate clock shared by every CU on the device
+    // (s_memrealtime). Its rate is device-specific (25 MHz on MI210; query
+    // hipDeviceAttributeWallClockRate), so the raw tick count is stored and
+    // timeline_profile_case scales it to nanoseconds (timeline.py --tick-ns).
+    now = uint32_t(wall_clock64());
+#else
     asm volatile("mov.u32 %0, %%globaltimer_lo;" : "=r"(now));
+#endif
     if (next < end) *next = (uint64_t(now) << 32) | tag | ((event & 0x3FFu) << 2) | type;
     next += stride;
   }

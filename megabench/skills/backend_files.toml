@@ -1,0 +1,9 @@
+# Files inside a skill that apply to one backend only. make_agent_workspace copies a listed
+# file only into workspaces of that backend; unlisted files go to every backend that the
+# skill's `backends` in .vibesys.toml allows.
+
+[cuda]
+files = ["megakernel-phase-profiling/scripts/codegen_gate.py"]
+
+[rocm]
+files = ["megakernel-phase-profiling/scripts/codegen_gate_amd.py"]

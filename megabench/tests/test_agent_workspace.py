@@ -25,7 +25,7 @@ from .test_glm53 import development as glm53_development
 
 MODULE_BY_FAMILY = TASK_MODULES
 SKILLS = ("megakernel-phase-profiling", "megakernel-microbench", "megakernel-regimes",
-          "blackwell-tensor-core-design")
+          "blackwell-tensor-core-design", "megakernel-design")
 MEGABENCH = Path(__file__).resolve().parents[1]
 
 
@@ -305,6 +305,77 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertIn("to('cpu', copy=True)", test_source)
             with self.assertRaises(FileExistsError):
                 make_workspace(case.id, destination, agent="kernelagent")
+
+    def test_rocm_workspace_uses_amd_profilers_and_bandwidth(self) -> None:
+        case = select_cases("p0")[0]
+        with tempfile.TemporaryDirectory() as directory:
+            project = make_workspace(case.id, Path(directory) / "rocm", agent="plain", backend="rocm")
+            self.assertIn("rocprof_profile_case", (project / "profile_candidate").read_text())
+            self.assertIn("amd_trace_report", (project / "trace_report").read_text())
+            self.assertIn("--bandwidth-tb-s 5.3", (project / "sol_info").read_text())
+            task = (project / "TASK.md").read_text()
+            for text in ("MI300X", "gfx942", "rocprofv3", "./trace_report", "codegen_gate_amd.py"):
+                self.assertIn(text, task)
+            self.assertNotIn("Nsight Compute for optional", task)
+            self.assertTrue((project / "megakernel_skills/megakernel-phase-profiling"
+                             / "scripts/codegen_gate_amd.py").is_file())
+            cuda = make_workspace(case.id, Path(directory) / "cuda", agent="plain", backend="cuda")
+            self.assertFalse((cuda / "trace_report").exists())
+            self.assertIn("ncu_profile_case", (cuda / "profile_candidate").read_text())
+
+    def test_gpu_sets_hardware_text_arch_and_bandwidth(self) -> None:
+        case = select_cases("p0")[0]
+        with tempfile.TemporaryDirectory() as directory:
+            mi210 = make_workspace(case.id, Path(directory) / "mi210", agent="plain", backend="rocm",
+                                   gpu="mi210")
+            task = (mi210 / "TASK.md").read_text()
+            for text in ("AMD Instinct MI210", "gfx90a", "1.6 TB/s"):
+                self.assertIn(text, task)
+            self.assertNotIn("MI300X", task)
+            self.assertIn("--bandwidth-tb-s 1.6", (mi210 / "sol_info").read_text())
+            mi350 = make_workspace(case.id, Path(directory) / "mi350", agent="plain", backend="rocm",
+                                   gpu="mi350x")
+            task = (mi350 / "TASK.md").read_text()
+            self.assertIn("--offload-arch=gfx950", task)
+            self.assertIn("--lds-per-cu 163840", task)
+            self.assertIn("--bandwidth-tb-s 8", (mi350 / "sol_info").read_text())
+            with self.assertRaises(ValueError):
+                make_workspace(case.id, Path(directory) / "cuda", agent="plain", backend="cuda", gpu="mi210")
+
+    def test_skills_and_scripts_follow_the_backend(self) -> None:
+        case = select_cases("p0")[0]
+        scripts = "megakernel_skills/megakernel-phase-profiling/scripts"
+        with tempfile.TemporaryDirectory() as directory:
+            rocm = make_workspace(case.id, Path(directory) / "rocm", agent="plain", backend="rocm")
+            cuda = make_workspace(case.id, Path(directory) / "cuda", agent="plain", backend="cuda")
+            self.assertFalse((rocm / "megakernel_skills/blackwell-tensor-core-design").exists())
+            self.assertNotIn("blackwell-tensor-core-design", (rocm / "TASK.md").read_text())
+            self.assertTrue((rocm / scripts / "codegen_gate_amd.py").is_file())
+            self.assertFalse((rocm / scripts / "codegen_gate.py").exists())
+            self.assertTrue((cuda / "megakernel_skills/blackwell-tensor-core-design/SKILL.md").is_file())
+            self.assertTrue((cuda / scripts / "codegen_gate.py").is_file())
+            self.assertFalse((cuda / scripts / "codegen_gate_amd.py").exists())
+
+    def test_stage_linking_is_optional(self) -> None:
+        case = select_cases("p0")[0]
+        with tempfile.TemporaryDirectory() as directory:
+            default = make_workspace(case.id, Path(directory) / "default", agent="plain", backend="rocm")
+            self.assertFalse((default / "megakernel_skills/megakernel-stage-linking").exists())
+            self.assertNotIn("megakernel-stage-linking", (default / "TASK.md").read_text())
+            opted = make_workspace(case.id, Path(directory) / "opted", agent="plain", backend="rocm",
+                                   optional_skills=("megakernel-stage-linking",))
+            self.assertTrue((opted / "megakernel_skills/megakernel-stage-linking/scripts/plk_link.py").is_file())
+            self.assertIn("megakernel-stage-linking", (opted / "TASK.md").read_text())
+            with self.assertRaises(ValueError):
+                make_workspace(case.id, Path(directory) / "bad", agent="plain", backend="rocm",
+                               optional_skills=("no-such-skill",))
+
+    def test_optional_skills_have_frontmatter_and_rules(self) -> None:
+        root = MEGABENCH / "skills-optional"
+        ruled = {r["path"] for r in tomllib.loads((root / ".vibesys.toml").read_text())["rule"]}
+        found = {p.parent.name for p in root.glob("*/SKILL.md")}
+        self.assertEqual(found, ruled)
+        self.assertFalse(found & set(SKILLS))
 
 
 if __name__ == "__main__":
