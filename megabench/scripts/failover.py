@@ -102,7 +102,10 @@ def choose(rows: list[dict], active: int | None, exclude: set[str]) -> dict | No
 
 
 def running(run: Path) -> bool:
-    return subprocess.run(["pgrep", "-f", f"runs/{run.name}/launch.sh"], capture_output=True).returncode == 0
+    # Match the launch script process only (its own command line, or the shell that runs
+    # it), not other commands that merely mention its path.
+    pattern = rf"^(\S*/)?(ba)?sh {re.escape(str(run))}/launch\.sh$|^{re.escape(str(run))}/launch\.sh$"
+    return subprocess.run(["pgrep", "-f", pattern], capture_output=True).returncode == 0
 
 
 def stop(run: Path) -> None:
