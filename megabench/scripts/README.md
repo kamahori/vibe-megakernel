@@ -10,6 +10,10 @@ They take every machine path from `env.sh` (each setting can be set in the envir
 | `launch_when_free.sh RUN CASE REF TOTAL_ROUNDS` | Starts a prepared run and its failover watcher when Slurm can start the run's GPU jobs at once. |
 | `watch.sh RUN...` | Prints one line for each new round file, error line or run exit. |
 
+VibeSys with the megabench-loop changes is the submodule `third_party/vibesys` (branch `megabench-loop` of uw-syfi/vibesys).
+Get it with `git submodule update --init third_party/vibesys`, then install it (as its README says) into the environment that `VS_VIBESYS` points to.
+`env.sh` takes the VibeSys skills from the submodule when it is checked out.
+
 Example:
 
 ```bash

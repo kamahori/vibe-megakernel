@@ -1,0 +1,4 @@
+[submodule "third_party/vibesys"]
+	path = third_party/vibesys
+	url = https://github.com/uw-syfi/vibesys.git
+	branch = megabench-loop
