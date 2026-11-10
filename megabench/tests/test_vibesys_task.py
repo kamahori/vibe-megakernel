@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ..integrations.make_vibesys_case_task import make_task
+from ..integrations.make_vibesys_case_task import GATE_QUEUE_ALLOWANCE_S, make_task
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -30,6 +30,16 @@ class VibeSysTaskTests(unittest.TestCase):
                 self.assertIn("main", namespace)
                 with self.assertRaises(SystemExit):
                     runpy.run_path(str(evaluator), run_name="__main__")
+
+    def test_gate_timeouts_leave_room_for_the_queue_only_with_a_launcher(self) -> None:
+        import tomllib
+        case_id = "dense-step-qwen3-06b-b1-s128"
+        for launcher, extra in (((), 0), (("srun", "--time=00:20:00"), GATE_QUEUE_ALLOWANCE_S)):
+            with self.subTest(launcher=launcher), tempfile.TemporaryDirectory() as directory:
+                task = make_task(case_id, Path(directory), ROOT, gate_launcher=launcher)
+                config = tomllib.loads((task / "vibesys.input.toml").read_text())
+                self.assertEqual(config["accuracy"]["timeout_seconds"], 1200 + extra)
+                self.assertEqual(config["benchmark"]["timeout_seconds"], 1800 + extra)
 
 
 if __name__ == "__main__":

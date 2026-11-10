@@ -19,6 +19,9 @@ from ..harness.runner import CONTRACT_FILES
 TRUSTED = (*CONTRACT_FILES, "megabench/integrations/vibesys_case_evaluator.py")
 
 
+GATE_QUEUE_ALLOWANCE_S = 4 * 3600  # queue room for gates that run through a launcher
+
+
 def make_task(case_id: str, root: Path, benchmark_root: Path | None = None,
               regimes: Path | None = None, gate_launcher: tuple[str, ...] = ()) -> Path:
     """Write the task; *gate_launcher* (for example srun and its arguments)
@@ -67,14 +70,18 @@ def make_task(case_id: str, root: Path, benchmark_root: Path | None = None,
         "exec " + "".join(f"{shlex.quote(part)} " for part in gate_launcher)
         + f"{shlex.quote(str(python))} \"$(dirname \"$0\")/evaluator.py\" \"$@\"\n")
     launcher.chmod(0o755)
+    # With a launcher (srun), a gate first waits in the Slurm queue, and VibeSys's timeout
+    # counts that wait: on a full node the gate "times out" before it runs. The job's own
+    # Slurm time limit stops a hung kernel; the VibeSys timeout only adds room for the queue.
+    queue = GATE_QUEUE_ALLOWANCE_S if gate_launcher else 0
     command = lambda mode: json.dumps([
         f".vibesys/tasks/{case_id}/evaluator.sh", mode,
         "--submission", "submission.py",
     ])
     (task / "vibesys.input.toml").write_text(
         "version = 1\n\n[agent]\ndomain = \"kernel-writing\"\n\n"
-        f"[accuracy]\ncommand = {command('accuracy')}\ntimeout_seconds = 1200\n\n"
-        f"[benchmark]\ncommand = {command('benchmark')}\ntimeout_seconds = 1800\n\n"
+        f"[accuracy]\ncommand = {command('accuracy')}\ntimeout_seconds = {1200 + queue}\n\n"
+        f"[benchmark]\ncommand = {command('benchmark')}\ntimeout_seconds = {1800 + queue}\n\n"
         "[benchmark.result]\njson_argument = \"--output-json\"\n"
         "metric = \"progress_score\"\n")
     brief = "TASK.md" if (root / "TASK.md").is_file() else "megabench/docs/AGENT_TASK.md"
