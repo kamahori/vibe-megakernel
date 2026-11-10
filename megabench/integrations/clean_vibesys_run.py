@@ -114,7 +114,7 @@ def write_launch(args, run: Path, env: dict[str, str], srun: list[str]) -> None:
     project = run / args.case
     vibesys_args = ["--project", str(project), "--config", str(project / "agent.toml"),
                     "--outer-loop", "agent", "--inner-loop", "multi-agent",
-                    "--max-rounds", str(args.rounds),
+                    "--max-rounds", str(getattr(args, "rounds_before", 0) + args.rounds),
                     # Each approved candidate gets the official gates, so a failed final round
                     # cannot lose the gains of earlier rounds (only official rounds can win).
                     "--official-eval-every", "1", "--profiler", "ncu", "--local",
@@ -154,6 +154,8 @@ def write_launch(args, run: Path, env: dict[str, str], srun: list[str]) -> None:
            and (full_rounds := getattr(args, "microbench_full_rounds", None)) is not None
            and full_rounds >= 0 else "")
         + ("VIBESYS_PHASE_AGENTS=1 " if getattr(args, "phase_agents", False) else "")
+        + (f"VIBESYS_ROUNDS_BEFORE={args.rounds_before} "
+           if getattr(args, "rounds_before", 0) else "")
         + f"VIBESYS_GPU_WAIT_FILE={q(run / 'gpu/queue_wait_s')} "
         + "\\\n  "
         + " ".join(NO_GPU) + " timeout --signal=TERM --kill-after=60s "
@@ -260,6 +262,23 @@ def rounds_done(workspace: Path, ref: str) -> int | None:
     return int(m.group(1)) if out.returncode == 0 and m else None
 
 
+def labelled_rounds(workspace: Path) -> int:
+    """The highest round-NNNN label in the progress files of *workspace* (0 if none).
+
+    A seed can carry rounds of several earlier runs, so its closed-round count alone can be
+    lower than the labels its ledger and rows already use.
+    """
+    high = 0
+    for path in (workspace / "progress").rglob("*"):
+        if not path.is_file() or path.stat().st_size > 50_000_000:
+            continue
+        found = re.findall(r"round-(\d{4})", path.name)
+        if path.suffix in {".md", ".json", ".jsonl"}:
+            found += re.findall(r"round-(\d{4})", path.read_text(errors="replace"))
+        high = max([high, *map(int, found)])
+    return high
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--case", required=True)
@@ -344,11 +363,14 @@ def main() -> int:
             parser.error("--restart: --seed-ref is not a 'multi: close round K' commit")
         if args.rounds <= done:
             parser.error(f"--restart: the seed already did {done} of the {args.rounds} rounds")
-        full = 1 if args.microbench_full_rounds is None else args.microbench_full_rounds
         args.rounds -= done
-        args.microbench_full_rounds = max(full - done, 0) if full >= 0 else full
-        print(f"restart after round {done}: {args.rounds} rounds remain, "
-              f"{args.microbench_full_rounds} of them full microbench rounds")
+        # The new run numbers its rounds after every round its seed already labels, so its
+        # rows, ledger entries and files never take the label of an earlier round.
+        args.rounds_before = max(done, labelled_rounds(args.seed_from))
+        if args.microbench_full_rounds is None:
+            args.microbench_full_rounds = 1  # absolute round numbers, as in the seed's run
+        print(f"restart after round {done}: {args.rounds} rounds remain, numbered from "
+              f"round {args.rounds_before + 1}")
     if args.microbench_full_rounds is None:
         args.microbench_full_rounds = 0 if args.seed_from else 1
     if args.phase_agents and args.microbench_full_rounds < 0:

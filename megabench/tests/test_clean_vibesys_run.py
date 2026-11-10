@@ -181,3 +181,14 @@ class RestartRoundsTests(unittest.TestCase):
             run("commit", "-q", "--allow-empty", "-m", "implementer-session-turn-1")
             self.assertIsNone(rounds_done(Path(tmp), "HEAD"))
             self.assertEqual(rounds_done(Path(tmp), "HEAD~1"), 3)
+
+
+class LabelledRoundsTests(unittest.TestCase):
+    def test_highest_label_in_names_and_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            (ws / "progress/plans").mkdir(parents=True)
+            (ws / "progress/plans/round-0002.json").write_text("{}")
+            (ws / "progress/open.md").write_text("## Q1 · open · opened round-0003\n")
+            self.assertEqual(clean.labelled_rounds(ws), 3)
+            self.assertEqual(clean.labelled_rounds(ws / "missing"), 0)
