@@ -206,7 +206,7 @@ class EvaluatorTests(unittest.TestCase):
 
     def test_benchmark_output_drops_row_contexts_and_stays_small(self) -> None:
         rows = [{"id": str(i), "contexts": list(range(256))} for i in range(4)]
-        output = evaluator.benchmark_output("c", {"status": "ok", "regimes": rows}, 1.5)
+        output = evaluator.benchmark_output("c", {"status": "ok", "regimes": rows})
         self.assertTrue(all("contexts" not in row for row in output["result"]["regimes"]))
         self.assertLess(len(json.dumps(output)), 100_000)
 

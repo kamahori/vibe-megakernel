@@ -14,6 +14,7 @@ from dataclasses import replace
 
 from ..cases import load_regimes, select_cases
 from ..harness.runner import CONTRACT_FILES
+from .vibesys_case_evaluator import METRIC, RELATIVE_NOISE
 
 
 TRUSTED = (*CONTRACT_FILES, "megabench/integrations/vibesys_case_evaluator.py")
@@ -73,7 +74,12 @@ def make_task(case_id: str, root: Path, benchmark_root: Path | None = None,
         f"[accuracy]\ncommand = {command('accuracy')}\ntimeout_seconds = 1200\n\n"
         f"[benchmark]\ncommand = {command('benchmark')}\ntimeout_seconds = 1800\n\n"
         "[benchmark.result]\njson_argument = \"--output-json\"\n"
-        "metric = \"progress_score\"\n")
+        f"metric = \"{METRIC}\"\n")
+    # Without objectives.toml VibeSys maximizes the metric and compares it exactly.
+    (task / "objectives.toml").write_text(
+        "# Kernel step time from the trusted evaluator; lower is better.\n"
+        f"[pareto]\nrelative_noise = {RELATIVE_NOISE}\n\n"
+        f"[[objective]]\nname = \"{METRIC}\"\ndirection = \"min\"\n")
     brief = "TASK.md" if (root / "TASK.md").is_file() else "megabench/docs/AGENT_TASK.md"
     reference = ("reference/megabench/tasks" if (root / "reference").is_dir()
                  else "megabench/tasks")
