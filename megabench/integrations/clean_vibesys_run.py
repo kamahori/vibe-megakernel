@@ -41,6 +41,9 @@ from pathlib import Path
 
 from ..cases import select_cases
 
+ROUND_WORK_S = 2 * 3600
+ROUND_QUEUE_ALLOWANCE_S = 3600  # queue room per round (the GPU jobs go through Slurm)
+
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_SKILLS = ("kernel-correctness", "kernel-ncu-analysis", "kernel-performance")
 # Generic guidance stays; docs that report past runs or designs do not.
@@ -129,7 +132,9 @@ def write_launch(args, run: Path, env: dict[str, str], srun: list[str]) -> None:
               "--job-script", str(run / "trusted/megabench/integrations/gpu_job.py"),
               "--max-jobs", str(args.max_gpu_jobs),
               "--hold-s", f"{getattr(args, 'gpu_hold_s', 0):g}", "--", *srun]
-    timeout = args.timeout_seconds or args.rounds * 7200
+    # GPU jobs wait in a shared Slurm queue, and this limit counts wall time: each round gets
+    # queue room on top of its work time, so a run behind a whole-node job is not cut mid-round.
+    timeout = args.timeout_seconds or args.rounds * (ROUND_WORK_S + ROUND_QUEUE_ALLOWANCE_S)
     (run / "launch.sh").write_text(
         "#!/bin/bash\nset -euo pipefail\n"
         f"key=$(<{q(key_file)})\n"
@@ -276,7 +281,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--venv", type=Path, default=REPO / ".venv")
     parser.add_argument("--cuda", type=Path, default=Path("/usr/local/cuda"))
     parser.add_argument("--timeout-seconds", type=int,
-                        help="limit for the whole VibeSys run (default: two hours per round)")
+                        help="limit for the whole VibeSys run (default: two hours of work and one hour of GPU queue per round)")
     parser.add_argument("--gpu-partition", default="main")
     parser.add_argument("--gpu-time", default="00:20:00", help="time limit of each GPU job (default: %(default)s)")
     parser.add_argument("--gpu-cpus", type=int, default=8)

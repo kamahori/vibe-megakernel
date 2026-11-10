@@ -53,7 +53,7 @@ class AgentEnvironmentTests(unittest.TestCase):
             self.assertNotIn("ANTHROPIC_API_KEY", broker)
             self.assertIn("-- srun --partition=main --gres=gpu:1", broker)
             self.assertIn(" ".join(clean.NO_GPU) + " timeout", "\n".join(lines))
-            self.assertIn("72000s", "\n".join(lines))
+            self.assertIn("108000s", "\n".join(lines))
             self.assertFalse((run / "job.sbatch").exists())
             self.assertNotIn("VIBESYS_MICROBENCH_PHASE", "\n".join(lines))
             args.microbench_phase = True
