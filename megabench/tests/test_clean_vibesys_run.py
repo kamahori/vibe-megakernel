@@ -221,3 +221,31 @@ class GpuShareTests(unittest.TestCase):
             fake.write_text("#!/bin/sh\necho 'PartitionName=main'\n")
             with mock.patch.dict(os.environ, {"PATH": f"{directory}:{os.environ['PATH']}"}):
                 self.assertIsNone(clean.gpu_share("main"))
+
+
+class SlurmShimTests(unittest.TestCase):
+    def test_shim_runs_the_real_tool_only_where_munge_is_reachable(self):
+        import socket, subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            d = Path(directory)
+            (d / "bin").mkdir()
+            real = d / "bin/squeue"
+            real.write_text("#!/bin/sh\necho real \"$@\"\n")
+            real.chmod(0o755)
+            munge = d / "munge"
+            munge.mkdir()
+            from unittest import mock
+            with mock.patch.object(clean, "NO_GPU_PATHS", (str(munge),)), \
+                    mock.patch.object(clean, "SLURM_TOOLS", ("squeue", "absent-tool")):
+                shims = clean.write_slurm_shims(d, str(d / "bin"))
+            self.assertEqual(sorted(p.name for p in shims.iterdir()), ["squeue"])
+            out = subprocess.run([shims / "squeue", "-u", "x"], capture_output=True, text=True)
+            self.assertEqual(out.returncode, 2)  # no socket: the sandbox case
+            self.assertIn("./gpu_run", out.stderr)
+            sock = socket.socket(socket.AF_UNIX)
+            sock.bind(str(munge / "munge.socket.2"))
+            try:
+                out = subprocess.run([shims / "squeue", "-u", "x"], capture_output=True, text=True)
+            finally:
+                sock.close()
+            self.assertEqual(out.stdout.strip(), "real -u x")

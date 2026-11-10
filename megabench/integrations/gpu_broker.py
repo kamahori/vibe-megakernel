@@ -82,6 +82,14 @@ def request(socket_path: Path, argv: list[str]) -> int:
     return reply["returncode"]
 
 
+def _bytes(value: str) -> float:
+    """Bytes of a Slurm memory value such as 48254344K or 64G (0 if not one)."""
+    m = re.fullmatch(r"([\d.]+)([KMGT]?)[nc]?", value.strip())
+    if not m:
+        return 0.0
+    return float(m.group(1)) * 1024 ** "_KMGT".index(m.group(2) or "_")
+
+
 def _minutes(value: str) -> float:
     """Minutes of a Slurm time limit (MM, HH:MM:SS, MM:SS or D-HH:MM:SS)."""
     days, _, rest = value.rpartition("-")
@@ -186,6 +194,7 @@ class Broker:
             beside = Path(args.srun[0]).with_name(name)
             return str(beside) if "/" in args.srun[0] and beside.exists() else name
         self.salloc, self.scancel, self.squeue = tool("salloc"), tool("scancel"), tool("squeue")
+        self.sacct = tool("sacct")
         if getattr(args, "hold_s", 0) > 0:
             threading.Thread(target=self._reap, daemon=True).start()
 
@@ -367,6 +376,43 @@ class Broker:
             with (self.project / "reports/gpu-jobs.jsonl").open("a") as out:
                 out.write(json.dumps(row) + "\n")
 
+    def oom_report(self, name: str, fd: int, jobid: str | None = None, tries: int = 5) -> bool:
+        """If Slurm stopped job or step *name* for host memory, tell the caller how and why.
+
+        Without this the caller sees only an exit code and a slurmstepd line; agents then
+        rebuilt framework tools to fit the limit instead of reporting the limit.
+        """
+        rows = []
+        for attempt in range(tries):  # accounting can lag the end of the job by seconds
+            command = [self.sacct, "-n", "-P", "-o", "JobName,State,MaxRSS,ReqMem"]
+            command += ["-j", jobid] if jobid else [f"--name={name}", "-S", "now-2days"]
+            try:
+                out = subprocess.run(command, capture_output=True, text=True, timeout=30,
+                                     env=self.env).stdout
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+            rows = [r.split("|") for r in out.splitlines() if r.count("|") == 3]
+            rows = [r for r in rows if r[0] == name or (not jobid and r[0] in ("batch", "extern", ""))]
+            if any("OUT_OF_MEMORY" in r[1] for r in rows):
+                break
+            if attempt + 1 < tries:
+                time.sleep(2)
+        hit = [r for r in rows if "OUT_OF_MEMORY" in r[1]]
+        if not hit:
+            return False
+        peak = max((r[2] for r in rows if r[2]), key=_bytes, default="?")
+        limit = next((r[3] for r in rows if r[3]), "?")
+        line = (f"gpu_run: OUT OF MEMORY: Slurm stopped {name}: it used more host memory than "
+                f"the job's limit ({limit}; peak seen {peak}). This is a limit of the run's setup, "
+                "not of the candidate. Report it as a harness fault in your result. A score from a "
+                "changed copy of a framework tool is not evidence for the gate.")
+        self.log(line.removeprefix("gpu_run: "))
+        try:
+            os.write(fd, (line + "\n").encode())
+        except OSError:
+            pass
+        return True
+
     def log(self, message: str) -> None:
         print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}", flush=True)
 
@@ -437,6 +483,8 @@ class Broker:
             self._state(name, None)
             self.log(f"{name} exit {code} after {time.monotonic() - started:.0f}s")
             self.gpu_report(name, path, t0, time.time(), fds[1], code, body["argv"])
+            if code != 0:
+                self.oom_report(name, fds[1])
             path.unlink(missing_ok=True)
             return {"returncode": code}
         finally:
@@ -486,6 +534,8 @@ class Broker:
             self._state(name, None)
         self.log(f"{name} exit {code} after {time.monotonic() - started:.0f}s")
         self.gpu_report(name, path, t0, time.time(), fds[1], code, body["argv"])
+        if code != 0:
+            self.oom_report(name, fds[1], jobid=alloc.jobid)
         path.unlink(missing_ok=True)
         self._give_back(alloc)
         return {"returncode": code}

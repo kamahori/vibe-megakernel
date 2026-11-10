@@ -56,6 +56,32 @@ NO_GPU = ("bwrap", "--dev-bind", "/", "/", "--dev", "/dev", "--unshare-user",
           "--die-with-parent", "--")
 # Without these the sandbox can neither use a GPU nor submit a Slurm job.
 NO_GPU_PATHS = ("/dev/nvidiactl", "/dev/nvidia0", "/run/munge")
+# Slurm tools that the agent might call. The sandbox hides the Munge socket, so in the
+# sandbox they fail with an authentication error that does not say what to do instead.
+SLURM_TOOLS = ("srun", "sbatch", "salloc", "squeue", "scontrol", "sacct", "scancel", "sinfo",
+               "slurm-windows")
+
+
+def write_slurm_shims(run: Path, path: str | None = None) -> Path:
+    """A PATH directory of Slurm tool wrappers: the real tool where Munge is reachable (the
+    launcher, the broker, the gates), else a message that names ./gpu_run."""
+    shims = run / "slurm-shims"
+    shims.mkdir(exist_ok=True)
+    munge = next(p for p in NO_GPU_PATHS if "munge" in p)
+    for tool in SLURM_TOOLS:
+        real = shutil.which(tool, path=path)
+        if not real:
+            continue
+        shim = shims / tool
+        shim.write_text(
+            "#!/bin/sh\n"
+            f"for s in {shlex.quote(munge)}/*; do [ -S \"$s\" ] && exec {shlex.quote(real)} \"$@\"; done\n"
+            f"echo '{tool}: Slurm is not reachable from the agent sandbox, by design. "
+            "Run a GPU command with ./gpu_run COMMAND in the workspace; the framework runs "
+            f"the official gates. Do not retry {tool}.' >&2\n"
+            "exit 2\n")
+        shim.chmod(0o755)
+    return shims
 
 
 def build_trusted(ref: str, trusted: Path, venv: Path) -> None:
@@ -92,7 +118,8 @@ def agent_env(args, run: Path, claude: Path, key: str) -> dict[str, str]:
     return {
         "HOME": str(run / "home"), "USER": os.environ.get("USER", "agent"),
         "LOGNAME": os.environ.get("USER", "agent"), "LANG": "C.UTF-8", "TERM": "dumb",
-        "PATH": ":".join((str(args.venv.resolve() / "bin"), str(claude.parent), str(args.cuda / "bin"),
+        "PATH": ":".join((str(run / "slurm-shims"), str(args.venv.resolve() / "bin"),
+                          str(claude.parent), str(args.cuda / "bin"),
                           "/usr/local/bin", "/usr/bin", "/bin")),
         credential(args)[1]: key, "TMPDIR": "/tmp", "TMP": "/tmp", "TEMP": "/tmp",
         "NCU_PATH": str(args.cuda / "bin/ncu"),
@@ -100,7 +127,8 @@ def agent_env(args, run: Path, claude: Path, key: str) -> dict[str, str]:
         "TRITON_CACHE_DIR": str(project / ".cache/triton"),
         "VIBESYS_STATE_HOME": str(run / "state"),
         "VIBESYS_AGENT_SANDBOX_ALLOW": ":".join(
-            (str(run / "trusted"), str(args.venv.resolve()), str(args.cuda), str(run / "gpu"))),
+            (str(run / "trusted"), str(args.venv.resolve()), str(args.cuda), str(run / "gpu"),
+             str(run / "slurm-shims"))),
     }
 
 
@@ -455,6 +483,7 @@ def main() -> int:
     (run / "state").mkdir()
     (run / "gpu").mkdir(mode=0o700)
     env = agent_env(args, run, Path(claude), key="")
+    write_slurm_shims(run, env["PATH"].split(":", 1)[1])
     # The sandbox of each GPU job; it holds no key.
     (run / "gpu-spec.json").write_text(json.dumps(
         {"env": {k: v for k, v in env.items() if k not in CREDENTIAL_ENV},

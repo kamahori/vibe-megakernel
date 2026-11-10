@@ -19,7 +19,7 @@ from ..cases import Case
 from ..tasks.parallel import initialize
 from ..workloads import make_inputs, oracle, reference
 from .benchmark import _audit_launches, _measure
-from .correctness import _compare
+from .correctness import _compare, input_fingerprints, mutated_inputs
 
 
 def agree(local_error: str | None) -> None:
@@ -80,7 +80,7 @@ def _rank_worker(rank: int, contract: dict, submission: str, device_kind: str,
             for trial in range(trials):
                 seed = shared_seed()
                 inputs = fresh_inputs(case, seed, device)
-                originals = {name: value.detach().to("cpu", copy=True) for name, value in inputs.items()}
+                originals = input_fingerprints(inputs)
                 expected = reference(case, inputs)
                 exact = oracle(case, inputs)
                 local_error, details = None, None
@@ -92,9 +92,8 @@ def _rank_worker(rank: int, contract: dict, submission: str, device_kind: str,
                     if first_start is not None:
                         result["first_call_ms_including_jit"] = (time.perf_counter()-first_start)*1000
                     details = _compare(expected, actual, case, device, exact)
-                    for name in inputs:
-                        if not torch.equal(inputs[name].cpu(), originals[name]):
-                            raise AssertionError(f"candidate mutated input {name}")
+                    for name in mutated_inputs(inputs, originals):
+                        raise AssertionError(f"candidate mutated input {name}")
                 except Exception as exc:
                     local_error = f"trial {trial}: {type(exc).__name__}: {exc}"
                 agree(local_error)
