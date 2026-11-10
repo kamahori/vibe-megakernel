@@ -494,7 +494,27 @@ def build(tcgen05: Path | None, probes: Path | None, results: Path | None,
     seen: dict = {}
     for r in rows:
         seen[r["id"]] = r  # a later file with the same point replaces an earlier one
-    return list(seen.values())
+    return portable(list(seen.values()), {"tcgen05": tcgen05, "probes": probes,
+                                          "results": results, "primbench": bench_out})
+
+
+def portable(rows: list[dict], roots: dict[str, Path | None]) -> list[dict]:
+    """Record each source file relative to the import root it came from ("probes/xover/...").
+
+    Row ids are set before this (from the paths the import read), so ids stay what they were;
+    the stored path no longer names the machine or the user that ran the import.
+    """
+    prefixes = [(f"{form}/", f"{label}/") for label, root in roots.items() if root
+                for form in dict.fromkeys([str(root).rstrip("/"), str(Path(root).resolve())])]
+    for r in rows:
+        file = (r.get("source") or {}).get("file")
+        if not isinstance(file, str):
+            continue
+        for prefix, label in prefixes:
+            if file.startswith(prefix):
+                r["source"]["file"] = label + file[len(prefix):]
+                break
+    return rows
 
 
 def main(argv: list[str] | None = None) -> int:

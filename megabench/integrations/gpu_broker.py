@@ -175,7 +175,8 @@ class Broker:
         self.states: dict[str, str] = {}
         self.state_lock = threading.Lock()
         self.queue_wait = 0.0
-        self.wait_file = Path(args.socket).parent / "queue_wait_s"
+        socket = getattr(args, "socket", None)  # in-process users (harness_model) have none
+        self.wait_file = Path(socket).parent / "queue_wait_s" if socket else None
         threading.Thread(target=self._count_wait, daemon=True).start()
         # Allocations held between commands (--hold-s).
         self.idle: list[Alloc] = []
@@ -304,7 +305,7 @@ class Broker:
                 states = set(self.states.values())
             if "pending" in states and "running" not in states:
                 self.queue_wait += tick
-            if time.monotonic() - last_write >= 5:
+            if self.wait_file and time.monotonic() - last_write >= 5:
                 last_write = time.monotonic()
                 try:
                     tmp = self.wait_file.with_suffix(".tmp")
