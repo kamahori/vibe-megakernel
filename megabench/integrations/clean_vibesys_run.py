@@ -276,13 +276,22 @@ def rounds_done(workspace: Path, ref: str) -> int | None:
     return int(m.group(1)) if out.returncode == 0 and m else None
 
 
-def labelled_rounds(workspace: Path) -> int:
+def labelled_rounds(workspace: Path, ref: str | None = None) -> int:
     """The highest round-NNNN label in the progress files of *workspace* (0 if none).
 
     A seed can carry rounds of several earlier runs, so its closed-round count alone can be
-    lower than the labels its ledger and rows already use.
+    lower than the labels its ledger and rows already use. With *ref*, read the files at that
+    commit: the working tree can hold files of a round that never closed.
     """
     high = 0
+    if ref:
+        names = subprocess.run(["git", "ls-tree", "-r", "--name-only", ref, "--", "progress"],
+                               cwd=workspace, capture_output=True, text=True).stdout
+        text = subprocess.run(["git", "grep", "-ohE", r"round-[0-9]{4}", ref, "--",
+                               "progress/*.md", "progress/*.json", "progress/*.jsonl"],
+                              cwd=workspace, capture_output=True, text=True).stdout
+        found = re.findall(r"round-(\d{4})", names + text)
+        return max([0, *map(int, found)])
     for path in (workspace / "progress").rglob("*"):
         if not path.is_file() or path.stat().st_size > 50_000_000:
             continue
@@ -371,7 +380,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
     if args.gpu_cpus is None or args.gpu_mem is None:
         cpus, mem = gpu_share(args.gpu_partition) or (8, "64G")
         args.gpu_cpus = cpus if args.gpu_cpus is None else args.gpu_cpus
@@ -388,7 +398,7 @@ def main() -> int:
         args.rounds -= done
         # The new run numbers its rounds after every round its seed already labels, so its
         # rows, ledger entries and files never take the label of an earlier round.
-        args.rounds_before = max(done, labelled_rounds(args.seed_from))
+        args.rounds_before = max(done, labelled_rounds(args.seed_from, args.seed_ref))
         if args.microbench_full_rounds is None:
             args.microbench_full_rounds = 1  # absolute round numbers, as in the seed's run
         print(f"restart after round {done}: {args.rounds} rounds remain, numbered from "

@@ -193,6 +193,20 @@ class LabelledRoundsTests(unittest.TestCase):
             self.assertEqual(clean.labelled_rounds(ws), 3)
             self.assertEqual(clean.labelled_rounds(ws / "missing"), 0)
 
+    def test_labels_at_the_seed_commit_ignore_later_files(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            git = lambda *a: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                                             *a], cwd=ws, check=True, capture_output=True)
+            git("init", "-q")
+            (ws / "progress/plans").mkdir(parents=True)
+            (ws / "progress/plans/round-0003.json").write_text('{"next": "round-0003"}')
+            git("add", "-A"); git("commit", "-qm", "multi: close round 3")
+            (ws / "progress/plans/round-0004.json").write_text("{}")
+            self.assertEqual(clean.labelled_rounds(ws), 4)
+            self.assertEqual(clean.labelled_rounds(ws, "HEAD"), 3)
+
 
 class GpuShareTests(unittest.TestCase):
     def test_share_from_partition_defaults(self):
