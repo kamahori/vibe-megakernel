@@ -1,0 +1,76 @@
+From de6f16cfc5fd4028a92fe9b2d72cdd9bc39d4806 Mon Sep 17 00:00:00 2001
+From: Garv Ghai <garv901@gmail.com>
+Date: Mon, 9 Nov 2026 18:34:01 -0800
+Subject: [PATCH 9/9] Multi-agent rounds: VIBESYS_ROUNDS_BEFORE numbers the
+ first round after the rounds a seeded workspace already did
+
+(cherry picked from commit 9f1b6699bd339b7838ae21b7d358c49db8476b09)
+---
+ .../orchestration/multi/orchestration.py        | 17 ++++++++++++++++-
+ .../orchestration/multi/test_rounds_before.py   | 15 +++++++++++++++
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+ create mode 100644 tests/vibesys/orchestration/multi/test_rounds_before.py
+
+diff --git a/src/vibesys/orchestration/multi/orchestration.py b/src/vibesys/orchestration/multi/orchestration.py
+index c8785cb81..d168d897e 100644
+--- a/src/vibesys/orchestration/multi/orchestration.py
++++ b/src/vibesys/orchestration/multi/orchestration.py
+@@ -2,6 +2,8 @@
+ 
+ from __future__ import annotations
+ 
++import os
++
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING
+ 
+@@ -65,6 +67,19 @@ if TYPE_CHECKING:
+     from vs_runtime.api import AgentBinding
+ 
+ 
++ROUNDS_BEFORE_ENV = "VIBESYS_ROUNDS_BEFORE"
++
++
++def rounds_before() -> int:
++    """Rounds that the seeded workspace already did in earlier runs (0 for a fresh run).
++
++    The first round of this run is numbered after them, so its plans, progress files and
++    measurement rows do not reuse an earlier round's label. ``--max-rounds`` counts them too.
++    """
++    raw = os.environ.get(ROUNDS_BEFORE_ENV, "").strip()
++    return max(int(raw), 0) if raw.isdigit() else 0
++
++
+ @dataclass(slots=True)
+ class _SelectedRound:
+     request: AttemptRequest
+@@ -224,7 +239,7 @@ class _MultiRun:
+         resumed = self.search.resume(aggregate.search, self.options.metric_space)
+         self.state = aggregate.model_copy(update={"search": resumed}, deep=True)
+         self.carry = self.search.initial_carry(self.records)
+-        self.round_number = len(self.records) + 1
++        self.round_number = len(self.records) + 1 + rounds_before()
+         self.files.write_pareto(
+             self.search.archive_summary(self.records, space=self.state.search.metrics)
+         )
+diff --git a/tests/vibesys/orchestration/multi/test_rounds_before.py b/tests/vibesys/orchestration/multi/test_rounds_before.py
+new file mode 100644
+index 000000000..c89266ea8
+--- /dev/null
++++ b/tests/vibesys/orchestration/multi/test_rounds_before.py
+@@ -0,0 +1,15 @@
++"""A run seeded from earlier runs numbers its rounds after theirs."""
++
++from vibesys.orchestration.multi import orchestration
++
++
++def test_rounds_before_reads_the_seeded_count(monkeypatch):
++    monkeypatch.setenv(orchestration.ROUNDS_BEFORE_ENV, "3")
++    assert orchestration.rounds_before() == 3
++
++
++def test_rounds_before_is_zero_for_a_fresh_or_bad_value(monkeypatch):
++    monkeypatch.delenv(orchestration.ROUNDS_BEFORE_ENV, raising=False)
++    assert orchestration.rounds_before() == 0
++    monkeypatch.setenv(orchestration.ROUNDS_BEFORE_ENV, "x")
++    assert orchestration.rounds_before() == 0

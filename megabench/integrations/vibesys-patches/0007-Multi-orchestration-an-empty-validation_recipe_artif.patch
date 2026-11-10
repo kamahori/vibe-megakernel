@@ -1,0 +1,25 @@
+From b7e7d22f9a855a99028465e4369c95585c6e0db8 Mon Sep 17 00:00:00 2001
+From: Garv Ghai <garv901@gmail.com>
+Date: Sun, 8 Nov 2026 23:22:35 -0800
+Subject: [PATCH 7/9] Multi orchestration: an empty validation_recipe_artifact
+ means no local recipe (archC14-pi05-s1 round 3 crashed on it)
+
+(cherry picked from commit 30bce602eea741c68a04d319906aad3a4b3b38a4)
+---
+ src/vibesys/orchestration/multi/orchestration.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/vibesys/orchestration/multi/orchestration.py b/src/vibesys/orchestration/multi/orchestration.py
+index 4e36dbe57..c8785cb81 100644
+--- a/src/vibesys/orchestration/multi/orchestration.py
++++ b/src/vibesys/orchestration/multi/orchestration.py
+@@ -552,7 +552,8 @@ class _MultiRun:
+         implementation: ImplementerReply,
+     ) -> str | None:
+         artifact = implementation.validation_recipe_artifact
+-        if artifact is None:
++        if artifact is None or not artifact.strip():
++            # An empty string from the structured reply means no recipe, like None.
+             return None
+         report_location = self.files.validation_report_location(
+             self.round_number,
