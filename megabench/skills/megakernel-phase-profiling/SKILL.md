@@ -102,6 +102,10 @@ except the profiling define.
 
 ## 6. Choose the target
 
+- Take the per-phase timeline before a whole-kernel NCU capture. NCU adds all phases of one
+  launch together. Use it on the phase that the timeline ranks first, to find why it is slow.
+- When a checked time misses its forecast, find the phases that missed, from the timeline,
+  before you choose the next change.
 - Reduce per phase across CTAs and across repeated occurrences.
 - Find the critical path. A phase that is long but overlapped with others may not matter.
 - Rank phases twice: by time, and by gap to a floor.

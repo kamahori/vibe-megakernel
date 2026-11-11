@@ -7,13 +7,22 @@ The agent must see the task and nothing from earlier work. This script builds:
 - ``<case>/``: a fresh workspace built from ``trusted/``;
 - ``home/``: an empty ``HOME`` for the agent CLI, with web tools denied, so no
   user config, memory, skills, plugins or transcripts are visible;
-- ``launch.sh`` and ``job.sbatch``: start VibeSys with ``env -i`` (only the
-  listed variables pass), the API key read from ``--api-key-file`` at launch,
-  and explicit skills, so preset skills outside the list do not load.
+- ``launch.sh``: runs on the host, not in a Slurm job. It starts
+  ``gpu_broker`` and then VibeSys with ``env -i`` (only the listed variables
+  pass), the agent credential read at launch (an API key from
+  ``--api-key-file``, or a ``claude setup-token`` subscription token from
+  ``--oauth-token-file``), and explicit
+  skills, so preset skills outside the list do not load.
 
-It then runs a preflight inside the VibeSys sandbox: forbidden paths must be
-absent and the workspace and trusted root must be present. Submit
-``job.sbatch`` only after the preflight passes.
+VibeSys runs in a namespace without GPU devices. Each GPU use is a Slurm job:
+the accuracy and benchmark gates run under ``srun``, and the agent runs GPU
+commands through ``./gpu_run``, which ``gpu_broker`` starts as a job in the
+agent's own sandbox (``gpu_job.py``).
+
+It then runs a preflight inside the VibeSys sandbox: forbidden paths (also the
+GPU devices and the Slurm credential socket) must be absent and the workspace
+and trusted root must be present. Start ``launch.sh`` only after the preflight
+passes.
 """
 
 from __future__ import annotations
@@ -21,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -29,6 +39,11 @@ import tarfile
 import tempfile
 from pathlib import Path
 
+from ..cases import select_cases
+
+ROUND_WORK_S = 2 * 3600
+ROUND_QUEUE_ALLOWANCE_S = 3600  # queue room per round (the GPU jobs go through Slurm)
+
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_SKILLS = ("kernel-correctness", "kernel-ncu-analysis", "kernel-performance")
 # Generic guidance stays; docs that report past runs or designs do not.
@@ -36,24 +51,37 @@ KEEP_DOCS = ("AGENT_TASK.md", "MODEL_STEP_TASKS.md", "REFERENCE_PRECISION.md",
              "SESSION_PROTOCOL.md")
 DROP_DIRS = ("probes", "submissions", "examples", "experiments", "runs", "archive")
 DENIED_TOOLS = ("WebFetch", "WebSearch")
+# VibeSys runs here: the host file system, but a /dev without GPU devices.
+NO_GPU = ("bwrap", "--dev-bind", "/", "/", "--dev", "/dev", "--unshare-user",
+          "--die-with-parent", "--")
+# Without these the sandbox can neither use a GPU nor submit a Slurm job.
+NO_GPU_PATHS = ("/dev/nvidiactl", "/dev/nvidia0", "/run/munge")
+# Slurm tools that the agent might call. The sandbox hides the Munge socket, so in the
+# sandbox they fail with an authentication error that does not say what to do instead.
+SLURM_TOOLS = ("srun", "sbatch", "salloc", "squeue", "scontrol", "sacct", "scancel", "sinfo",
+               "slurm-windows")
 
-PREFLIGHT = r"""
-import json, os, subprocess, sys
-from pathlib import Path
-from vs_agent.host_resource_declarations import declare_agent_host_resources
-from vs_sandbox.api import build_host_sandbox
-spec = json.load(open(sys.argv[1]))
-env = spec["env"]
-res = declare_agent_host_resources(env, binary_path=spec["claude"], provider="claude")
-sb = build_host_sandbox(spec["project"], env=env, resources=res, log=lambda _: None,
-                        require_enforcement=True)
-lines = [f'for p in "$@"; do if [ -e "$p" ]; then echo "present $p"; else echo "absent $p"; fi; done']
-paths = spec["forbid"] + spec["require"]
-out = subprocess.run(sb.wrap(["/bin/bash", "-c", lines[0], "probe", *paths]),
-                     capture_output=True, text=True, timeout=120, env=env)
-seen = dict(line.split(" ", 1)[::-1] for line in out.stdout.split("\n") if line)
-print(json.dumps({"seen": seen, "stderr": out.stderr[-2000:]}))
-"""
+
+def write_slurm_shims(run: Path, path: str | None = None) -> Path:
+    """A PATH directory of Slurm tool wrappers: the real tool where Munge is reachable (the
+    launcher, the broker, the gates), else a message that names ./gpu_run."""
+    shims = run / "slurm-shims"
+    shims.mkdir(exist_ok=True)
+    munge = next(p for p in NO_GPU_PATHS if "munge" in p)
+    for tool in SLURM_TOOLS:
+        real = shutil.which(tool, path=path)
+        if not real:
+            continue
+        shim = shims / tool
+        shim.write_text(
+            "#!/bin/sh\n"
+            f"for s in {shlex.quote(munge)}/*; do [ -S \"$s\" ] && exec {shlex.quote(real)} \"$@\"; done\n"
+            f"echo '{tool}: Slurm is not reachable from the agent sandbox, by design. "
+            "Run a GPU command with ./gpu_run COMMAND in the workspace; the framework runs "
+            f"the official gates. Do not retry {tool}.' >&2\n"
+            "exit 2\n")
+        shim.chmod(0o755)
+    return shims
 
 
 def build_trusted(ref: str, trusted: Path, venv: Path) -> None:
@@ -73,53 +101,109 @@ def build_trusted(ref: str, trusted: Path, venv: Path) -> None:
     (trusted / ".venv").symlink_to(venv)
 
 
+# Variables that carry the agent credential; GPU jobs and gates drop both.
+CREDENTIAL_ENV = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+
+
+def credential(args) -> tuple[Path, str]:
+    """The credential file and the variable the Claude CLI reads it from."""
+    if args.oauth_token_file:
+        return args.oauth_token_file, "CLAUDE_CODE_OAUTH_TOKEN"
+    return args.api_key_file, "ANTHROPIC_API_KEY"
+
+
 def agent_env(args, run: Path, claude: Path, key: str) -> dict[str, str]:
     """The complete environment VibeSys and the agent see; nothing else passes."""
     project = run / args.case
     return {
         "HOME": str(run / "home"), "USER": os.environ.get("USER", "agent"),
         "LOGNAME": os.environ.get("USER", "agent"), "LANG": "C.UTF-8", "TERM": "dumb",
-        "PATH": ":".join((str(args.venv.resolve() / "bin"), str(claude.parent), str(args.cuda / "bin"),
+        "PATH": ":".join((str(run / "slurm-shims"), str(args.venv.resolve() / "bin"),
+                          str(claude.parent), str(args.cuda / "bin"),
                           "/usr/local/bin", "/usr/bin", "/bin")),
-        "ANTHROPIC_API_KEY": key, "TMPDIR": "/tmp", "TMP": "/tmp", "TEMP": "/tmp",
+        credential(args)[1]: key, "TMPDIR": "/tmp", "TMP": "/tmp", "TEMP": "/tmp",
         "NCU_PATH": str(args.cuda / "bin/ncu"),
         "TORCH_EXTENSIONS_DIR": str(project / ".torch_extensions"),
         "TRITON_CACHE_DIR": str(project / ".cache/triton"),
         "VIBESYS_STATE_HOME": str(run / "state"),
         "VIBESYS_AGENT_SANDBOX_ALLOW": ":".join(
-            (str(run / "trusted"), str(args.venv.resolve()), str(args.cuda))),
+            (str(run / "trusted"), str(args.venv.resolve()), str(args.cuda), str(run / "gpu"),
+             str(run / "slurm-shims"))),
     }
 
 
-def write_launch(args, run: Path, env: dict[str, str]) -> None:
+def gpu_share(partition: str) -> tuple[int, str] | None:
+    """(CPUs, memory) that Slurm gives one GPU of *partition* by default, if it says."""
+    try:
+        out = subprocess.run(["scontrol", "show", "partition", partition], capture_output=True,
+                             text=True, timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    cpus = re.search(r"DefCpuPerGPU=(\d+)", out)
+    mem = re.search(r"DefMemPerCPU=(\d+)", out)
+    if not cpus or not mem:
+        return None
+    return int(cpus.group(1)), f"{int(cpus.group(1)) * int(mem.group(1))}M"
+
+
+def srun_command(args, gpus: int) -> list[str]:
+    return ["srun", f"--partition={args.gpu_partition}", f"--gres=gpu:{gpus}", "--nodes=1",
+            "--ntasks=1", f"--cpus-per-task={args.gpu_cpus}", f"--mem={args.gpu_mem}",
+            f"--time={args.gpu_time}", "--kill-on-bad-exit=1"]
+
+
+def write_launch(args, run: Path, env: dict[str, str], srun: list[str]) -> None:
     project = run / args.case
     vibesys_args = ["--project", str(project), "--config", str(project / "agent.toml"),
                     "--outer-loop", "agent", "--inner-loop", "multi-agent",
-                    "--max-rounds", str(args.rounds), "--profiler", "ncu", "--local",
-                    "--headless", "--task", args.case]
+                    "--max-rounds", str(getattr(args, "rounds_before", 0) + args.rounds),
+                    # Each approved candidate gets the official gates, so a failed final round
+                    # cannot lose the gains of earlier rounds (only official rounds can win).
+                    "--official-eval-every", "1", "--profiler", "ncu", "--local",
+                    "--backend", "cuda", "--headless", "--task", args.case]
     for skill in args.skills:
         vibesys_args += ["--skills-dir", str(args.vibesys_skills / skill)]
     vibesys_args += ["--extra-skills", str(run / "trusted/megabench/skills")]
-    fixed = {k: v for k, v in env.items() if k != "ANTHROPIC_API_KEY"}
+    fixed = {k: v for k, v in env.items() if k not in CREDENTIAL_ENV}
+    key_file, key_env = credential(args)
     passed = " ".join(f"{k}={shlex.quote(v)}" for k, v in fixed.items())
+    q = lambda path: shlex.quote(str(path))
+    broker = [str(args.venv / "bin/python"), "-m", "megabench.integrations.gpu_broker", "serve",
+              "--socket", str(run / "gpu/broker.sock"), "--requests", str(run / "state/gpu"),
+              "--spec", str(run / "gpu-spec.json"), "--job-python", str(args.vibesys.parent / "python"),
+              "--job-script", str(run / "trusted/megabench/integrations/gpu_job.py"),
+              "--max-jobs", str(args.max_gpu_jobs),
+              "--hold-s", f"{getattr(args, 'gpu_hold_s', 0):g}", "--", *srun]
+    # GPU jobs wait in a shared Slurm queue, and this limit counts wall time: each round gets
+    # queue room on top of its work time, so a run behind a whole-node job is not cut mid-round.
+    timeout = args.timeout_seconds or args.rounds * (ROUND_WORK_S + ROUND_QUEUE_ALLOWANCE_S)
     (run / "launch.sh").write_text(
         "#!/bin/bash\nset -euo pipefail\n"
-        f"key=$(<{shlex.quote(str(args.api_key_file))})\n"
-        f"mkdir -p {shlex.quote(env['TORCH_EXTENSIONS_DIR'])} "
-        f"{shlex.quote(env['TRITON_CACHE_DIR'])} {shlex.quote(env['VIBESYS_STATE_HOME'])}\n"
-        f"cd {shlex.quote(str(project))}\n"
-        f"exec env -i {passed} CUDA_VISIBLE_DEVICES=\"${{CUDA_VISIBLE_DEVICES:-}}\" "
-        "ANTHROPIC_API_KEY=\"$key\" \\\n  timeout --signal=TERM --kill-after=60s "
-        f"{args.timeout_seconds}s {shlex.quote(str(args.vibesys))} "
+        f"key=$(<{q(key_file)})\n"
+        f"mkdir -p {q(env['TORCH_EXTENSIONS_DIR'])} "
+        f"{q(env['TRITON_CACHE_DIR'])} {q(env['VIBESYS_STATE_HOME'])}\n"
+        f"cd {q(project)}\n"
+        f"env -i {passed} PYTHONPATH={q(run / 'trusted')} "
+        + " ".join(map(shlex.quote, broker)) + f" >> {q(run / 'gpu-broker.log')} 2>&1 &\n"
+        "broker=$!\ntrap 'kill $broker 2>/dev/null || true' EXIT\n"
+        f"for _ in $(seq 100); do [ -S {q(run / 'gpu/broker.sock')} ] && break; sleep 0.1; done\n"
+        f"env -i {passed} {key_env}=\"$key\" VIBESYS_MEASUREMENT_DIR=reports "
+        + ("VIBESYS_MICROBENCH_PHASE=1 " if getattr(args, "microbench_phase", False) else "")
+        + (f"VIBESYS_MICROBENCH_MINUTES={args.microbench_minutes:g} "
+           if getattr(args, "microbench_minutes", None) else "")
+        + (f"VIBESYS_MICROBENCH_FULL_ROUNDS={full_rounds} "
+           if (getattr(args, "microbench_phase", False) or getattr(args, "phase_agents", False))
+           and (full_rounds := getattr(args, "microbench_full_rounds", None)) is not None
+           and full_rounds >= 0 else "")
+        + ("VIBESYS_PHASE_AGENTS=1 " if getattr(args, "phase_agents", False) else "")
+        + (f"VIBESYS_ROUNDS_BEFORE={args.rounds_before} "
+           if getattr(args, "rounds_before", 0) else "")
+        + f"VIBESYS_GPU_WAIT_FILE={q(run / 'gpu/queue_wait_s')} "
+        + "\\\n  "
+        + " ".join(NO_GPU) + " timeout --signal=TERM --kill-after=60s "
+        f"{timeout}s {q(args.vibesys)} "
         + " ".join(shlex.quote(a) for a in vibesys_args) + "\n")
     (run / "launch.sh").chmod(0o700)
-    (run / "job.sbatch").write_text(
-        "#!/bin/bash\n"
-        f"#SBATCH --partition={args.partition}\n#SBATCH --gres=gpu:1\n#SBATCH --nodes=1\n"
-        f"#SBATCH --ntasks=1\n#SBATCH --cpus-per-task=8\n#SBATCH --mem=128G\n"
-        f"#SBATCH --time={args.time}\n#SBATCH --chdir={run}\n"
-        f"#SBATCH --output={run}/job-%j.log\n"
-        f"exec {run}/launch.sh\n")
 
 
 def preflight(args, run: Path, env: dict[str, str], claude: Path) -> bool:
@@ -129,16 +213,14 @@ def preflight(args, run: Path, env: dict[str, str], claude: Path) -> bool:
     forbid = [str(home / ".claude"), str(home / ".claude.json"), *map(str, args.forbid)]
     forbid += [str(repo / name) for repo in sorted(repos) for name in ("megabench", "README.md")]
     forbid += [str(run / "trusted/megabench" / name) for name in DROP_DIRS]
+    forbid += [*NO_GPU_PATHS, str(run / "state"), str(credential(args)[0].resolve())]
     require = [str(run / args.case / "TASK.md"), str(run / "trusted/megabench/cases.py"),
-               str(args.venv / "bin/python")]
-    spec = run / "state/preflight.json"
-    spec.write_text(json.dumps({"env": env | {"ANTHROPIC_API_KEY": "unset-in-preflight"},
-                                "claude": str(claude), "project": str(run / args.case),
-                                "forbid": forbid, "require": require}))
+               str(args.venv.resolve() / "bin/python"), str(run / "gpu")]
     python = args.vibesys.parent / "python"
-    out = subprocess.run([str(python), "-c", PREFLIGHT, str(spec)], capture_output=True,
-                         text=True, check=False)
-    spec.unlink()
+    # The same sandbox that gpu_job.py builds in each GPU job, seen from VibeSys's namespace.
+    out = subprocess.run([*NO_GPU, str(python), str(run / "trusted/megabench/integrations/gpu_job.py"),
+                          "probe", str(run / "gpu-spec.json"), *forbid, *require],
+                         capture_output=True, text=True, check=False, env=env)
     if out.returncode:
         print(out.stderr[-3000:], file=sys.stderr)
         return False
@@ -152,13 +234,113 @@ def preflight(args, run: Path, env: dict[str, str], claude: Path) -> bool:
     return not bad
 
 
-def main() -> int:
+SEED_SKIP = (".build/", "progress/microbench/.build-cache/", "variants/")
+ROUND_FILE = re.compile(r"(^|/)round-\d+")
+
+
+def seed_workspace(workspace: Path, source: Path, ref: str) -> list[str]:
+    """Copy the candidate and the progress files of commit *ref* of the workspace *source*.
+
+    The new workspace keeps every file that the harness installed (TASK.md, tools, skills),
+    except submission.py, which comes from the seed. Files under progress/ come from the seed.
+    A progress file that belongs to one round of the earlier run (plans, microbench requests
+    and answers, round notes) goes to progress/prior/, so that the new run's rounds do not
+    find files of the same name. Build outputs are not copied.
+    """
+    names = subprocess.run(["git", "-C", str(source), "ls-tree", "-r", "-z", "--name-only", ref],
+                           capture_output=True, check=True).stdout.decode().split("\0")
+    names = list(filter(None, names))
+    # Skill folders and agent-tool folders are installed by the harness and VibeSys.
+    skills = {n.split("/", 1)[0] for n in names if n.count("/") == 1 and n.endswith("/SKILL.md")}
+    copied = []
+    for name in names:
+        top = name.split("/", 1)[0]
+        if name.startswith(SEED_SKIP) or ("/" in name and (top.startswith(".") or top in skills)):
+            continue
+        installed = (workspace / name).exists()
+        if installed and name != "submission.py" and not name.startswith("progress/"):
+            continue
+        target = name
+        if name.startswith("progress/") and ROUND_FILE.search(name):
+            target = "progress/prior/" + name.removeprefix("progress/")
+        data = subprocess.run(["git", "-C", str(source), "show", f"{ref}:{name}"],
+                              capture_output=True, check=True).stdout
+        path = workspace / target
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        copied.append(target)
+    commit_workspace(workspace, f"Seed from {source.name} at {ref}")
+    return copied
+
+
+def commit_workspace(workspace: Path, message: str) -> None:
+    """Commit what setup added: VibeSys starts only from a clean repository."""
+    if not subprocess.run(["git", "status", "--porcelain"], cwd=workspace, capture_output=True,
+                          text=True, check=True).stdout.strip():
+        return
+    subprocess.run(["git", "add", "-A"], cwd=workspace, check=True)
+    subprocess.run(["git", "-c", "user.name=MegaBench", "-c", "user.email=megabench@example.invalid",
+                    "commit", "-q", "-m", message], cwd=workspace, check=True)
+
+
+def cache_rows(args, run: Path) -> int:
+    """Copy the rows that earlier runs of the case measured into the new workspace."""
+    from ..primdb import cache
+
+    rows = cache.harvest(run.parent, args.case, exclude=(run.name,),
+                         store=getattr(args, "microbench_cache_store", None))
+    n = cache.write(rows, run / args.case / "progress/microbench/primdb_cache.jsonl")
+    if getattr(args, "microbench_cache_store", None):
+        cache.write(rows, args.microbench_cache_store)
+    print(f"microbench cache: {n} measured rows of {args.case} from earlier runs")
+    return n
+
+
+def rounds_done(workspace: Path, ref: str) -> int | None:
+    """K when *ref* of *workspace* is the commit that closes round K, else None."""
+    out = subprocess.run(["git", "log", "-1", "--format=%s", ref], cwd=workspace,
+                         capture_output=True, text=True)
+    m = re.fullmatch(r"multi: close round (\d+)", out.stdout.strip())
+    return int(m.group(1)) if out.returncode == 0 and m else None
+
+
+def labelled_rounds(workspace: Path, ref: str | None = None) -> int:
+    """The highest round-NNNN label in the progress files of *workspace* (0 if none).
+
+    A seed can carry rounds of several earlier runs, so its closed-round count alone can be
+    lower than the labels its ledger and rows already use. With *ref*, read the files at that
+    commit: the working tree can hold files of a round that never closed.
+    """
+    high = 0
+    if ref:
+        names = subprocess.run(["git", "ls-tree", "-r", "--name-only", ref, "--", "progress"],
+                               cwd=workspace, capture_output=True, text=True).stdout
+        text = subprocess.run(["git", "grep", "-ohE", r"round-[0-9]{4}", ref, "--",
+                               "progress/*.md", "progress/*.json", "progress/*.jsonl"],
+                              cwd=workspace, capture_output=True, text=True).stdout
+        found = re.findall(r"round-(\d{4})", names + text)
+        return max([0, *map(int, found)])
+    for path in (workspace / "progress").rglob("*"):
+        if not path.is_file() or path.stat().st_size > 50_000_000:
+            continue
+        found = re.findall(r"round-(\d{4})", path.name)
+        if path.suffix in {".md", ".json", ".jsonl"}:
+            found += re.findall(r"round-(\d{4})", path.read_text(errors="replace"))
+        high = max([high, *map(int, found)])
+    return high
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--case", required=True)
     parser.add_argument("--run-dir", type=Path, required=True,
                         help="new directory, outside any directory of earlier work")
-    parser.add_argument("--api-key-file", type=Path, required=True,
+    secret = parser.add_mutually_exclusive_group(required=True)
+    secret.add_argument("--api-key-file", type=Path,
                         help="file with the API key for the agent account; read at launch")
+    secret.add_argument("--oauth-token-file", type=Path,
+                        help="file with a `claude setup-token` token for the agent's "
+                             "subscription account; read at launch")
     parser.add_argument("--vibesys", type=Path, required=True, help="vibesys executable")
     parser.add_argument("--vibesys-skills", type=Path, required=True,
                         help="VibeSys preset skills root (resources/skills)")
@@ -168,19 +350,97 @@ def main() -> int:
     parser.add_argument("--ref", default="HEAD", help="git ref for the trusted snapshot")
     parser.add_argument("--venv", type=Path, default=REPO / ".venv")
     parser.add_argument("--cuda", type=Path, default=Path("/usr/local/cuda"))
-    parser.add_argument("--timeout-seconds", type=int, default=3300)
-    parser.add_argument("--partition", default="main")
-    parser.add_argument("--time", default="01:00:00")
+    parser.add_argument("--timeout-seconds", type=int,
+                        help="limit for the whole VibeSys run (default: two hours of work and one hour of GPU queue per round)")
+    parser.add_argument("--gpu-partition", default="main")
+    parser.add_argument("--gpu-time", default="00:20:00", help="time limit of each GPU job (default: %(default)s)")
+    parser.add_argument("--gpu-cpus", type=int,
+                        help="CPUs of each GPU job (default: the partition's CPUs per GPU, else 8)")
+    parser.add_argument("--gpu-mem",
+                        help="host memory of each GPU job (default: the partition's share of one "
+                             "GPU, CPUs per GPU x memory per CPU, else 64G); a gate that loads a "
+                             "large model's reference needs more than a small fixed amount")
+    parser.add_argument("--gpu-hold-s", type=float, default=120,
+                        help="the GPU broker keeps an allocation this many idle seconds after "
+                             "a command, for the next one (0: one Slurm job per command)")
+    parser.add_argument("--max-gpu-jobs", type=int, default=8,
+                        help="GPU jobs from the agent queued or running at a time")
+    parser.add_argument("--microbench-phase", action=argparse.BooleanOptionalAction, default=True,
+                        help="each round plan is a draft: VibeSys runs the microbench phase on it "
+                             "and the orchestrator revises the plan before the implementer starts "
+                             "(default: on)")
+    parser.add_argument("--microbench-minutes", type=float, default=30,
+                        help="time limit of each pre-plan microbench phase; the agents get a "
+                             "deadline and leave what they cannot measure open, and VibeSys "
+                             "stops the phase a grace period later (default: %(default)s; "
+                             "0: no limit)")
+    parser.add_argument("--microbench-full-rounds", type=int,
+                        help="rounds that run the full microbench phase; a later round runs it "
+                             "only for open questions that the kernel timeline cannot settle "
+                             "(-1: every round runs the full phase; default: 1, or 0 with "
+                             "--seed-from, whose seed already has its opening rounds)")
+    parser.add_argument("--phase-agents", action="store_true",
+                        help="rounds after the full microbench rounds are phase rounds: the "
+                             "implementer coordinates one phase subagent per target phase "
+                             "(needs a round count: an unset or negative "
+                             "--microbench-full-rounds means 2)")
+    parser.add_argument("--seed-from", type=Path,
+                        help="workspace of an earlier run: start from its candidate and progress "
+                             "files at --seed-ref instead of an empty candidate")
+    parser.add_argument("--seed-ref", default="HEAD",
+                        help="commit of --seed-from to start from (default: %(default)s)")
+    parser.add_argument("--microbench-cache", dest="microbench_cache", action="store_true",
+                        default=False,
+                        help="start with the measured rows of earlier runs of the case (numbers "
+                             "only, no notes). Off by default: a run measures what it needs")
+    parser.add_argument("--restart", action="store_true",
+                        help="continue the run of --seed-from after the round that --seed-ref "
+                             "closes ('multi: close round K'): --rounds and "
+                             "--microbench-full-rounds count the whole run, and the K rounds "
+                             "already done are subtracted")
+    parser.add_argument("--no-microbench-cache", dest="microbench_cache", action="store_false",
+                        help="start without cached rows (the default)")
+    parser.add_argument("--microbench-cache-store", type=Path,
+                        help="file that keeps cached rows after run directories are deleted")
     parser.add_argument("--forbid", type=Path, action="append", default=[],
                         help="extra path that must be absent in the sandbox (repeat)")
-    args = parser.parse_args()
+    return parser
 
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.gpu_cpus is None or args.gpu_mem is None:
+        cpus, mem = gpu_share(args.gpu_partition) or (8, "64G")
+        args.gpu_cpus = cpus if args.gpu_cpus is None else args.gpu_cpus
+        args.gpu_mem = mem if args.gpu_mem is None else args.gpu_mem
+
+    if args.restart:
+        if not args.seed_from:
+            parser.error("--restart needs --seed-from")
+        done = rounds_done(args.seed_from, args.seed_ref)
+        if done is None:
+            parser.error("--restart: --seed-ref is not a 'multi: close round K' commit")
+        if args.rounds <= done:
+            parser.error(f"--restart: the seed already did {done} of the {args.rounds} rounds")
+        args.rounds -= done
+        # The new run numbers its rounds after every round its seed already labels, so its
+        # rows, ledger entries and files never take the label of an earlier round.
+        args.rounds_before = max(done, labelled_rounds(args.seed_from, args.seed_ref))
+        if args.microbench_full_rounds is None:
+            args.microbench_full_rounds = 1  # absolute round numbers, as in the seed's run
+        print(f"restart after round {done}: {args.rounds} rounds remain, numbered from "
+              f"round {args.rounds_before + 1}")
+    if args.microbench_full_rounds is None:
+        args.microbench_full_rounds = 0 if args.seed_from else 1
+    if args.phase_agents and args.microbench_full_rounds < 0:
+        args.microbench_full_rounds = 2  # -1 means every round is a full round: no phase round
     run = args.run_dir.resolve()
     if run.exists():
         parser.error(f"{run} exists; use a new directory for each run")
-    key_file = args.api_key_file.resolve()
+    key_file = credential(args)[0].resolve()
     if not key_file.is_file() or key_file.stat().st_mode & 0o077:
-        parser.error("--api-key-file must be a file readable only by its owner (chmod 600)")
+        parser.error("the credential file must be readable only by its owner (chmod 600)")
     if key_file.is_relative_to(run):
         parser.error("keep the key file outside the run directory")
     claude = shutil.which("claude")
@@ -192,24 +452,48 @@ def main() -> int:
 
     args.venv = args.venv.absolute()
     build_trusted(args.ref, run / "trusted", args.venv.resolve())
+    gpus = select_cases("all", [args.case])[0].gpus
+    srun = srun_command(args, gpus)
+    # Gates keep cached baseline timings in state/, which the agent cannot see;
+    # the shared HOME would let the agent edit them.
+    gate = ["env", *(f"-u{name}" for name in CREDENTIAL_ENV),
+            f"MEGABENCH_BASELINE_CACHE={run / 'state/baseline-cache'}",
+            f"MEGABENCH_OFFICIAL_TIMING_HISTORY={run / 'state/official-timing.jsonl'}",
+            *srun, "--job-name=vs-gate"]
     command = [str(run / "trusted/.venv/bin/python"), "-m",
                "megabench.integrations.make_agent_workspace", "--case", args.case,
                "--output", str(run / args.case), "--agent", "vibesys",
-               "--benchmark-root", str(run / "trusted")]
+               "--benchmark-root", str(run / "trusted"),
+               "--gpu-socket", str(run / "gpu/broker.sock"), "--gate-launcher", shlex.join(gate)]
     if args.regimes:
         command += ["--regimes", str(args.regimes.resolve())]
+    if args.phase_agents:
+        command += ["--phase-agents"]
     subprocess.run(command, check=True, cwd=run / "trusted",
                    env=os.environ | {"PYTHONPATH": str(run / "trusted")})
+    if args.seed_from:
+        copied = seed_workspace(run / args.case, args.seed_from.resolve(), args.seed_ref)
+        print(f"seed: {len(copied)} files from {args.seed_from} at {args.seed_ref}")
+    if args.microbench_cache:
+        cache_rows(args, run)
+        commit_workspace(run / args.case, "Microbench rows of earlier runs of the case")
     settings = run / "home/.claude/settings.json"
     settings.parent.mkdir(parents=True)
     settings.write_text(json.dumps({"permissions": {"deny": list(DENIED_TOOLS)}}, indent=2))
     (run / "state").mkdir()
+    (run / "gpu").mkdir(mode=0o700)
     env = agent_env(args, run, Path(claude), key="")
-    write_launch(args, run, env)
+    write_slurm_shims(run, env["PATH"].split(":", 1)[1])
+    # The sandbox of each GPU job; it holds no key.
+    (run / "gpu-spec.json").write_text(json.dumps(
+        {"env": {k: v for k, v in env.items() if k not in CREDENTIAL_ENV},
+         "claude": str(claude), "project": str(run / args.case)}))
+    write_launch(args, run, env, srun)
     if not preflight(args, run, env, Path(claude)):
-        print("preflight failed; do not submit", file=sys.stderr)
+        print("preflight failed; do not start the run", file=sys.stderr)
         return 1
-    print(f"preflight passed. Submit from a neutral directory: cd / && sbatch {run}/job.sbatch")
+    print("preflight passed. Start the run on this host (not in a Slurm job):\n"
+          f"  setsid nohup {run}/launch.sh > {run}/vibesys.log 2>&1 < /dev/null &")
     return 0
 
 

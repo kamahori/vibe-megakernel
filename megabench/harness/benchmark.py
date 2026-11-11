@@ -7,6 +7,8 @@ import time
 from collections import Counter
 from typing import Callable
 
+from ..heartbeat import beat
+
 
 def _measure(fn: Callable, inputs: dict, device: str, warmup: int,
              reps: int) -> dict:
@@ -15,8 +17,10 @@ def _measure(fn: Callable, inputs: dict, device: str, warmup: int,
     cuda = torch.device(device).type == "cuda"
     for _ in range(warmup):
         fn(inputs)
+        beat("warmup call")
     if cuda:
         torch.cuda.synchronize(device)
+    beat("warmup done")
     host_ms: list[float] = []
     event_ms: list[float] = []
     for _ in range(reps):
@@ -32,6 +36,7 @@ def _measure(fn: Callable, inputs: dict, device: str, warmup: int,
             end_event.synchronize()
             event_ms.append(start_event.elapsed_time(end_event))
         host_ms.append((time.perf_counter() - start) * 1000)
+        beat("timed call")
 
     def p95(values: list[float]) -> float:
         ordered = sorted(values)
@@ -71,6 +76,7 @@ def _audit_launches(fn: Callable, inputs: dict, device: str,
 
     if torch.device(device).type != "cuda":
         return {"status": "not_applicable_cpu"}
+    beat("launch audit", allow=300, force=True)  # profiler start-up
     try:
         from torch.profiler import ProfilerActivity, profile
 

@@ -12,7 +12,7 @@ import tomllib
 import unittest
 from pathlib import Path
 
-from ..integrations.make_vibesys_case_task import make_task
+from ..integrations.make_vibesys_case_task import GATE_QUEUE_ALLOWANCE_S, make_task
 from ..integrations.vibesys_case_evaluator import (
     METRIC, RELATIVE_NOISE, benchmark_output, progress_score)
 from ..integrations.vibesys_noise_calibration import summarize
@@ -37,6 +37,15 @@ class VibeSysTaskTests(unittest.TestCase):
                 self.assertIn("main", namespace)
                 with self.assertRaises(SystemExit):
                     runpy.run_path(str(evaluator), run_name="__main__")
+
+    def test_gate_timeouts_leave_room_for_the_queue_only_with_a_launcher(self) -> None:
+        case_id = "dense-step-qwen3-06b-b1-s128"
+        for launcher, extra in (((), 0), (("srun", "--time=00:20:00"), GATE_QUEUE_ALLOWANCE_S)):
+            with self.subTest(launcher=launcher), tempfile.TemporaryDirectory() as directory:
+                task = make_task(case_id, Path(directory), ROOT, gate_launcher=launcher)
+                config = tomllib.loads((task / "vibesys.input.toml").read_text())
+                self.assertEqual(config["accuracy"]["timeout_seconds"], 1200 + extra)
+                self.assertEqual(config["benchmark"]["timeout_seconds"], 1800 + extra)
 
     def test_task_minimizes_kernel_latency_within_declared_noise(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

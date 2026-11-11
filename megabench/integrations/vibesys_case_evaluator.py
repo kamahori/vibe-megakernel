@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 from pathlib import Path
 
 from dataclasses import replace
@@ -11,6 +13,86 @@ from dataclasses import replace
 from ..cases import load_regimes, select_cases
 from ..harness.correctness import check_trials
 from ..harness.runner import _load_submission, evaluate_case
+from . import gpu_noise
+
+
+def pinned_score(result: dict, pin_dir: Path | None, key: dict) -> tuple[float, dict | None]:
+    """The progress score against one best-baseline time pinned per run.
+
+    The baselines are re-measured at each evaluation and drift between rounds,
+    so a faster kernel could score below a slower one measured earlier. The
+    first successful evaluation in *pin_dir* writes its measured best baseline
+    (the fastest of eager, graph and compiled); every later evaluation with the
+    same *key* scores against that value. Without *pin_dir* the score uses the
+    measured baseline, as before.
+    """
+    if result.get("status") != "ok_provisional":
+        return 0.0, None
+    measured = result["speedup_vs_best_baseline_cuda_event"]
+    if pin_dir is None:
+        return 1.0 + measured / (1.0 + measured), None
+    cand = result["candidate_timing"]["cuda_event_p50_ms"]
+    measured_best = measured * cand
+    digest = hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode()).hexdigest()[:16]
+    path = Path(pin_dir) / f"score-baseline-{digest}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pinned_now = False
+    if not path.is_file():
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"key": key, "best_baseline_cuda_event_p50_ms": measured_best},
+                                  sort_keys=True, default=str))
+        try:
+            os.link(tmp, path)  # fails if another evaluation pinned first
+            pinned_now = True
+        except FileExistsError:
+            pass
+        finally:
+            tmp.unlink()
+    pinned = json.loads(path.read_text())["best_baseline_cuda_event_p50_ms"]
+    speedup = pinned / cand
+    info = {"pinned_best_baseline_cuda_event_p50_ms": pinned,
+            "measured_best_baseline_cuda_event_p50_ms": measured_best,
+            "speedup_vs_pinned_baseline_cuda_event": speedup,
+            "pinned_now": pinned_now, "file": str(path)}
+    return 1.0 + speedup / (1.0 + speedup), info
+
+
+def stabilize(result: dict, case, case_id: str, submission: Path,
+              regimes_path: Path | None) -> None:
+    """Time the candidate in more fresh processes; a slow evaluate process is not scored.
+
+    When the evaluate process is outside the fast cluster (``gpu_noise.spread``), its
+    candidate p50 is replaced by the fast-cluster p50. With MEGABENCH_OFFICIAL_TIMING_HISTORY
+    set, the p50 is also capped by the best earlier official run of the same code tree. The
+    speedups are scaled to match. The evaluate value and all process values stay in
+    ``timing_stability``.
+    """
+    processes = int(os.environ.get("MEGABENCH_STABILITY_PROCESSES", "3"))
+    timing = result.get("candidate_timing") or {}
+    if processes < 2 or case.gpus != 1 or timing.get("cuda_event_p50_ms") is None:
+        return
+    probes = gpu_noise.run_probes(
+        gpu_noise.probe_command(case_id, submission, regimes_path), processes - 1)
+    stab = gpu_noise.check_report(result, probes, gpu_noise.DEFAULT_TOLERANCE_PCT)
+    result["timing_stability"] = stab
+    old = timing["cuda_event_p50_ms"]
+    new = stab["fast_p50_ms"] if 0 in stab["slow_processes"] else old
+    # The framework's own history (a path the agent cannot write): a run of a tree that is
+    # slower than its best earlier official run was in the slow mode as a whole.
+    raw = os.environ.get(gpu_noise.OFFICIAL_HISTORY_ENV)
+    history = Path(raw) if raw else None
+    if history is not None:
+        key = gpu_noise.history_key("official", case_id,
+                                    regimes_path.name if regimes_path else "",
+                                    gpu_noise.tree_digest(submission.parent))
+        gpu_noise.score(stab, gpu_noise.best_known(history, key))
+        gpu_noise.add_history(history, key, stab, "official")
+        new = min(new, stab["score_ms"])
+    if new != old:
+        timing["cuda_event_p50_ms_evaluate_process"] = old
+        timing["cuda_event_p50_ms"] = new
+        for key in [k for k in result if k.startswith("speedup_vs_") and "cuda_event" in k]:
+            result[key] *= old / new
 
 
 # The metric VibeSys optimizes: the candidate's own CUDA-event p50 step time, lower is better.
@@ -111,7 +193,21 @@ def main(case_id: str, argv: list[str] | None = None,
         result = evaluate_case(case, submission, device="cuda:0", **BENCHMARK_SETTINGS)
     except Exception as exc:
         result = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"}
+    stabilize(result, case, case_id, submission, regimes_path)
+    # VibeSys optimizes METRIC (the stabilized candidate time). progress_score is for reports;
+    # with MEGABENCH_BASELINE_CACHE it is scored against the run's pinned best baseline.
+    pin_dir = os.environ.get("MEGABENCH_BASELINE_CACHE")
+    key = {"case": case.to_dict()}
+    if pin_dir and result.get("status") == "ok_provisional":
+        import torch
+
+        key["gpu"] = torch.cuda.get_device_name(0)
+    score, pin = pinned_score(result, Path(pin_dir) if pin_dir else None, key)
+    if pin is not None:
+        result["score_baseline"] = pin
     output = benchmark_output(case_id, result)
+    if pin is not None:
+        output["progress_score"] = score
     with args.output_json.open("x", encoding="utf-8") as file:
         json.dump(output, file)
     summary = {key: output[key] for key in ("case", "status", METRIC, "progress_score")

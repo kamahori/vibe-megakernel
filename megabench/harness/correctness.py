@@ -7,7 +7,58 @@ import time
 from typing import Callable
 
 from ..cases import Case
+from ..heartbeat import beat
 from ..tasks.workloads import make_inputs, oracle, reference
+
+
+_PRINT_CHUNK = 1 << 24  # words per step: bounds the device memory of a fingerprint
+
+
+def input_fingerprints(inputs: dict, key: int | None = None) -> tuple[int, dict]:
+    """Bit-exact fingerprints of *inputs*, computed where each tensor lives.
+
+    A copy of every input on the host costs as much host memory as the inputs (more than
+    60 GB for full MoE weights), so the mutation check keys a hash of the raw bytes
+    instead. Each word w at position i adds (w + i*a) * b and ((w * c) ^ (i * d)) to two
+    64-bit sums with random odd keys: any change of one word changes both sums, and the
+    keys are new for each check, so changes that cancel are improbable.
+    """
+    import torch
+    key = secrets.randbits(63) if key is None else key
+    rng = torch.Generator().manual_seed(key)
+    a, b, c, d = (int(x) | 1 for x in torch.randint(1, 2**62, (4,), generator=rng))
+    prints = {}
+    for name, value in inputs.items():
+        if not isinstance(value, torch.Tensor):
+            prints[name] = ("value", repr(value))
+            continue
+        t = value.detach()
+        meta = (tuple(t.shape), str(t.dtype), tuple(t.stride()), t.storage_offset())
+        if t.numel() == 0:
+            prints[name] = (meta, 0, 0)
+            continue
+        raw = t.contiguous().view(-1).view(torch.uint8)
+        try:
+            words = raw.view(torch.int32) if raw.numel() % 4 == 0 else raw
+        except RuntimeError:  # storage offset not aligned to 4 bytes
+            words = raw
+        h1 = torch.zeros((), dtype=torch.int64, device=t.device)
+        h2 = torch.zeros((), dtype=torch.int64, device=t.device)
+        for start in range(0, words.numel(), _PRINT_CHUNK):
+            w = words[start:start + _PRINT_CHUNK].to(torch.int64)
+            i = torch.arange(start, start + w.numel(), dtype=torch.int64, device=t.device)
+            h1 += ((w + i * a) * b).sum()
+            h2 += ((w * c) ^ (i * d)).sum()
+            del w, i
+        prints[name] = (meta, int(h1), int(h2))
+    return key, prints
+
+
+def mutated_inputs(inputs: dict, before: tuple[int, dict]) -> list[str]:
+    """Names of the inputs whose fingerprint differs from *before* (input_fingerprints)."""
+    key, prints = before
+    _, now = input_fingerprints(inputs, key)
+    return [name for name in prints if now.get(name) != prints[name]]
 
 
 def _band(want, got, exact, case: Case) -> dict:
@@ -323,21 +374,22 @@ def check_trials(case: Case, candidate: Callable, device: str,
                 accepted_prefix = (case.params["draft_depth"] if
                                    scenario == "accept_full" else 1)
                 set_acceptance_scenario(case, inputs, accepted_prefix)
-        # Full MoE weights exceed 60 GB. Keep mutation snapshots on host
-        # so correctness does not need two full copies on one GPU.
-        originals = {name: value.detach().to("cpu", copy=True)
-                     for name, value in inputs.items()}
+        # A keyed fingerprint where each input lives, not a copy: full MoE weights
+        # exceed 60 GB, and a host copy of them needs that much host memory.
+        originals = input_fingerprints(inputs)
         expected = reference(case, inputs)
         exact = oracle(case, inputs)
         first_start = time.perf_counter() if trial_index == 0 else None
+        if trial_index == 0:
+            beat("first candidate call (may compile)", allow=900, force=True)
         actual = candidate(inputs)
         if torch.device(device).type == "cuda":
             torch.cuda.synchronize(device)
+        beat(f"correctness trial {trial_index}", force=True)
         if first_start is not None:
             first_call_ms = (time.perf_counter() - first_start) * 1000
-        for name in inputs:
-            if not torch.equal(inputs[name].cpu(), originals[name]):
-                raise AssertionError(f"candidate mutated input {name}")
+        for name in mutated_inputs(inputs, originals):
+            raise AssertionError(f"candidate mutated input {name}")
         if case.family == "tts_frame_step":
             forced = _teacher_forced(case, inputs, expected, exact, actual)
             if forced[0] is not expected:

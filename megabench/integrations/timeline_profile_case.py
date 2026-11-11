@@ -31,6 +31,8 @@ _HIP_WALL_CLOCK_RATE_ATTR = 10017
 
 
 def _load_timeline_build(path: Path, contract: dict):
+    from ..heartbeat import beat
+    beat("build the timeline submission", allow=900, force=True)
     spec = importlib.util.spec_from_file_location("megabench_candidate_timeline", path)
     if spec is None or spec.loader is None:
         raise ValueError(f"cannot import submission {path}")
@@ -96,7 +98,8 @@ def _save(buffer, names: list[str], output: Path, tick_ns: float = 1.0) -> str:
     (output / "trace.json").write_text(json.dumps(timeline.to_chrome_trace(decoded)))
     rows = timeline.phase_table(decoded)
     summary = timeline.summarize(decoded, top=len(rows) or 1)
-    (output / "summary.json").write_text(json.dumps({"phases": rows, "summary": summary}, indent=2))
+    (output / "summary.json").write_text(json.dumps({"phases": rows, "summary": summary,
+                                                     "windows": timeline.phase_windows(decoded)}, indent=2))
     return timeline.format_table(rows)
 
 
