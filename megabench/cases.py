@@ -43,7 +43,8 @@ class Case:
     checkpoint: str = ""
     # Correctness rule: "band" bounds error by the BF16 reference's own error
     # and requires integer outputs to match; "tilert" is the per-step output
-    # check of harness.correctness.tilert_metrics.
+    # check of harness.correctness.tilert_metrics; "dspark" adds per-row
+    # near-tie checks of speculative picks (harness.correctness.dspark_metrics).
     gate: str = "band"
     # Per-sequence KV lengths already cached (batched decode); empty means
     # every sequence holds params["context"] positions.
@@ -135,7 +136,7 @@ def load_regimes(path) -> tuple[dict, ...]:
     return tuple(_regime(r, str(path)) for r in data["regimes"])
 
 
-GATES = ("band", "tilert")
+GATES = ("band", "tilert", "dspark")
 
 
 # Families whose cases time one layer rather than a whole model step.
@@ -150,6 +151,24 @@ DEEPSEEK_V32 = {"batch": 1, "context": 128, "layers": 61,
                 "index_topk": 2048, "router_groups": 8, "router_top_groups": 4,
                 "prompts": 4}
 DEEPSEEK_CHECKPOINT = "deepseek-ai/DeepSeek-V3.2@a7e62ac04ecb2c0a54d736dc46601c5606cf10a6"
+
+# DeepSeek-V4.1-Flash text backbone plus its three-stage DSpark drafter. The
+# layer layout (sliding-window, 2:1 and 1:1 compressed layers, KV/indexer
+# sharing groups, Engram and DSpark target layers) is derived from these
+# counts by tasks.dsv41.layout; see model_specs for the pinned config.
+DEEPSEEK_V41_FLASH = {"batch": 1, "context": 2048, "draft_depth": 5, "layers": 40,
+                      "hidden": 5120, "q_heads": 64, "head_dim": 512, "rope_dim": 64,
+                      "q_lora_rank": 1280, "o_lora_rank": 1024, "o_groups": 8,
+                      "window": 128, "window_layers": 2, "c2_layers": 18, "c2_group": 6,
+                      "c1_index_group": 4, "index_heads": 32, "index_dim": 128,
+                      "index_topk": 512, "candidate_blocks": 2048, "candidate_block_size": 8,
+                      "hc_mult": 4, "hc_sinkhorn_iters": 20, "experts": 384, "topk": 6,
+                      "intermediate": 2304, "shared_experts": 1, "vocab": 129280,
+                      "engram_first": 1, "engram_second": 14, "engram_ngram": 4,
+                      "engram_heads": 8, "engram_dim": 256, "engram_buckets": 16000000,
+                      "engram_compressed_vocab": 99092, "draft_layers": 3,
+                      "draft_experts": 128, "draft_topk": 3, "markov_rank": 256,
+                      "noise_token": 128799}
 DEEPSEEK_NOTE = ("Real FP8 checkpoint MLA/DSA TP8 decode with TileRT 0.1.6 numerics (BF16 caches "
                  "and indexer) over prefilled chat prompts; TileRT-style output gate.")
 
@@ -367,6 +386,14 @@ CASES: tuple[Case, ...] = (
            "expert_parallel", "p3", ready=True, gpus=8, ep=8, atol=0.003, rtol=0.003,
            note="FP8 x MXFP4 routed-expert layer over EP8 all-to-all; verified bitwise against the serial run on eight B200 GPUs.")
       for tokens in (512, 4096)),
+    # One DSpark iteration: verify the committed token plus 5 proposals (6 rows)
+    # against 2,048 cached tokens, accept the greedy prefix, draft 5 more.
+    Case("dsv41-flash-dspark-step-k5-ctx2k", "dsv41_dspark_step",
+         "deepseek-ai/DeepSeek-V4.1-Flash + DSpark", "spec_iteration", DEEPSEEK_V41_FLASH,
+         "speculative_decoding", "p3", ready=True, gpus=8, tp=8, atol=0.003, rtol=0.003,
+         gate="dspark",
+         note="Native synthetic FP8/FP4 TP8 DSpark iteration: 6-row CSA/indexer verify, prefix "
+              "acceptance and 3-stage DSpark draft at B=1, context 2048."),
 )
 
 

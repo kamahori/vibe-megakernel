@@ -83,6 +83,7 @@ REFERENCE_FILES = {
     "vla_action_step": ("pi05.py", "vision.py", "gemma.py", "common.py"),
     "world_frame_step": ("waypoint.py", "common.py"),
     "megamoe_layer": ("megamoe.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
+    "dsv41_dspark_step": ("dsv41.py", "distributed.py", "parallel.py", "quantization.py", "common.py"),
 }
 OUTPUT_KEYS = {
     "dense_step": ("logits", "next_token", "k_write", "v_write"),
@@ -106,6 +107,11 @@ OUTPUT_KEYS = {
     "vla_action_step": ("actions",),
     "world_frame_step": ("latent", "k_write", "v_write"),
     "megamoe_layer": ("y",),
+    "dsv41_dspark_step": ("logits", "verify_tokens", "accepted_count", "committed_tokens", "draft_tokens",
+                          "draft_logits", "draft_confidence", "draft_window_kv_write", "draft_expert_ids",
+                          "window_kv_write", "compress_kv_write_r2", "compress_kv_write_r1",
+                          "index_k_write_r2", "index_k_write_r1", "compressor_kv_state",
+                          "compressor_score_state", "expert_ids", "sparse_indices"),
     "spec_full_iteration": ("logits", "proposed_tokens", "tree_parents", "accepted_count",
                             "proposed_count", "committed_count", "committed_tokens",
                             "cache_length", "draft_cache_length", "target_features",
@@ -758,6 +764,20 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "communication inside run. The budget includes NCCL kernels and is one GPU launch per rank. "
         "Use an allocation with all required GPUs visible. Nsight capture of spawned "
         "ranks requires `--target-processes all`.\n\n" if case.family == "megamoe_layer" else
+        f"The evaluator starts {case.gpus} rank processes with TP={case.tp}, the upstream "
+        "DeepSeek-V4.1 runtime layout. `build(case)` receives `case['execution']`: rank, world_size, "
+        "tp_rank, ep_rank, device, backend, and live tp_group/ep_group handles. Attention and indexer "
+        "heads, the grouped output projection, vocabulary logits and Engram table rows are split by rank; "
+        f"rank r owns routed experts [r*{case.params['experts'] // case.tp}, (r+1)*{case.params['experts'] // case.tp}) "
+        f"(DSpark: {case.params['draft_experts'] // case.tp} per rank) whole; the shared expert, router, "
+        "compressors, mHC and caches are replicated. Token outputs (`verify_tokens`, `draft_tokens`, "
+        "`accepted_count`, `committed_tokens`) are global and identical on every rank. Trials cycle "
+        "natural rejection, full acceptance and a two-token prefix (`set_trial_scenario`); greedy picks "
+        "are graded per row with a near-tie rule after the reference is forced onto your picks. "
+        "Complete all communication inside run. "
+        "The budget includes NCCL kernels and is one GPU launch per rank. "
+        "Use an allocation with all required GPUs visible. Nsight capture of spawned "
+        "ranks requires `--target-processes all`.\n\n" if case.family == "dsv41_dspark_step" else
         f"The evaluator starts {case.gpus} rank processes, with TP={case.tp}, EP={case.ep}. "
         "`build(case)` receives `case['execution']`: rank, world_size, tp_rank, ep_rank, "
         "device, backend, and live tp_group/ep_group handles. "

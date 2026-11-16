@@ -17,6 +17,7 @@ from .distributed_probe import development
 from .test_frontier import development as frontier_development
 from .test_glm53 import development as glm53_development
 from .test_kimi import development as kimi_development
+from .test_dsv41 import development as dsv41_development
 
 
 def one_per_family(cases):
@@ -29,7 +30,9 @@ def one_per_family(cases):
 
 class DistributedReferenceTests(unittest.TestCase):
     def test_frontier_state_rollouts_match_serial_oracles(self):
-        cases = one_per_family(case for case in select_cases('p3') if case.family not in LAYER_FAMILIES)
+        # DeepSeek-V4.1 checks its TP layout against the serial run in test_dsv41.py.
+        cases = one_per_family(case for case in select_cases('p3')
+                               if case.family not in LAYER_FAMILIES | {'dsv41_dspark_step'})
         checks = [(case,2) for case in cases] + [(case,8) for case in cases[:2]]
         for case,ranks in checks:
             with self.subTest(case=case.id,ranks=ranks), tempfile.TemporaryDirectory() as directory:
@@ -56,7 +59,8 @@ class DistributedReferenceTests(unittest.TestCase):
             if original.family in LAYER_FAMILIES:
                 continue  # test_kimi_layer.py and test_megamoe.py run these through the harness.
             with self.subTest(case=original.id):
-                tiny = {'kimi_k3_step':kimi_development, 'glm53_flash_step':glm53_development}.get(
+                tiny = {'kimi_k3_step':kimi_development, 'glm53_flash_step':glm53_development,
+                        'dsv41_dspark_step':lambda case: dsv41_development()}.get(
                     original.family, frontier_development)(original)
                 case = replace(tiny, ready=True, gpus=2, tp=2)
                 if case.family == 'glm53_flash_step':
