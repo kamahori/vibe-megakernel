@@ -8,7 +8,7 @@ from typing import Callable
 
 from ..cases import Case
 from ..heartbeat import beat
-from ..tasks.workloads import make_inputs, oracle, reference
+from ..tasks.workloads import make_inputs, oracle, reference, regrade, set_trial_scenario
 
 
 _PRINT_CHUNK = 1 << 24  # words per step: bounds the device memory of a fingerprint
@@ -169,22 +169,28 @@ TILERT_CACHE_WRITES = ("kv_write", "pe_write", "index_k_write")
 TILERT_DIAGNOSTIC = ("sparse_indices", "expert_ids")
 
 
-def tilert_metrics(expected: dict, actual: dict, case: Case, device: str, exact: dict) -> dict:
-    """Per-output cosine similarity and relative L2, with verdicts.
+def _tp_sharded(case: Case) -> bool:
+    import torch.distributed as dist
 
-    Each floating output is measured against both the FP32 oracle and the
-    BF16 reference, and passes if it is within the thresholds of either.
-    Cache writes are graded over their first ``TILERT_GRADED_LAYERS`` layers
-    and reported over all layers.
+    return dist.is_available() and dist.is_initialized() and case.tp > 1 and dist.get_world_size() == case.tp
 
-    In a TP process group the logits are vocabulary shards, so their sums,
-    maxima and the greedy token's logit are reduced over the group. Every rank
-    reaches every collective, even when its own outputs are malformed.
-    """
+
+def _group_total(sharded: bool):
+    """In-place sum (or ``op``) over the TP group; the identity outside one."""
+    import torch.distributed as dist
+
+    def total(value, op=None):
+        if sharded:
+            dist.all_reduce(value, op=op or dist.ReduceOp.SUM)
+        return value
+    return total
+
+
+def _check_structure(expected: dict, actual: dict, device: str, sharded: bool) -> None:
+    """Raise on every rank if any rank's outputs have the wrong keys, shapes, dtypes or device."""
     import torch
     import torch.distributed as dist
 
-    sharded = dist.is_available() and dist.is_initialized() and case.tp > 1 and dist.get_world_size() == case.tp
     problem = None
     if not isinstance(actual, dict) or set(actual) != set(expected):
         problem = (f"output keys: expected {sorted(expected)}, got "
@@ -207,30 +213,64 @@ def tilert_metrics(expected: dict, actual: dict, case: Case, device: str, exact:
     if problem or flag.item():
         raise AssertionError(problem or "another rank returned malformed outputs")
 
-    def total(value: torch.Tensor, op=None) -> torch.Tensor:
-        if sharded:
-            dist.all_reduce(value, op=op or dist.ReduceOp.SUM)
-        return value
+
+def _similarity(got, want, oracle, total=None) -> dict:
+    """Cosine and relative L2 to the oracle and to the reference; ``total`` reduces shards.
+
+    Passes within ``TILERT_MIN_COSINE``/``TILERT_MAX_RELATIVE_L2`` of either.
+    """
+    import torch
+
+    got, want, oracle = (value.double().flatten() for value in (got, want, oracle))
+    sums = torch.stack([got @ oracle, got @ want, got.square().sum(), oracle.square().sum(),
+                        want.square().sum(), (got - oracle).square().sum(), (got - want).square().sum(),
+                        want @ oracle, (want - oracle).square().sum()])
+    if total is not None:
+        sums = total(sums)
+    dot, ref_dot, got_sq, oracle_sq, ref_sq, error_sq, ref_error_sq, agree, drift_sq = sums.tolist()
+    tiny = torch.finfo(torch.float64).tiny
+    result = {"cosine": dot / max((got_sq * oracle_sq) ** 0.5, tiny),
+              "relative_l2": (error_sq / max(oracle_sq, tiny)) ** 0.5,
+              "cosine_to_reference": ref_dot / max((got_sq * ref_sq) ** 0.5, tiny),
+              "relative_l2_to_reference": (ref_error_sq / max(ref_sq, tiny)) ** 0.5,
+              "reference_cosine": agree / max((ref_sq * oracle_sq) ** 0.5, tiny),
+              "reference_relative_l2": (drift_sq / max(oracle_sq, tiny)) ** 0.5}
+    result["pass"] = any(result[cosine] >= TILERT_MIN_COSINE and result[relative] <= TILERT_MAX_RELATIVE_L2
+                         for cosine, relative in (("cosine", "relative_l2"),
+                                                  ("cosine_to_reference", "relative_l2_to_reference")))
+    return result
+
+
+def _recall(got, want) -> dict:
+    """Ungraded overlap of submitted index rows with the reference's (``-1`` is padding)."""
+    got, want = got.reshape(got.shape[0], -1), want.reshape(want.shape[0], -1)
+    recall = [len(set(row.tolist()) & set(ref.tolist()) - {-1}) / max(len(set(ref.tolist()) - {-1}), 1)
+              for row, ref in zip(got.cpu(), want.cpu()) if (ref >= 0).any()]
+    return {"graded": False, "mean_recall": sum(recall) / max(len(recall), 1),
+            "min_recall": min(recall, default=1.0)}
+
+
+def tilert_metrics(expected: dict, actual: dict, case: Case, device: str, exact: dict) -> dict:
+    """Per-output cosine similarity and relative L2, with verdicts.
+
+    Each floating output is measured against both the FP32 oracle and the
+    BF16 reference, and passes if it is within the thresholds of either.
+    Cache writes are graded over their first ``TILERT_GRADED_LAYERS`` layers
+    and reported over all layers.
+
+    In a TP process group the logits are vocabulary shards, so their sums,
+    maxima and the greedy token's logit are reduced over the group. Every rank
+    reaches every collective, even when its own outputs are malformed.
+    """
+    import torch
+    import torch.distributed as dist
+
+    sharded = _tp_sharded(case)
+    _check_structure(expected, actual, device, sharded)
+    total = _group_total(sharded)
 
     def measure(got: torch.Tensor, want: torch.Tensor, oracle: torch.Tensor, reduce: bool) -> dict:
-        got, want, oracle = (value.double().flatten() for value in (got, want, oracle))
-        sums = torch.stack([got @ oracle, got @ want, got.square().sum(), oracle.square().sum(),
-                            want.square().sum(), (got - oracle).square().sum(), (got - want).square().sum(),
-                            want @ oracle, (want - oracle).square().sum()])
-        if reduce:
-            sums = total(sums)
-        dot, ref_dot, got_sq, oracle_sq, ref_sq, error_sq, ref_error_sq, agree, drift_sq = sums.tolist()
-        tiny = torch.finfo(torch.float64).tiny
-        result = {"cosine": dot / max((got_sq * oracle_sq) ** 0.5, tiny),
-                  "relative_l2": (error_sq / max(oracle_sq, tiny)) ** 0.5,
-                  "cosine_to_reference": ref_dot / max((got_sq * ref_sq) ** 0.5, tiny),
-                  "relative_l2_to_reference": (ref_error_sq / max(ref_sq, tiny)) ** 0.5,
-                  "reference_cosine": agree / max((ref_sq * oracle_sq) ** 0.5, tiny),
-                  "reference_relative_l2": (drift_sq / max(oracle_sq, tiny)) ** 0.5}
-        result["pass"] = any(result[cosine] >= TILERT_MIN_COSINE and result[relative] <= TILERT_MAX_RELATIVE_L2
-                             for cosine, relative in (("cosine", "relative_l2"),
-                                                      ("cosine_to_reference", "relative_l2_to_reference")))
-        return result
+        return _similarity(got, want, oracle, total if reduce else None)
 
     details = {}
     for name, want in expected.items():
@@ -268,17 +308,158 @@ def tilert_metrics(expected: dict, actual: dict, case: Case, device: str, exact:
                                      or float(maximum - picked) <= margin)
 
     for name in (name for name in TILERT_DIAGNOSTIC if name in expected):
-        got, want = actual[name].reshape(actual[name].shape[0], -1), expected[name].reshape(expected[name].shape[0], -1)
-        recall = [len(set(row.tolist()) & set(ref.tolist()) - {-1}) / max(len(set(ref.tolist()) - {-1}), 1)
-                  for row, ref in zip(got.cpu(), want.cpu()) if (ref >= 0).any()]
-        details[name] = {"graded": False, "mean_recall": sum(recall) / max(len(recall), 1),
-                         "min_recall": min(recall, default=1.0)}
+        details[name] = _recall(actual[name], expected[name])
     return details
 
 
 def _tilert_gate(expected: dict, actual: dict, case: Case, device: str, exact: dict) -> dict:
     """Raise unless every graded output passes ``tilert_metrics``."""
     details = tilert_metrics(expected, actual, case, device, exact)
+    failed = [name for name, detail in details.items() if detail.get("pass") is False]
+    if failed:
+        raise AssertionError("; ".join(f"{name}: {details[name]}" for name in failed))
+    return details
+
+
+# DSpark speculative iteration (gate "dspark"). Floating outputs use the
+# oracle band of ``_band`` on relative L2 only: error within ``noise_factor``
+# times the BF16 reference's own error plus rtol, against the oracle or the
+# reference. FP8 re-quantization flips make peak errors meaningless. Stacked
+# per-layer writes are graded layer by layer, so one wrong layer cannot hide
+# in the average; smaller per-source writes are graded whole. DSpark outputs
+# read the hidden state entering the last backbone layers, so their reference
+# error is floored at the deepest window write's. Expert and sparse-index
+# selections must keep DSPARK_MIN_RECALL of the reference's picks on average
+# in every layer, source and stage. Greedy picks are graded per row, because each verify row and
+# Markov step can tie within BF16 noise; the task's ``regrade`` hook has
+# already teacher-forced the reference and oracle onto the submission's picks,
+# so the acceptance outputs must then match exactly. Calibration is in
+# docs/NON_P0_VALIDATION.md.
+DSPARK_TOKEN_ROWS = (("verify_tokens", "logits"), ("draft_tokens", "draft_logits"))
+DSPARK_EXACT = ("accepted_count", "committed_tokens")
+DSPARK_VOCAB_SHARDS = ("logits", "draft_logits")
+DSPARK_PER_LAYER = ("window_kv_write", "draft_window_kv_write")
+# Reference-error floors for DSpark outputs, in units of the deepest window
+# write's reference error. The five confidences are one projection each and
+# their relative error over five values is noisy, hence the wider floor.
+DSPARK_DRAFT = {"draft_logits": 1.0, "draft_confidence": 3.0, "draft_window_kv_write": 1.0}
+# Legitimate BF16 schedules kept >= 0.75 (experts per layer), >= 0.89 (sparse
+# indices per source) and >= 0.87 (DSpark experts per stage); random picks
+# score about 0.02, 0.25-0.5 and 0.02.
+DSPARK_MIN_RECALL = {"expert_ids": 0.5, "sparse_indices": 0.7, "draft_expert_ids": 0.5}
+
+
+def _relative_band(got, want, oracle, case: Case, total=None, floor: float = 0.0) -> dict:
+    """``_band``'s relative-L2 rule against the oracle or the reference, shard-reduced by ``total``.
+
+    ``floor`` is a lower bound on the reference error the limit scales with.
+    """
+    import torch
+
+    got, want, oracle = (value.double().flatten() for value in (got, want, oracle))
+    sums = torch.stack([(got - oracle).square().sum(), (got - want).square().sum(),
+                        (want - oracle).square().sum(), oracle.square().sum(), got.square().sum()])
+    if total is not None:
+        sums = total(sums)
+    error, to_reference, drift, scale, got_sq = sums.tolist()
+    if scale == 0 and drift == 0:
+        return {"relative_error": got_sq ** 0.5, "reference_relative_error": 0.0, "pass": got_sq == 0}
+    scale = max(scale, torch.finfo(torch.float64).tiny) ** 0.5
+    rtol = case.bf16_rtol if want.dtype == torch.bfloat16 else case.rtol
+    detail = {"relative_error": error ** 0.5 / scale,
+              "relative_error_to_reference": to_reference ** 0.5 / scale,
+              "reference_relative_error": drift ** 0.5 / scale}
+    limit = case.noise_factor * max(detail["reference_relative_error"], floor) + rtol
+    detail["pass"] = bool(min(detail["relative_error"], detail["relative_error_to_reference"]) <= limit)
+    return detail
+
+
+def _row_picks(picks, got_logits, want_logits, oracle_logits, case: Case, device: str, sharded: bool) -> dict:
+    """Near-tie rule for each row of vocabulary-sharded logits.
+
+    A pick passes if it is the BF16 reference's or the oracle's greedy token
+    for its row, or its oracle logit is within ``noise_factor`` times the
+    row's relative logit error (the reference's or the submission's,
+    whichever is larger; the logits band bounds the latter) times the row's
+    largest oracle logit magnitude. Errors grow with the logit, so the RMS
+    error alone understates the error at the top of the row.
+    """
+    import torch
+    import torch.distributed as dist
+
+    total = _group_total(sharded)
+    width = want_logits.shape[-1]
+    offset = dist.get_rank() * width if sharded else 0
+    picks, want, oracle = picks.reshape(-1), want_logits.double(), oracle_logits.double()
+    local = picks - offset
+    inside = (local >= 0) & (local < width)
+    picked = torch.where(inside, oracle.gather(1, local.clamp(0, width - 1)[:, None])[:, 0],
+                         torch.zeros_like(picks, dtype=torch.float64))
+    picked = total(picked)
+    vocabulary = width * (case.tp if sharded else 1)
+    picked = torch.where((picks >= 0) & (picks < vocabulary), picked, -torch.inf)
+
+    def argmax(values):
+        maximum = total(values.amax(-1), dist.ReduceOp.MAX)
+        ids = torch.arange(width, device=values.device) + offset
+        best = torch.where(values == maximum[:, None], ids, torch.iinfo(torch.int64).max).amin(-1)
+        return maximum, total(best, dist.ReduceOp.MIN)
+
+    oracle_max, oracle_best = argmax(oracle)
+    _, want_best = argmax(want)
+    noise = total(torch.stack([(want - oracle).square().sum(-1), (got_logits.double() - oracle).square().sum(-1),
+                               oracle.square().sum(-1)]))
+    peak = total(oracle.abs().amax(-1), dist.ReduceOp.MAX)
+    relative = (noise[:2].amax(0) / noise[2].clamp_min(torch.finfo(torch.float64).tiny)).sqrt()
+    margin = case.noise_factor * relative * peak
+    gap = oracle_max - picked
+    passed = (picks == want_best) | (picks == oracle_best) | (gap <= margin)
+    return {"tokens": picks.tolist(), "reference_tokens": want_best.tolist(),
+            "oracle_tokens": oracle_best.tolist(), "oracle_logit_gap": gap.tolist(),
+            "near_tie_margin": margin.tolist(), "pass": bool(passed.all())}
+
+
+def dspark_metrics(expected: dict, actual: dict, case: Case, device: str, exact: dict) -> dict:
+    """Similarity of float outputs, per-row greedy picks and exact acceptance outputs."""
+    import torch
+
+    sharded = _tp_sharded(case)
+    _check_structure(expected, actual, device, sharded)
+    total = _group_total(sharded)
+    want_last, oracle_last = (value["window_kv_write"][-1].double() for value in (expected, exact))
+    deepest = float((want_last - oracle_last).norm()) / max(float(oracle_last.norm()), torch.finfo(torch.float64).tiny)
+    details = {}
+    for name, want in expected.items():
+        if not want.is_floating_point():
+            continue
+        got, oracle = actual[name], exact[name]
+        floor = deepest * DSPARK_DRAFT.get(name, 0.0)
+        if name in DSPARK_PER_LAYER:
+            for layer in range(want.shape[0]):
+                details[f"{name}[{layer}]"] = _relative_band(got[layer], want[layer], oracle[layer], case,
+                                                             floor=floor)
+        else:
+            details[name] = _relative_band(got, want, oracle, case, total if name in DSPARK_VOCAB_SHARDS else None,
+                                           floor=floor)
+    for name, logits in DSPARK_TOKEN_ROWS:
+        details[name] = _row_picks(actual[name], actual[logits], expected[logits], exact[logits], case, device,
+                                   sharded)
+    for name in DSPARK_EXACT:
+        mismatch = int((actual[name] != expected[name]).sum())
+        details[name] = {"mismatched_elements": mismatch, "pass": mismatch == 0}
+    for name, minimum in DSPARK_MIN_RECALL.items():
+        per_slice = [_recall(actual[name][index], expected[name][index])["mean_recall"]
+                     for index in range(expected[name].shape[0])]
+        worst = min(range(len(per_slice)), key=per_slice.__getitem__)
+        details[name] = {"mean_recall": sum(per_slice) / len(per_slice), "worst_slice": worst,
+                         "worst_slice_recall": per_slice[worst], "minimum": minimum,
+                         "pass": per_slice[worst] >= minimum}
+    return details
+
+
+def _dspark_gate(expected: dict, actual: dict, case: Case, device: str, exact: dict) -> dict:
+    """Raise unless every graded output passes ``dspark_metrics``."""
+    details = dspark_metrics(expected, actual, case, device, exact)
     failed = [name for name, detail in details.items() if detail.get("pass") is False]
     if failed:
         raise AssertionError("; ".join(f"{name}: {details[name]}" for name in failed))
@@ -298,6 +479,8 @@ def _compare(expected: dict, actual: dict, case: Case, device: str,
 
     if exact is not None and case.gate == "tilert":
         return _tilert_gate(expected, actual, case, device, exact)
+    if exact is not None and case.gate == "dspark":
+        return _dspark_gate(expected, actual, case, device, exact)
     if not isinstance(actual, dict) or set(actual) != set(expected):
         raise AssertionError(f"output keys: expected {sorted(expected)}, got "
                              f"{sorted(actual) if isinstance(actual, dict) else type(actual)}")
@@ -374,6 +557,8 @@ def check_trials(case: Case, candidate: Callable, device: str,
                 accepted_prefix = (case.params["draft_depth"] if
                                    scenario == "accept_full" else 1)
                 set_acceptance_scenario(case, inputs, accepted_prefix)
+        else:
+            scenario = set_trial_scenario(case, inputs, trial_index)
         # A keyed fingerprint where each input lives, not a copy: full MoE weights
         # exceed 60 GB, and a host copy of them needs that much host memory.
         originals = input_fingerprints(inputs)
@@ -390,6 +575,7 @@ def check_trials(case: Case, candidate: Callable, device: str,
             first_call_ms = (time.perf_counter() - first_start) * 1000
         for name in mutated_inputs(inputs, originals):
             raise AssertionError(f"candidate mutated input {name}")
+        expected, exact = regrade(case, inputs, expected, exact, actual)
         if case.family == "tts_frame_step":
             forced = _teacher_forced(case, inputs, expected, exact, actual)
             if forced[0] is not expected:

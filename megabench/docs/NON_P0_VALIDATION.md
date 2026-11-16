@@ -372,6 +372,18 @@ seeds. The slowest rank's eager CUDA-event median was 67.8 ms (t512) and
 reference is `non_megakernel`, as expected. Each verify step took about a
 minute and each harness run about 45 s; the job took 3 min 35 s.
 
+### DeepSeek-V4.1-Flash DSpark iteration
+
+Eight B300 SXM6 GPUs (sm_103, PyTorch 2.14.1/CUDA 13.0), 2026-11-16. Inputs
+take about 66 GB per rank, including the two full-size Engram tables (384M
+rows each, split by rows), and generate in about 5 s; the eager reference runs
+in about 5 s warm and the FP32 oracle in about 3 s, peaking at 68 GB per rank.
+The harness with `examples/reference_submission.py` passed correctness on all
+ranks for the three trial scenarios (natural rejection, full acceptance, a
+two-token prefix). Its CUDA-event median was 747 ms with about 66,000 kernels
+per rank, so the reference is `non_megakernel`, as expected. Gate calibration
+is described in [REFERENCE_PRECISION.md](REFERENCE_PRECISION.md#deepseek-v41-flash-dspark-iteration).
+
 ### CSM-1B, π0.5 and Waypoint-1.5
 
 Same campaign. One-B200 job 4888 (commit 125d175 with the cases set ready) ran

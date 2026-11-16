@@ -70,6 +70,59 @@ These tasks follow their upstream serving paths:
   element to a neighboring FP8 value or flip a block's power-of-two scale, so
   the band is wider than for unquantized cases.
 
+## DeepSeek-V4.1-Flash DSpark iteration
+
+The reference follows DeepSeek's `inference/model.py` (pinned in
+`model_specs.json`) operation by operation: BF16 activations; FP32 RMSNorm with
+the weight applied in FP32 (`eps=1e-20`); per-32-channel FP8 activation
+quantization with power-of-two scales before every FP8/FP4 GEMM, FP32
+accumulation and a BF16 result; FP32 2:1 compressor projections and pooling;
+BF16 indexer scores over FP4-dequantized queries and keys; FP8 window KV, FP4
+compressed KV (E4M3 scale per 16) and FP4 index keys (UE8M0 per 32) stored as
+the dequantized BF16 values the kernels write; FP32 attention scores with a
+sink and BF16 probabilities; FP32 mHC coefficients and Sinkhorn; FP32 router,
+LM head, Markov head and confidence head. Two choices make the result
+independent of reduction order: cross-rank sums accumulate in FP32 (upstream
+sums BF16 index scores and embeddings with NCCL), and top-k ties go to the
+lower index. `tests/test_dsv41.py` runs the pinned upstream code with PyTorch
+stand-ins for its kernels, decoding one token at a time, and requires the same
+tokens, acceptance and drafts, with every float output inside the band below.
+Batching six rows changes GEMM accumulation order, which can flip a BF16 ulp
+that FP8 re-quantization then amplifies, so bit equality is not expected.
+
+Synthetic weights scale each block's residual-stream projections (`wo_b`,
+expert and shared `w2`) by `1/sqrt(2 * blocks)` beyond fan-in. With unit-scale
+updates the random model is chaotic: FP8 scale, route and sparse-selection
+flips on BF16-level noise grow by about 10% per layer, and the reference's
+logits reach cosine 0.73 to the oracle. With the scaling, the reference
+drifts 3% (first layer) to 9% (last layer) relative L2 from the oracle and its
+logits about 8%. That floor also bounds what output grading can see: dropping
+one layer's whole MoE moves the next layer's writes by about 9%, and dropping
+one attention sublayer by about 4%, so such omissions in deep layers are below
+the band and need source and trace review.
+
+The `dspark` gate (`harness.correctness.dspark_metrics`) applies `_band`'s
+relative-L2 rule (against the oracle or the reference, `noise_factor=2`) to
+the logits, every layer's window write, every DSpark stage's window write and
+each whole per-source write. DSpark outputs read the deepest backbone state, so
+their reference error is floored at the last layer's (three times that for the
+five confidences). Expert IDs per layer, sparse indices per source and DSpark
+expert IDs per stage must keep mean recall 0.5, 0.7 and 0.5 of the reference's
+selections; legitimate schedules kept at least 0.75, 0.89 and 0.87.
+
+Verify rows and Markov steps can tie within that noise, and a different pick
+changes the bonus token and every later draft. Before grading,
+`tasks.dsv41.regrade` reruns the reference and oracle forced onto the
+submission's picks when they differ. Each pick must then be the reference's
+or the oracle's greedy token for its row, or within `noise_factor` times the
+row's relative logit error (the reference's or the submission's) times the
+row's peak logit. `accepted_count` and `committed_tokens` must match exactly.
+Over 24 eight-GPU seeds, the reference, the FP32 oracle and an alternative
+schedule (split-K accumulation, BF16-applied norm weights, reversed attention
+order) passed every trial. Zeroing one layer's KV write, scaling logits, an
+off-by-one acceptance, wrong draft tokens, an inverted indexer, a router that
+ignores its scores, and a drafter that ignores the target hidden all failed.
+
 ## Grading band
 
 BF16 rounding differences compound through the model. On the full synthetic

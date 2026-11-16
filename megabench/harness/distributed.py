@@ -18,6 +18,7 @@ import torch.multiprocessing as mp
 from ..cases import Case
 from ..tasks.parallel import initialize
 from ..workloads import make_inputs, oracle, reference
+from ..tasks.workloads import regrade, set_trial_scenario
 from .benchmark import _audit_launches, _measure
 from .correctness import _compare, input_fingerprints, mutated_inputs
 
@@ -80,6 +81,7 @@ def _rank_worker(rank: int, contract: dict, submission: str, device_kind: str,
             for trial in range(trials):
                 seed = shared_seed()
                 inputs = fresh_inputs(case, seed, device)
+                scenario = set_trial_scenario(case, inputs, trial)
                 originals = input_fingerprints(inputs)
                 expected = reference(case, inputs)
                 exact = oracle(case, inputs)
@@ -91,13 +93,14 @@ def _rank_worker(rank: int, contract: dict, submission: str, device_kind: str,
                         torch.cuda.synchronize(device)
                     if first_start is not None:
                         result["first_call_ms_including_jit"] = (time.perf_counter()-first_start)*1000
+                    expected, exact = regrade(case, inputs, expected, exact, actual)
                     details = _compare(expected, actual, case, device, exact)
                     for name in mutated_inputs(inputs, originals):
                         raise AssertionError(f"candidate mutated input {name}")
                 except Exception as exc:
                     local_error = f"trial {trial}: {type(exc).__name__}: {exc}"
                 agree(local_error)
-                result["correctness"]["trials"].append({"seed": seed, "outputs": details})
+                result["correctness"]["trials"].append({"seed": seed, "scenario": scenario, "outputs": details})
                 del inputs, originals, expected, exact, actual
             perf_inputs = fresh_inputs(case, shared_seed(), device)
             dist.barrier()

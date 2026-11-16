@@ -23,6 +23,7 @@ TASK_MODULES = {
     "kimi_k3_step": "kimi", "glm53_flash_step": "glm53", "kimi_k3_layer": "kimi_layer",
     "tts_frame_step": "csm", "vla_action_step": "pi05",
     "world_frame_step": "waypoint", "megamoe_layer": "megamoe",
+    "dsv41_dspark_step": "dsv41",
 }
 
 
@@ -43,10 +44,28 @@ def _module(case: Case):
     return importlib.import_module(f"{__package__}.{TASK_MODULES[case.family]}")
 
 
-def reference(case: Case, t: Inputs) -> Outputs:
-    return _module(case).reference(case, t)
+def reference(case: Case, t: Inputs, **options) -> Outputs:
+    return _module(case).reference(case, t, **options)
 
 
-def oracle(case: Case, t: Inputs) -> Outputs:
+def oracle(case: Case, t: Inputs, **options) -> Outputs:
     """The reference's operator graph without BF16 activation rounding."""
-    return fp32_reference(_module(case), case, t)
+    return fp32_reference(_module(case), case, t, **options)
+
+
+def set_trial_scenario(case: Case, t: Inputs, trial: int) -> str:
+    """Let a task adjust trial inputs (e.g. forced acceptance); returns the scenario name."""
+    module = _module(case)
+    if hasattr(module, "set_trial_scenario"):
+        return module.set_trial_scenario(case, t, trial)
+    return "seeded"
+
+
+def regrade(case: Case, t: Inputs, expected: Outputs, exact: Outputs,
+            actual) -> tuple[Outputs, Outputs]:
+    """Let a task re-derive reference outputs that follow the candidate's own picks."""
+    module = _module(case)
+    if hasattr(module, "regrade"):
+        return module.regrade(case, t, expected, exact, actual,
+                              lambda c, v, **o: oracle(c, v, **o))
+    return expected, exact
