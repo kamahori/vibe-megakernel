@@ -390,7 +390,9 @@ def _row_picks(picks, got_logits, want_logits, oracle_logits, case: Case, device
     total = _group_total(sharded)
     width = want_logits.shape[-1]
     offset = dist.get_rank() * width if sharded else 0
-    picks, want, oracle = picks.reshape(-1), want_logits.double(), oracle_logits.double()
+    got_logits = got_logits.reshape(-1, width)
+    picks, want, oracle = (picks.reshape(-1), want_logits.reshape(-1, width).double(),
+                           oracle_logits.reshape(-1, width).double())
     local = picks - offset
     inside = (local >= 0) & (local < width)
     picked = torch.where(inside, oracle.gather(1, local.clamp(0, width - 1)[:, None])[:, 0],
@@ -448,7 +450,10 @@ def dspark_metrics(expected: dict, actual: dict, case: Case, device: str, exact:
         mismatch = int((actual[name] != expected[name]).sum())
         details[name] = {"mismatched_elements": mismatch, "pass": mismatch == 0}
     for name, minimum in DSPARK_MIN_RECALL.items():
-        per_slice = [_recall(actual[name][index], expected[name][index])["mean_recall"]
+        # One recall per selection row (verify row x sequence), not per sequence.
+        width = expected[name].shape[-1]
+        per_slice = [_recall(actual[name][index].reshape(-1, width),
+                             expected[name][index].reshape(-1, width))["mean_recall"]
                      for index in range(expected[name].shape[0])]
         worst = min(range(len(per_slice)), key=per_slice.__getitem__)
         details[name] = {"mean_recall": sum(per_slice) / len(per_slice), "worst_slice": worst,

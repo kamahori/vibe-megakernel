@@ -1,7 +1,11 @@
-"""DeepSeek-V4.1-Flash DSpark speculative decode iteration at B=1.
+"""DeepSeek-V4.1-Flash DSpark speculative decode iteration.
 
 One iteration of DSpark speculative decoding (DeepSeek's confidence-scheduled,
-semi-autoregressive drafter) after ``context`` cached tokens:
+semi-autoregressive drafter) for ``batch`` independent sequences, each after
+``context`` cached tokens. Weights are shared; every sequence has its own
+caches, acceptance, bonus token and draft. With ``batch == 1`` per-sequence
+tensors carry no batch axis; otherwise it is the axis listed in
+``INPUT_BATCH_AXIS``/``OUTPUT_BATCH_AXIS``. Per sequence:
 
 1. **Verify.** The 40-layer backbone runs ``draft_depth + 1`` tokens: the token
    committed by the previous iteration and the ``draft_depth`` DSpark
@@ -374,6 +378,8 @@ def _check(case: Case, rank: int) -> None:
         raise ValueError('candidate blocks must cover index_topk positions')
     if not 0 <= p['noise_token'] < p['vocab']:
         raise ValueError('noise token outside the vocabulary')
+    if case.contexts:
+        raise ValueError('every sequence holds params["context"] cached tokens')
 
 
 def make_inputs(case: Case, seed: int, device: str, *, rank: int | None = None) -> dict[str, torch.Tensor]:
@@ -392,8 +398,10 @@ def make_inputs(case: Case, seed: int, device: str, *, rank: int | None = None) 
         generator = torch.Generator(device=device).manual_seed(seed_for(seed, name))
         return torch.randint(0, p['vocab'], (count,), generator=generator, device=device)
 
-    values['tokens'] = tokens('tokens', p['draft_depth']+1)
-    values['history_tokens'] = tokens('history_tokens', 3)
+    batch = p['batch']
+    seq = lambda b, name: name if b == 0 else f'{name}@{b}'   # sequence 0 keeps the B=1 streams
+    values['tokens'] = torch.stack([tokens(seq(b, 'tokens'), p['draft_depth']+1) for b in range(batch)])
+    values['history_tokens'] = torch.stack([tokens(seq(b, 'history_tokens'), 3) for b in range(batch)])
     generator = torch.Generator(device=device).manual_seed(seed_for(seed, 'engram_token_map'))
     values['engram_token_map'] = torch.randint(0, p['engram_compressed_vocab'], (p['vocab'],),
                                                generator=generator, device=device)
@@ -449,8 +457,8 @@ def make_inputs(case: Case, seed: int, device: str, *, rank: int | None = None) 
                 ids, lambda i: fp8_matrix(seed, i+'shared_'+name, rows, cols, device, fan_in=cols*gain))
 
     block_weights('', [f'l{layer}_' for layer in range(layers)], p['experts'])
-    values['window_kv'] = stack([f'l{layer}_' for layer in range(layers)],
-                                lambda i: kv_rows(seed, i+'window_kv', window, d, device, fp8_qdq))
+    values['window_kv'] = stack([f'l{layer}_' for layer in range(layers)], lambda i: torch.stack(
+        [kv_rows(seed, seq(b, i+'window_kv'), window, d, device, fp8_qdq) for b in range(batch)]))
     for source in lay.kv_sources:
         prefix, ratio = f'l{source}_', lay.ratios[source]
         values[prefix+'comp_wkv'] = matrix(seed, prefix+'comp_wkv', d, h, h, device)
@@ -459,8 +467,10 @@ def make_inputs(case: Case, seed: int, device: str, *, rank: int | None = None) 
         values[prefix+'comp_norm'] = (matrix(seed, prefix+'comp_norm', 1, d, 100, device)[0].float()+1).to(torch.bfloat16)
         values[prefix+'idx_wk'] = matrix(seed, prefix+'idx_wk', idim, d, d, device)
         values[prefix+'idx_knorm'] = (matrix(seed, prefix+'idx_knorm', 1, idim, 100, device)[0].float()+1).to(torch.bfloat16)
-        values[prefix+'compress_kv'] = kv_rows(seed, prefix+'compress_kv', context//ratio, d, device, kv_fp4_qdq)
-        values[prefix+'index_k'] = kv_rows(seed, prefix+'index_k', context//ratio, idim, device, fp4_qdq)
+        values[prefix+'compress_kv'] = torch.stack([kv_rows(seed, seq(b, prefix+'compress_kv'), context//ratio, d,
+                                                            device, kv_fp4_qdq) for b in range(batch)])
+        values[prefix+'index_k'] = torch.stack([kv_rows(seed, seq(b, prefix+'index_k'), context//ratio, idim,
+                                                        device, fp4_qdq) for b in range(batch)])
     for source in lay.index_sources:
         prefix = f'l{source}_'
         values[prefix+'idx_wq_b'], values[prefix+'idx_wq_b_scale'] = fp8_matrix(
@@ -480,7 +490,8 @@ def make_inputs(case: Case, seed: int, device: str, *, rank: int | None = None) 
 
     ids = [f'draft{stage}_' for stage in range(p['draft_layers'])]
     block_weights('draft_', ids, p['draft_experts'])
-    values['draft_window_kv'] = stack(ids, lambda i: kv_rows(seed, i+'window_kv', window, d, device, fp8_qdq))
+    values['draft_window_kv'] = stack(ids, lambda i: torch.stack(
+        [kv_rows(seed, seq(b, i+'window_kv'), window, d, device, fp8_qdq) for b in range(batch)]))
     values['draft_main_proj'], values['draft_main_proj_scale'] = fp8_matrix(seed, 'draft_main_proj', h, DRAFT_TARGETS*h, device)
     for name in ('draft_main_norm', 'draft_norm'):
         values[name] = (matrix(seed, name, 1, h, 100, device)[0].float()+1).to(torch.bfloat16)
@@ -488,7 +499,38 @@ def make_inputs(case: Case, seed: int, device: str, *, rank: int | None = None) 
     values['markov_head'] = matrix(seed, 'markov_head', p['vocab'], p['markov_rank'], p['markov_rank'], device,
                                    row_range=split(p['vocab']))
     values['confidence'] = matrix(seed, 'confidence', 1, h+p['markov_rank'], h+p['markov_rank'], device)[0]
+    if batch == 1:
+        for name in values:
+            axis = input_batch_axis(name)
+            if axis is not None:
+                values[name] = values[name].squeeze(axis)
     return values
+
+
+def input_batch_axis(name: str) -> int | None:
+    """Batch axis of a per-sequence input (absent when ``batch == 1``)."""
+    if name in ('tokens', 'history_tokens') or name.endswith(('_compress_kv', '_index_k')):
+        return 0
+    if name in ('window_kv', 'draft_window_kv'):
+        return 1
+    return None
+
+
+# Batch axis of each output (absent when ``batch == 1``); stacked writes lead with layer or source.
+OUTPUT_BATCH_AXIS = {
+    'logits': 0, 'verify_tokens': 0, 'accepted_count': 0, 'committed_tokens': 0, 'draft_tokens': 0,
+    'draft_logits': 0, 'draft_confidence': 0, 'draft_window_kv_write': 1, 'draft_expert_ids': 1,
+    'window_kv_write': 1, 'compress_kv_write_r2': 1, 'compress_kv_write_r1': 1, 'index_k_write_r2': 1,
+    'index_k_write_r1': 1, 'compressor_kv_state': 1, 'compressor_score_state': 1, 'expert_ids': 1,
+    'sparse_indices': 1}
+
+
+def batched(case: Case, values: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Views of the inputs with an explicit batch axis."""
+    if case.params['batch'] != 1:
+        return values
+    return {name: value if input_batch_axis(name) is None else value.unsqueeze(input_batch_axis(name))
+            for name, value in values.items()}
 
 
 # --------------------------------------------------------------------------- reference
@@ -526,20 +568,20 @@ def embed_rows(rt, table: torch.Tensor, ids: torch.Tensor, offset: int) -> torch
     return rt.sum(rows)
 
 
-def engram_ids(case: Case, values, slot: int) -> torch.Tensor:
-    """Hashed table rows [verify, (ngram-1)*heads] for every verified position."""
+def engram_ids(case: Case, values, slot: int, b: int) -> torch.Tensor:
+    """Hashed table rows [verify, (ngram-1)*heads] for every verified position of sequence ``b``."""
     p, lay = case.params, layout(case.params)
     ngram = p['engram_ngram']
     token_map = values['engram_token_map']
-    sequence = token_map[torch.cat((values['history_tokens'], values['tokens']))]
-    first = values['history_tokens'].numel()
+    sequence = token_map[torch.cat((values['history_tokens'][b], values['tokens'][b]))]
+    first = values['history_tokens'].shape[-1]
     pad = token_map[ENGRAM_PAD_ID]
     multipliers = engram_multipliers(lay.engram, ngram, p['engram_compressed_vocab'])[slot]
     primes = engram_primes(2, ngram, p['engram_heads'], p['engram_buckets'])[slot]
     flat = [prime for sizes in primes for prime in sizes]
     offsets = torch.tensor(np.cumsum([0, *flat[:-1]]), device=sequence.device)
     rows = []
-    for index in range(values['tokens'].numel()):
+    for index in range(values['tokens'].shape[-1]):
         position = p['context']+index
         tokens = [int(sequence[first+index-shift]) if position >= shift else int(pad) for shift in range(ngram)]
         rolling, hashes = tokens[0]*multipliers[0], []
@@ -554,7 +596,7 @@ def engram(case: Case, values, rt, slot: int, layer: int, stream: torch.Tensor) 
     p = case.params
     prefix = f'l{layer}_engram_'
     table, scales = values[prefix+'table'], values[prefix+'table_scale']
-    ids = engram_ids(case, values, slot)
+    ids = torch.cat([engram_ids(case, values, slot, b) for b in range(p['batch'])])
     local = ids-rt.rank*table.shape[0]
     inside = (local >= 0) & (local < table.shape[0])
     local = local.clamp(0, table.shape[0]-1)
@@ -661,59 +703,68 @@ def select_candidates(scores: torch.Tensor, visible: int, blocks: int, size: int
 
 
 def verify(case: Case, values, rt):
-    """Backbone over the verified tokens: logits, captured target hiddens and state writes."""
+    """Backbone over every sequence's verified tokens: logits, target hiddens and state writes.
+
+    Row-wise work runs over all ``batch * verify`` rows at once; attention,
+    compression and index selection read each sequence's own caches.
+    """
     p, lay = case.params, layout(case.params)
-    rows, context, window = p['draft_depth']+1, p['context'], p['window']
+    batch, verify_rows, context, window = p['batch'], p['draft_depth']+1, p['context'], p['window']
+    rows = batch*verify_rows
     d, rd, ih = p['head_dim'], p['rope_dim'], p['index_heads']
     device = values['tokens'].device
-    positions = torch.arange(context, context+rows, device=device)
+    positions = torch.arange(context, context+verify_rows, device=device).repeat(batch)
     offset = rt.rank*values['embed'].shape[0]
-    stream = embed_rows(rt, values['embed'], values['tokens'], offset)[:, None].expand(rows, p['hc_mult'], -1).contiguous()
+    stream = embed_rows(rt, values['embed'], values['tokens'].reshape(rows), offset)
+    stream = stream[:, None].expand(rows, p['hc_mult'], -1).contiguous()
     pre_mix = torch.zeros(rows, p['hc_mult'], device=device)
     pre_mix[:, 0] = 1
     shared = SimpleNamespace(compress_kv=None, index_k=None, topk=None, candidates=None)
     writes = {name: [] for name in ('window', 'compress', 'index_k', 'kv_state', 'score_state', 'experts', 'sparse')}
     captured = []
+    per_sequence = lambda tensor: tensor.view(batch, -1, *tensor.shape[1:])
 
     def attention(block: Block, x: torch.Tensor) -> torch.Tensor:
         layer, ratio = block.index, lay.ratios[block.index]
         angles = rope_angles(positions, rd, ratio > 0)
         qr, q = block.query(x, angles)
         kv = block.window_kv(x, angles)
-        writes['window'].append(kv)
+        writes['window'].append(per_sequence(kv))
         if layer == lay.kv_source[layer]:
             prefix = f'l{layer}_'
-            starts = positions[::ratio]
+            # verify_rows is a multiple of ratio, so no group spans two sequences
+            starts = positions.view(-1, ratio)[:, 0]
             group_angles = rope_angles(starts, rd, True)
             if ratio == 1:
                 latent = norm(F.linear(x, values[prefix+'comp_wkv']), values[prefix+'comp_norm'])
             else:
                 raw = x.float() @ values[prefix+'comp_wkv'].float().T
                 score = x.float() @ values[prefix+'comp_wgate'].float().T
-                writes['kv_state'].append(raw)
-                writes['score_state'].append(score)
+                writes['kv_state'].append(per_sequence(raw))
+                writes['score_state'].append(per_sequence(score))
                 pooled = (raw.view(-1, ratio, d)*score.view(-1, ratio, d).softmax(1)).sum(1)
                 latent = norm(pooled.to(torch.bfloat16), values[prefix+'comp_norm'])
             index_key = norm(F.linear(latent, values[prefix+'idx_wk']), values[prefix+'idx_knorm'])
-            index_key = fp4_qdq(rotate(index_key, group_angles, rd))
-            latent = kv_fp4_qdq(rotate(latent, group_angles, rd))
+            index_key = per_sequence(fp4_qdq(rotate(index_key, group_angles, rd)))
+            latent = per_sequence(kv_fp4_qdq(rotate(latent, group_angles, rd)))
             writes['compress'].append(latent)
             writes['index_k'].append(index_key)
-            shared.compress_kv = torch.cat((values[prefix+'compress_kv'], latent))
-            shared.index_k = torch.cat((values[prefix+'index_k'], index_key))
+            shared.compress_kv = torch.cat((values[prefix+'compress_kv'], latent), 1)
+            shared.index_k = torch.cat((values[prefix+'index_k'], index_key), 1)
         if ratio and layer == lay.index_source[layer]:
             prefix = f'l{layer}_'
             iq = linear(qr, values[prefix+'idx_wq_b'], values[prefix+'idx_wq_b_scale'])
-            iq = fp4_qdq(rotate(iq.view(rows, -1, p['index_dim']), angles, rd))
-            head_weights = F.linear(x, values[prefix+'idx_weights'])*(p['index_dim']**-0.5*ih**-0.5)
+            iq = per_sequence(fp4_qdq(rotate(iq.view(rows, -1, p['index_dim']), angles, rd)))
+            head_weights = per_sequence(F.linear(x, values[prefix+'idx_weights'])*(p['index_dim']**-0.5*ih**-0.5))
             # Upstream scores in BF16; heads are summed per rank, ranks in FP32.
-            scores = torch.einsum('rhd,td->rht', iq.float(), shared.index_k.float()).to(torch.bfloat16)
-            scores = (scores.relu()*head_weights[..., None]).float().sum(1).to(torch.bfloat16)
+            scores = torch.einsum('bvhd,btd->bvht', iq.float(), shared.index_k.float()).to(torch.bfloat16)
+            scores = (scores.relu()*head_weights[..., None]).float().sum(2).to(torch.bfloat16)
             scores = rt.sum(scores).float()
             selected, candidates = [], []
             for row in range(rows):
-                visible = (context+row+1)//ratio
-                row_scores = scores[row, :visible]
+                b, index = divmod(row, verify_rows)
+                visible = (context+index+1)//ratio
+                row_scores = scores[b, index, :visible]
                 if layer == lay.candidate_source:
                     candidates.append(select_candidates(row_scores, visible, p['candidate_blocks'],
                                                         p['candidate_block_size']))
@@ -726,15 +777,15 @@ def verify(case: Case, values, rt):
             padded = torch.full((rows, p['index_topk']), -1, device=device, dtype=torch.int64)
             for row, chosen in enumerate(selected):
                 padded[row, :chosen.numel()] = chosen
-            writes['sparse'].append(padded)
-        ring = values['window_kv'][layer]
+            writes['sparse'].append(per_sequence(padded))
         attended = []
         for row in range(rows):
-            position = context+row
+            b, index = divmod(row, verify_rows)
+            position = context+index
             old = torch.arange(max(0, position-window+1), context, device=device)
-            keys = torch.cat((ring[old % window], kv[:row+1]))
+            keys = torch.cat((values['window_kv'][layer, b][old % window], kv[b*verify_rows:row+1]))
             if ratio:
-                keys = torch.cat((keys, shared.compress_kv[shared.topk[row]]))
+                keys = torch.cat((keys, shared.compress_kv[b][shared.topk[row]]))
             attended.append(sparse_attention(q[row], keys, block('attn_sink')))
         return block.output(torch.stack(attended), angles)
 
@@ -745,64 +796,68 @@ def verify(case: Case, values, rt):
         if layer in lay.targets:
             captured.append(stream.mean(1))
         stream, pre_mix, ids = Block(case, values, rt, '', layer).forward(stream, pre_mix, attention, p['topk'])
-        writes['experts'].append(ids)
+        writes['experts'].append(per_sequence(ids))
     final = norm(hc_pre(stream, pre_mix), values['fnorm'])
     logits = final.float() @ values['head'].float().T
-    return logits, torch.cat(captured, -1), writes
+    return per_sequence(logits), per_sequence(torch.cat(captured, -1)), writes
 
 
-def draft(case: Case, values, rt, main_hidden: torch.Tensor, accepted: int, bonus: torch.Tensor,
+def draft(case: Case, values, rt, main_hidden: torch.Tensor, accepted: list[int], bonus: torch.Tensor,
           forced_tokens: torch.Tensor | None = None):
-    """Three DSpark stages over ``[bonus, noise...]`` and the greedy Markov chain."""
+    """Three DSpark stages over each sequence's ``[bonus, noise...]`` and its greedy Markov chain."""
     p = case.params
-    depth, context, window = p['draft_depth'], p['context'], p['window']
+    batch, depth, context, window = p['batch'], p['draft_depth'], p['context'], p['window']
     rd, device = p['rope_dim'], bonus.device
-    main_rows = main_hidden.shape[0]
-    main_positions = torch.arange(context, context+main_rows, device=device)
-    start = context+accepted
-    positions = torch.arange(start+1, start+1+depth, device=device)
-    main_x = norm(linear(main_hidden, values['draft_main_proj'], values['draft_main_proj_scale']),
-                  values['draft_main_norm'])
+    verify_rows = main_hidden.shape[1]
+    main_positions = torch.arange(context, context+verify_rows, device=device).repeat(batch)
+    starts = context+torch.tensor(accepted, device=device)
+    positions = (starts[:, None]+1+torch.arange(depth, device=device)).reshape(-1)
+    main_x = norm(linear(main_hidden.reshape(batch*verify_rows, -1), values['draft_main_proj'],
+                         values['draft_main_proj_scale']), values['draft_main_norm'])
     offset = rt.rank*values['embed'].shape[0]
-    ids = torch.full((depth,), p['noise_token'], device=device, dtype=torch.int64)
-    ids[0] = bonus
-    stream = embed_rows(rt, values['embed'], ids, offset)[:, None].expand(depth, p['hc_mult'], -1).contiguous()
-    pre_mix = torch.zeros(depth, p['hc_mult'], device=device)
+    ids = torch.full((batch, depth), p['noise_token'], device=device, dtype=torch.int64)
+    ids[:, 0] = bonus
+    stream = embed_rows(rt, values['embed'], ids.reshape(-1), offset)
+    stream = stream[:, None].expand(batch*depth, p['hc_mult'], -1).contiguous()
+    pre_mix = torch.zeros(batch*depth, p['hc_mult'], device=device)
     pre_mix[:, 0] = 1
     window_writes, expert_ids = [], []
 
     def attention(block: Block, x: torch.Tensor) -> torch.Tensor:
-        main_kv = block.window_kv(main_x, rope_angles(main_positions, rd, False))
+        main_kv = block.window_kv(main_x, rope_angles(main_positions, rd, False)).view(batch, verify_rows, -1)
         window_writes.append(main_kv)
-        ring = values['draft_window_kv'][block.index].index_copy(
-            0, main_positions[:accepted+1] % window, main_kv[:accepted+1])
         angles = rope_angles(positions, rd, False)
         _, q = block.query(x, angles)
-        keys = torch.cat((ring, block.window_kv(x, angles)))
-        attended = torch.stack([sparse_attention(q[row], keys, block('attn_sink')) for row in range(depth)])
-        return block.output(attended, angles)
+        block_kv = block.window_kv(x, angles)
+        attended = []
+        for b in range(batch):
+            slots = torch.arange(context, context+accepted[b]+1, device=device) % window
+            ring = values['draft_window_kv'][block.index, b].index_copy(0, slots, main_kv[b, :accepted[b]+1])
+            keys = torch.cat((ring, block_kv[b*depth:(b+1)*depth]))
+            attended += [sparse_attention(q[b*depth+row], keys, block('attn_sink')) for row in range(depth)]
+        return block.output(torch.stack(attended), angles)
 
     for stage in range(p['draft_layers']):
         stream, pre_mix, routed = Block(case, values, rt, 'draft_', stage).forward(
             stream, pre_mix, attention, p['draft_topk'])
-        expert_ids.append(routed)
+        expert_ids.append(routed.view(batch, depth, -1))
     hidden = hc_pre(stream, pre_mix)
-    logits = norm(hidden, values['draft_norm']).float() @ values['head'].float().T
-    tokens = torch.empty(depth+1, device=device, dtype=torch.int64)
-    tokens[0] = bonus
+    logits = (norm(hidden, values['draft_norm']).float() @ values['head'].float().T).view(batch, depth, -1)
+    tokens = torch.empty(batch, depth+1, device=device, dtype=torch.int64)
+    tokens[:, 0] = bonus
     markov = []
     for row in range(depth):
-        embedded = embed_rows(rt, values['markov_embed'], tokens[row], offset)
+        embedded = embed_rows(rt, values['markov_embed'], tokens[:, row], offset)
         markov.append(embedded)
-        logits[row] = logits[row]+embedded.float() @ values['markov_head'].float().T
-        tokens[row+1] = forced_tokens[row] if forced_tokens is not None else greedy(rt, logits[row], offset)
-    confidence = torch.cat((hidden, torch.stack(markov)), -1).float() @ values['confidence'].float()
-    return {'draft_tokens': tokens[1:], 'draft_logits': logits, 'draft_confidence': confidence,
+        logits[:, row] = logits[:, row]+embedded.float() @ values['markov_head'].float().T
+        tokens[:, row+1] = forced_tokens[:, row] if forced_tokens is not None else greedy(rt, logits[:, row], offset)
+    confidence = torch.cat((hidden.view(batch, depth, -1), torch.stack(markov, 1)), -1).float() @ values['confidence'].float()
+    return {'draft_tokens': tokens[:, 1:], 'draft_logits': logits, 'draft_confidence': confidence,
             'draft_window_kv_write': torch.stack(window_writes), 'draft_expert_ids': torch.stack(expert_ids)}
 
 
 def accept(tokens: torch.Tensor, verified: torch.Tensor) -> int:
-    """Length of the proposal prefix equal to the backbone's greedy tokens."""
+    """Length of one sequence's proposal prefix equal to the backbone's greedy tokens."""
     matches = (tokens[1:] == verified[:-1]).to(torch.int64)
     return int(matches.cumprod(0).sum())
 
@@ -812,49 +867,71 @@ def reference(case: Case, values: dict[str, torch.Tensor], *, serial: bool = Fal
     """One DSpark iteration. ``forced`` replaces greedy picks with given tokens (regrading)."""
     rt = _runtime(case, serial)
     p, lay = case.params, layout(case.params)
+    batch, rows = p['batch'], p['draft_depth']+1
+    values = batched(case, values)
     logits, main_hidden, writes = verify(case, values, rt)
     offset = rt.rank*values['head'].shape[0]
-    verified = forced['verify_tokens'] if forced else greedy(rt, logits, offset)
-    accepted = accept(values['tokens'], verified)
-    rows = p['draft_depth']+1
-    committed = torch.full((rows,), -1, device=logits.device, dtype=torch.int64)
-    committed[:accepted] = values['tokens'][1:accepted+1]
-    committed[accepted] = verified[accepted]
-    drafted = draft(case, values, rt, main_hidden, accepted, verified[accepted],
-                    forced['draft_tokens'] if forced else None)
+    verified = forced['verify_tokens'].reshape(batch, rows) if forced else greedy(rt, logits, offset)
+    accepted = [accept(values['tokens'][b], verified[b]) for b in range(batch)]
+    committed = torch.full((batch, rows), -1, device=logits.device, dtype=torch.int64)
+    for b, count in enumerate(accepted):
+        committed[b, :count] = values['tokens'][b, 1:count+1]
+        committed[b, count] = verified[b, count]
+    bonus = verified[torch.arange(batch, device=logits.device), torch.tensor(accepted, device=logits.device)]
+    drafted = draft(case, values, rt, main_hidden, accepted, bonus,
+                    forced['draft_tokens'].reshape(batch, -1) if forced else None)
     c2 = len(lay.c2_sources)
-    return {'logits': logits, 'verify_tokens': verified,
-            'accepted_count': torch.tensor(accepted, device=logits.device),
-            'committed_tokens': committed, **drafted,
-            'window_kv_write': torch.stack(writes['window']),
-            'compress_kv_write_r2': torch.stack(writes['compress'][:c2]),
-            'compress_kv_write_r1': torch.stack(writes['compress'][c2:]),
-            'index_k_write_r2': torch.stack(writes['index_k'][:c2]),
-            'index_k_write_r1': torch.stack(writes['index_k'][c2:]),
-            'compressor_kv_state': torch.stack(writes['kv_state']),
-            'compressor_score_state': torch.stack(writes['score_state']),
-            'expert_ids': torch.stack(writes['experts']),
-            'sparse_indices': torch.stack(writes['sparse'])}
+    out = {'logits': logits, 'verify_tokens': verified,
+           'accepted_count': torch.tensor(accepted, device=logits.device),
+           'committed_tokens': committed, **drafted,
+           'window_kv_write': torch.stack(writes['window']),
+           'compress_kv_write_r2': torch.stack(writes['compress'][:c2]),
+           'compress_kv_write_r1': torch.stack(writes['compress'][c2:]),
+           'index_k_write_r2': torch.stack(writes['index_k'][:c2]),
+           'index_k_write_r1': torch.stack(writes['index_k'][c2:]),
+           'compressor_kv_state': torch.stack(writes['kv_state']),
+           'compressor_score_state': torch.stack(writes['score_state']),
+           'expert_ids': torch.stack(writes['experts']),
+           'sparse_indices': torch.stack(writes['sparse'])}
+    if batch == 1:
+        out = {name: value.squeeze(OUTPUT_BATCH_AXIS[name]) for name, value in out.items()}
+    return out
 
 
 # --------------------------------------------------------------------------- grading hooks
 
+def scenario_prefixes(case: Case, scenario: str) -> list[int] | None:
+    """Accepted prefix per sequence of a controlled scenario (None: natural)."""
+    p = case.params
+    if scenario == 'raw':
+        return None
+    if scenario == 'accept_full':
+        return [p['draft_depth']]*p['batch']
+    # Two for a single sequence; ragged 2, 3, ..., wrapping over 0..draft_depth, for a batch.
+    return [(2+b) % (p['draft_depth']+1) for b in range(p['batch'])]
+
+
 def set_trial_scenario(case: Case, values: dict[str, torch.Tensor], trial: int) -> str:
-    """Cycle natural rejection, full acceptance and a two-token prefix.
+    """Cycle natural rejection, full acceptance and a mixed prefix.
 
     Random proposals are rejected at the first row. The controlled scenarios
     zero the shared LM head, so every greedy token is 0 (ties go to the lowest
-    id), and choose proposals ``0...0[1]`` for the wanted prefix. The draft
-    then follows the Markov head alone, but the backbone, DSpark stages and
-    every state write are still graded.
+    id), and choose proposals ``0...0[1]`` for each sequence's wanted prefix
+    (two tokens for a single sequence, ragged prefixes across a batch). The
+    draft then follows the Markov head alone, but the backbone, DSpark stages
+    and every state write are still graded.
     """
     scenario = SCENARIOS[trial % len(SCENARIOS)]
-    if scenario != 'raw':
-        accepted = case.params['draft_depth'] if scenario == 'accept_full' else 2
+    if scenario == 'accept_two' and case.params['batch'] > 1:
+        scenario = 'accept_mixed'
+    prefixes = scenario_prefixes(case, scenario)
+    if prefixes is not None:
         values['head'].zero_()
-        values['tokens'][1:] = 0
-        if accepted < case.params['draft_depth']:
-            values['tokens'][accepted+1] = 1
+        tokens = values['tokens'].view(case.params['batch'], -1)
+        for b, accepted in enumerate(prefixes):
+            tokens[b, 1:] = 0
+            if accepted < case.params['draft_depth']:
+                tokens[b, accepted+1] = 1
     return scenario
 
 
@@ -876,9 +953,10 @@ def regrade(case: Case, values: dict[str, torch.Tensor], expected: dict, exact: 
     usable = isinstance(actual, dict) and all(
         isinstance(actual.get(name), torch.Tensor) and actual[name].shape == expected[name].shape
         and actual[name].dtype == expected[name].dtype and actual[name].device == device for name in TOKEN_OUTPUTS)
-    reference_picks = torch.cat([expected[name] for name in TOKEN_OUTPUTS])
-    oracle_picks = torch.cat([exact[name].to(reference_picks.dtype) for name in TOKEN_OUTPUTS])
-    picks = torch.cat([actual[name] for name in TOKEN_OUTPUTS]).clone() if usable else reference_picks.clone()
+    reference_picks = torch.cat([expected[name].reshape(-1) for name in TOKEN_OUTPUTS])
+    oracle_picks = torch.cat([exact[name].to(reference_picks.dtype).reshape(-1) for name in TOKEN_OUTPUTS])
+    picks = (torch.cat([actual[name].reshape(-1) for name in TOKEN_OUTPUTS]).clone() if usable
+             else reference_picks.clone())
     if usable:
         usable = bool(((picks >= 0) & (picks < case.params['vocab'])).all())
     flags = torch.tensor([0 if usable else 1, int(not torch.equal(picks, reference_picks)),
@@ -890,8 +968,9 @@ def regrade(case: Case, values: dict[str, torch.Tensor], expected: dict, exact: 
         dist.all_reduce(flags, op=dist.ReduceOp.MAX)
     if flags[0]:
         return expected, exact
-    rows = case.params['draft_depth']+1
-    forced = {'verify_tokens': picks[:rows], 'draft_tokens': picks[rows:]}
+    rows = expected['verify_tokens'].numel()
+    forced = {'verify_tokens': picks[:rows].view(expected['verify_tokens'].shape),
+              'draft_tokens': picks[rows:].view(expected['draft_tokens'].shape)}
     options = {'forced': forced, **({'serial': True} if serial else {})}
     if flags[1]:
         expected = reference(case, values, **options)

@@ -107,8 +107,8 @@ the logits, every layer's window write, every DSpark stage's window write and
 each whole per-source write. DSpark outputs read the deepest backbone state, so
 their reference error is floored at the last layer's (three times that for the
 five confidences). Expert IDs per layer, sparse indices per source and DSpark
-expert IDs per stage must keep mean recall 0.5, 0.7 and 0.5 of the reference's
-selections; legitimate schedules kept at least 0.75, 0.89 and 0.87.
+expert IDs per stage must keep mean per-row recall 0.5, 0.7 and 0.5 of the
+reference's selections; legitimate schedules kept at least 0.75, 0.89 and 0.87.
 
 Verify rows and Markov steps can tie within that noise, and a different pick
 changes the bonus token and every later draft. Before grading,

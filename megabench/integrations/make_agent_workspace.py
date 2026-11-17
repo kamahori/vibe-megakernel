@@ -774,6 +774,10 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "`accepted_count`, `committed_tokens`) are global and identical on every rank. Trials cycle "
         "natural rejection, full acceptance and a two-token prefix (`set_trial_scenario`); greedy picks "
         "are graded per row with a near-tie rule after the reference is forced onto your picks. "
+        + (f"The step serves {case.params['batch']} independent sequences that share weights; each has its "
+           "own caches, acceptance and draft. Per-sequence inputs and outputs carry a batch axis given by "
+           "`input_batch_axis` and `OUTPUT_BATCH_AXIS` in the reference. "
+           if case.params.get('batch', 1) > 1 else "") +
         "Complete all communication inside run. "
         "The budget includes NCCL kernels and is one GPU launch per rank. "
         "Use an allocation with all required GPUs visible. Nsight capture of spawned "

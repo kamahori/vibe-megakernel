@@ -394,6 +394,14 @@ CASES: tuple[Case, ...] = (
          gate="dspark",
          note="Native synthetic FP8/FP4 TP8 DSpark iteration: 6-row CSA/indexer verify, prefix "
               "acceptance and 3-stage DSpark draft at B=1, context 2048."),
+    # The same iteration for eight sequences that share weights; each keeps its own
+    # caches, acceptance and draft (48 verify rows, 40 draft rows).
+    Case("dsv41-flash-dspark-step-k5-ctx2k-b8", "dsv41_dspark_step",
+         "deepseek-ai/DeepSeek-V4.1-Flash + DSpark", "spec_iteration", DEEPSEEK_V41_FLASH | {"batch": 8},
+         "speculative_decoding", "p3", ready=True, gpus=8, tp=8, atol=0.003, rtol=0.003,
+         gate="dspark",
+         note="Native synthetic FP8/FP4 TP8 DSpark iteration for 8 sequences at context 2048: "
+              "48 verify rows, per-sequence acceptance and drafts."),
 )
 
 
