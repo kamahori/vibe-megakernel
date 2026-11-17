@@ -50,7 +50,7 @@ boundary; [`cases.py`](cases.py) is the active machine-readable catalog.
 | P2 | π0.5 VLA 10-step flow-matching action chunk over a cached PaliGemma prefix | Ready with a synthetic PaliGemma prefix fixture; verified on B200 |
 | P2 | Waypoint-1.5-1B world-model latent frame (4 denoise passes plus cache commit) | Ready with synthetic rolling-cache fixtures; verified on B200 |
 | P3 | DeepSeek-V4-Pro MegaMoE routed-expert layer, EP8 at 512 and 4,096 tokens per rank | Ready with native synthetic FP8 activations and MXFP4 experts; verified on eight B200 GPUs |
-| P3 | DeepSeek-V4.1-Flash DSpark speculative iteration (TP8): verify 1+5 tokens at 2,048 cached, accept, draft 5 | Ready with native synthetic FP8/FP4 weights and a per-row speculative gate; verified on eight B300 GPUs |
+| P3 | DeepSeek-V4.1-Flash DSpark speculative iteration (TP8): verify 1+5 tokens at 2,048 cached, accept, draft 5; B=1 and B=8 | Ready with native synthetic FP8/FP4 weights and a per-row speculative gate; verified on eight B300 GPUs |
 
 `list --suite core` selects every enabled case; `--suite p0` selects the original five.
 `--suite p1` through `p3`, `planned`, and `all` expose their catalog subsets; an

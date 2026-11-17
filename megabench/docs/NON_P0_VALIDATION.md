@@ -384,6 +384,15 @@ two-token prefix). Its CUDA-event median was 747 ms with about 66,000 kernels
 per rank, so the reference is `non_megakernel`, as expected. Gate calibration
 is described in [REFERENCE_PRECISION.md](REFERENCE_PRECISION.md#deepseek-v41-flash-dspark-iteration).
 
+The B=8 case (`-b8`, 48 verify rows; same machine, 2026-11-17) generates eight
+independent caches from the same weights. Its batch-1 slice equals the B=1 case
+bit for bit, and a batch of three equals three single-sequence runs in every
+integer output. Over six eight-GPU seeds (two per trial scenario, with ragged
+prefixes 2, 3, 4, 5, 0, 1, 2, 3), the reference, the FP32 oracle and the
+alternative schedule passed every trial, and the same broken variants failed
+as at B=1. Selection recall is computed per verify row; pooling a sequence's
+six rows let an inverted indexer keep 0.88 recall, and per row it scores 0.
+
 ### CSM-1B, π0.5 and Waypoint-1.5
 
 Same campaign. One-B200 job 4888 (commit 125d175 with the cases set ready) ran

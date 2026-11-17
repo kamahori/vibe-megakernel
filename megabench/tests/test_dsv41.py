@@ -43,6 +43,9 @@ DEV = {'context': 20, 'layers': 8, 'hidden': 128, 'q_heads': 4, 'head_dim': 64, 
        'draft_topk': 2, 'markov_rank': 32, 'noise_token': 500}
 
 
+DEV_VERIFY = 6
+
+
 def development(**changes):
     """Eight layers: sliding 0, 2:1 at 1-4 (sources 1, 3), 1:1 at 5-7 (source 5), indexers 1/3/5/7,
     Engram before 1 and 4, DSpark reading 5-7. Twenty cached tokens make every top-k sparse and
@@ -523,6 +526,40 @@ class Dsv41ParallelTests(unittest.TestCase):
         want, oracle_out = dsv41.regrade(case, values, serial, exact, tp, oracle, serial=True)
         details = dspark_metrics(want, tp, case, 'cpu', oracle_out)
         self.assertFalse({k: v for k, v in details.items() if v.get('pass') is False})
+
+
+
+class Dsv41BatchTests(unittest.TestCase):
+    def test_batch_matches_single_sequence_runs(self):
+        """Each sequence of a batch reproduces a single-sequence run on its own inputs."""
+        batch, single_case = development(batch=3), development()
+        for trial in range(3):
+            values = dsv41.make_inputs(batch, 9, 'cpu', rank=0)
+            scenario = dsv41.set_trial_scenario(batch, values, trial)
+            out = dsv41.reference(batch, values, serial=True)
+            prefixes = dsv41.scenario_prefixes(batch, scenario)
+            if prefixes is not None:
+                self.assertEqual(out['accepted_count'].tolist(), prefixes)
+            for b in range(3):
+                single = {name: value if dsv41.input_batch_axis(name) is None
+                          else value.select(dsv41.input_batch_axis(name), b) for name, value in values.items()}
+                want = dsv41.reference(single_case, single, serial=True)
+                for name, value in want.items():
+                    got = out[name].select(dsv41.OUTPUT_BATCH_AXIS[name], b)
+                    with self.subTest(scenario=scenario, sequence=b, output=name):
+                        if value.is_floating_point():
+                            # Batched GEMMs accumulate in another order; FP8 re-quantization can
+                            # amplify a resulting BF16 ulp flip.
+                            self.assertLess(relative(got, value), 0.05)
+                        else:
+                            self.assertTrue(torch.equal(got, value))
+
+    def test_batch_one_has_no_batch_axis(self):
+        values = dsv41.make_inputs(development(), 1, 'cpu', rank=0)
+        self.assertEqual(values['tokens'].shape, (DEV_VERIFY,))
+        values = dsv41.make_inputs(development(batch=2), 1, 'cpu', rank=0)
+        self.assertEqual(values['tokens'].shape, (2, DEV_VERIFY))
+        self.assertEqual(values['window_kv'].shape[:2], (DEV['layers'], 2))
 
 
 if __name__ == '__main__':
