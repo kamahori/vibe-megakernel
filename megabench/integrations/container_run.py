@@ -527,8 +527,11 @@ def report(args: argparse.Namespace) -> int:
         "overlays": config.get("overlays", []), "budget_minutes": config.get("budget_minutes"),
         "model": config["model"], "image": config["image"], "ref_commit": config["ref_commit"],
         "rounds": rounds, "active_minutes": round(worked / 60, 1),
+        # Ended on its own with more than 2 minutes of the agent budget left (the slot floor):
+        # a session that stops when ./time_left reaches 0 used its whole budget.
         "ended_early": bool(rounds) and rounds[-1]["exit"] not in (124, None)
-        and (run / "state/finished").exists(),
+        and (run / "state/finished").exists()
+        and (config.get("budget_minutes") or 0) * 60 - sum(r["agent_seconds"] or 0 for r in rounds) > 120,
         "goal_reprompts": sum(r["goal_reprompts"] for r in rounds),
         "cost_usd": round(sum(r["cost_usd"] or 0 for r in rounds), 2),
         "checks": {"n": len(checks), "passing": len(snaps)},
@@ -537,8 +540,13 @@ def report(args: argparse.Namespace) -> int:
         "best_so_far": trajectory, "rescore": tried,
         "L_ms": chosen["L_ms"] if chosen else None,
     }
-    path = run / "result.json"
-    path.write_text(json.dumps(result, indent=1) + "\n")
+    # Exclusive-create: a later report (say, after another rescore) gets a new file.
+    path = next(run / name for name in
+                ["result.json"] + [f"result-{n}.json" for n in range(2, 1000)]
+                if not (run / name).exists())
+    with path.open("x") as out:
+        out.write(json.dumps(result, indent=1) + "\n")
+    print(f"wrote {path}")
     print(json.dumps({k: result[k] for k in ("run", "active_minutes", "ended_early", "goal_reprompts",
                                              "cost_usd", "checks", "best_agent_p50_ms", "L_ms")}))
     return 0
