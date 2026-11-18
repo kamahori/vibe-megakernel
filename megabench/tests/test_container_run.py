@@ -290,11 +290,18 @@ class ExperimentToolsTests(unittest.TestCase):
         harvest = _harvest_module()
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp)
-            (src / "submission.py").write_text("import torch\nx = torch.load('answers.pt')\n")
-            (src / "mk.cu").write_text("// fine\n")
+            (src / "submission.py").write_text(
+                "import torch\nimport helper\nx = torch.load('answers.pt')\nsrc = HERE / 'csrc' / 'mk.cu'\n")
+            (src / "csrc").mkdir()
+            (src / "csrc/mk.cu").write_text('#include "inc.cuh"\n')
+            (src / "csrc/inc.cuh").write_text("// reads oracle values\n")
             (src / "helper.py").write_text("from megabench.tasks import dsv41\n")
+            (src / "tools").mkdir()
+            (src / "tools/dbg.py").write_text("from megabench.workloads import oracle\n")
             problems = harvest.review(src)
-            self.assertEqual(sorted(problems), ["helper.py: imports megabench", "submission.py: torch.load"])
+            # tools/dbg.py is not reached from submission.py, so it is not reviewed.
+            self.assertEqual(sorted(problems), ["csrc/inc.cuh: mentions an oracle",
+                                                "helper.py: imports megabench", "submission.py: torch.load"])
 
 
 def _harvest_module():

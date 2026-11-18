@@ -127,14 +127,46 @@ def candidates(run: Path, limit: int = 3) -> list[Path]:
     return out
 
 
+# What a source file can pull in: a quoted relative path ("csrc/mk.cu", HERE / 'csrc' / ...
+# is caught through its last component) or a local Python import.
+_QUOTED = re.compile(r"""["']([\w./-]+\.(?:py|cu|cuh|h|hpp|cpp|cc|c|sh))["']""")
+_INCLUDE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.M)
+_IMPORT = re.compile(r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))", re.M)
+
+
+def used_sources(directory: Path) -> list[Path]:
+    """submission.py and every source file it reaches by name, transitively.
+
+    Debugging scripts the agent wrote next to it (which may legitimately load the reference)
+    are not part of the submission and are not reviewed."""
+    files = {p.relative_to(directory).as_posix(): p for p in directory.rglob("*")
+             if p.is_file() and not p.is_symlink() and p.suffix in SOURCE_SUFFIXES
+             and ".git" not in p.relative_to(directory).parts}
+    by_name: dict[str, list[str]] = {}
+    for rel in files:
+        by_name.setdefault(rel.rsplit("/", 1)[-1], []).append(rel)
+    todo, seen = ["submission.py"] if "submission.py" in files else [], set()
+    while todo:
+        rel = todo.pop()
+        if rel in seen:
+            continue
+        seen.add(rel)
+        text = files[rel].read_text(errors="replace")
+        names = [m.rsplit("/", 1)[-1] for m in _QUOTED.findall(text) + _INCLUDE.findall(text)]
+        for a, b in _IMPORT.findall(text):
+            mod = (a or b).split(".")
+            names += [mod[0] + ".py", mod[-1] + ".py"]
+        for name in names:
+            todo += [r for r in by_name.get(name, []) if r not in seen]
+    return [files[r] for r in sorted(seen)]
+
+
 def review(directory: Path) -> list[str]:
-    problems = []
-    for path in sorted(directory.rglob("*")):
-        if path.is_symlink():
-            problems.append(f"{path.relative_to(directory)}: symlink")
-            continue
-        if not path.is_file() or path.suffix not in SOURCE_SUFFIXES:
-            continue
+    problems = [f"{p.relative_to(directory)}: symlink"
+                for p in sorted(directory.rglob("*")) if p.is_symlink()]
+    if not (directory / "submission.py").is_file():
+        problems.append("no submission.py")
+    for path in used_sources(directory):
         text = path.read_text(errors="replace")
         for pattern, what in FORBIDDEN:
             if pattern.search(text):
