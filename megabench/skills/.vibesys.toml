@@ -22,3 +22,13 @@ domains = ["kernel-writing"]
 path = "megakernel-design"
 backends = ["cuda", "rocm"]
 domains = ["kernel-writing"]
+
+[[rule]]
+path = "cdna-sync-and-memory"
+backends = ["rocm"]
+domains = ["kernel-writing"]
+
+[[rule]]
+path = "cdna-matrix-core-design"
+backends = ["rocm"]
+domains = ["kernel-writing"]

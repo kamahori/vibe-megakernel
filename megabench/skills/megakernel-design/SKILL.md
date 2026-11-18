@@ -9,7 +9,9 @@ Use this skill to choose what to try next. It lists design options and the quest
 between them. It does not tell you which option wins on your case. Answer the questions with
 measurements: `megakernel-phase-profiling` finds where the time goes, and `megakernel-microbench`
 tests one option in isolation. For tensor-core engines on Blackwell, also read
-`blackwell-tensor-core-design`.
+`blackwell-tensor-core-design`. On AMD CDNA (rocm), also read `cdna-sync-and-memory` for barriers,
+coherence across XCDs and weight streaming, and `cdna-matrix-core-design` for MFMA against VALU
+engines.
 
 Each section ends with ideas that earlier runs retried many times without a gain. They are not
 forbidden. Before you plan one, write down what in your case differs from the cases where it
