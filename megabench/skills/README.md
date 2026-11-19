@@ -10,6 +10,9 @@ Method guidance for megakernel work, one skill per directory:
 - `megakernel-microbench`: study the slowest or furthest-from-floor phase in isolated
   microbenchmarks; these do not use rounds.
 - `blackwell-tensor-core-design`: evaluate Blackwell tensor-core designs (cuda backend only).
+- `blackwell-hardware-features`: measured B200 costs of grid sync, streaming loads (warps, 256-bit
+  loads, TMA ring depth), L2 eviction hints and bulk L2 prefetch, with what held in b1 megakernels,
+  large-batch decode attention and moderate-T MoE (cuda backend only).
 - `megakernel-regimes`: decide whether to specialize the kernel per batch size or KV length, using
   trace-derived regimes (`./trace_regimes`).
 
@@ -22,7 +25,10 @@ Optional skills live in `../skills-optional/` and are copied only on request
 (`--optional-skill NAME`). `megakernel-stage-linking` is optional: it splits a megakernel into
 contract-checked stage packages (PipeLink-style, `scripts/plk_link.py`). On MI300X the split did not
 improve performance: a separately compiled and linked seam cost 1.6-2.4%, and stages swapped between
-independently written kernels were slower or neutral.
+independently written kernels were slower or neutral. On B200 (sm_100a, CUDA 13.3 nvJitLink LTO)
+PipeLink's own linker cost nothing: linked/one-unit time was 0.994-1.008 with identical SASS, for a
+fused GEMM+SwiGLU kernel and for a nine-package Llama-1B megakernel. On either vendor the split only
+helps when it lets you swap in a better stage.
 
 VibeSys loads the skills natively; `.vibesys.toml` routes them to the `cuda` backend and the
 `kernel-writing` domain:
