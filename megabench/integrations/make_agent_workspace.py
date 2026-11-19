@@ -305,7 +305,8 @@ NO_FALLBACK_TASK = (
     "failure: what you built, the test that fails, and the step that would fix it. If the "
     "named design is correct but the timeline shows the phase slower than the design it "
     "replaces, keep the faster build as the candidate and return both timelines and both "
-    "checks as evidence.\n"
+    "checks as evidence. A stage of a large change is the exception (see the next "
+    "section): its candidate is the stage.\n"
     "- **Judge.** Compare the design of each phase that the candidate builds or rewrites "
     "with the fastest design by the order above. Accept a design that the rows rank slower "
     "only when the round's evidence holds a correct build of the faster-ranked design in the "
@@ -313,6 +314,32 @@ NO_FALLBACK_TASK = (
     "end to end. Without that evidence, do not accept it, however correct or fast it is: "
     "send it back with the phase, the row ids and the design to build. Record each such "
     "gap between proxy and kernel as an open question in `progress/microbench/open.md`.\n")
+
+LARGE_CHANGE_TASK = (
+    "\n## A large change: build it in its round, in stages if it is large\n\n"
+    "A round builds the change that its plan names, at the size the plan names. A switch of "
+    "a phase's engine or decomposition, a new data path or pipeline, or a new way of "
+    "dividing or scheduling work across CTAs is built in the round that plans it. This rule "
+    "binds every role:\n\n"
+    "- **Implementer.** Write the code of the plan's change in this round. Do not replace it "
+    "with a smaller or safer change, and do not leave it for a later round: a `deferred:` "
+    "cell of the build record never postpones the change of the plan. When the change does "
+    "not fit in one round, build one stage of it that is correct and passes "
+    "`./check_candidate`, for example: the new design in one phase while the other phases "
+    "keep their code; the new pipeline for one shape while the old one serves the rest; the "
+    "new scheduler that runs the old work items unchanged. Return the stage as the "
+    "candidate, with `Stage: <k> of about <n>` in the round result, what the stage contains, "
+    "its timeline, and the next stage as a list of the files and functions it changes. A "
+    "design note, a list of stages, or microbenchmarks alone are not a stage.\n"
+    "- **Orchestrator.** A correct stage that is slower than its parent does not settle its "
+    "plan. Plan the next stage on that candidate in the next round instead of a rollback, "
+    "and judge the change when its stages are done, against the parent that the first stage "
+    "started from. Roll back when the finished change is slower, or when two stages in a row "
+    "move no phase toward the plan's forecast.\n"
+    "- **Judge.** Judge a stage on correctness and on its contract (timeline events, build "
+    "record). The no-fallback rule applies to the phases that the stage writes; a phase that "
+    "the plan leaves for a later stage keeps its design. The speed of a stage alone is not a "
+    "reason to send it back.\n")
 
 GPU_JOBS_NOTE = (
     "- Every GPU job ends with a line that starts with the job name: the GPU it ran on, "
@@ -854,7 +881,7 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
            "not see this shell's `/tmp`. Compile in this shell (`./mb_build` and nvcc need "
            "no GPU) and send only built programs to `./gpu_run`: a compile error inside a "
            "GPU job costs its wait in the queue.\n" if gpu_socket is not None else "")
-        + (ENGINE_MAP_TASK + MICROBENCH_TASK + NO_FALLBACK_TASK
+        + (ENGINE_MAP_TASK + MICROBENCH_TASK + NO_FALLBACK_TASK + LARGE_CHANGE_TASK
            + TIMING_NOISE_TASK.replace("{gpu_jobs}", GPU_JOBS_NOTE if gpu_socket is not None else "")
            + PHASE_TIMING_TASK
            + (PHASE_AGENTS_TASK if phase_agents else "") if agent == "vibesys" else ""))
