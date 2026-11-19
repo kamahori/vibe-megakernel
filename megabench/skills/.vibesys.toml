@@ -22,3 +22,8 @@ domains = ["kernel-writing"]
 path = "megakernel-design"
 backends = ["cuda", "rocm"]
 domains = ["kernel-writing"]
+
+[[rule]]
+path = "blackwell-hardware-features"
+backends = ["cuda"]
+domains = ["kernel-writing"]
