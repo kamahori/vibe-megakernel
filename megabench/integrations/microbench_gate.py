@@ -22,7 +22,10 @@ plan there is nothing to check. A round whose phase the framework skipped
 (progress/microbench/skipped/<round>.md: no question of the plan needed a new microbenchmark)
 needs none of these files, and neither does a round whose phase the framework stopped at its
 hard time limit (progress/microbench/deadline/<round>.md) or that ended with an error before
-it wrote its files (progress/microbench/stopped/<round>.md). A claim that only the revised plan
+it wrote its files (progress/microbench/stopped/<round>.md). The same holds when the request
+file's `deadline: YYYY-MM-DDTHH:MM UTC` line has passed and the answers file exists: the
+microbench budget of the round is spent, and the subagent and the implementer build on the
+answers that exist instead of measuring until the gate passes. A claim that only the revised plan
 makes (not its draft, progress/microbench/draft/<round>.json) and that cites no row goes to the
 next round's phase (progress/microbench/carried/<round>.md). A plan claim that cites a row id
 that the round's answers also cite counts as answered. ./check_candidate runs `check --build` first and stops on a failure:
@@ -38,6 +41,7 @@ import argparse
 import json
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
 
@@ -49,6 +53,19 @@ RULES_OUT = re.compile(
     r"\b(reject\w*|premature|not worth|gains? nothing|does not pay|doesn't pay|no \w+ reuse|"
     r"ruled? out|too (?:complex|costly|risky|large)|cannot help|will not help|won't help)\b", re.I)
 ROW_ID = re.compile(r"\b[0-9a-f]{10}\b")
+DEADLINE = re.compile(r"^\s*deadline:\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(?::\d{2})?\s*(?:UTC|Z)?\s*$",
+                      re.MULTILINE | re.IGNORECASE)
+
+
+def deadline_passed(request: Path, now: datetime | None = None) -> bool:
+    """True when the request file's first `deadline:` line names a time that has passed."""
+    if not request.is_file():
+        return False
+    match = DEADLINE.search(request.read_text())
+    if match is None:
+        return False
+    end = datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M").replace(tzinfo=timezone.utc)
+    return (now or datetime.now(timezone.utc)) >= end
 LEDGER = MICROBENCH / "open.md"
 LEDGER_HEAD = re.compile(r"##\s+(Q\d+)\b[^\n]*?\b(open|closed|refuted)\b[^\n]*?\bopened\s+(round-\d+)",
                          re.I)
@@ -956,6 +973,9 @@ def check(workspace: Path, build: bool = False) -> list[str]:
               for marker in ("deadline", "stopped"))
     request = workspace / MICROBENCH / "requests" / f"{round_name}.md"
     answer = workspace / MICROBENCH / "answers" / f"{round_name}.md"
+    # The round's microbench budget is spent: the deadline of the request has passed and the
+    # answers exist. What they do not settle stays open in the ledger for a later round.
+    cut = cut or (deadline_passed(request) and answer.is_file() and bool(answer.read_text().strip()))
     for path in (request, answer):
         if not path.is_file() or not path.read_text().strip():
             problems.append(f"{path.relative_to(workspace)} is missing")

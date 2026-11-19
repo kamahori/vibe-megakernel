@@ -150,13 +150,16 @@ If the request file gives a deadline, plan the measurements to fit it: the quest
 the largest estimated effect first, the screen before the repeats. At the deadline, stop
 measuring, answer each item from the rows you have, and mark the items that the rows do not
 settle as open in the ledger with the measurement that would settle them. A later round
-measures them.
+measures them. The deadline is the round's whole microbench budget: once it has passed,
+`./microbench_check` accepts the answers file that exists, so do not keep measuring to make the
+gate pass. Write the answers and the ledger entries, and return.
 
 ## Before you return
 
 Run `./microbench_check`. It runs the gate that `./check_candidate` runs. If it fails, do what
-its message names, then run it again. Return only when it passes: the implementer writes code
-from the answers that you return, and answers that the gate rejects are not complete.
+its message names, then run it again. Return only when it passes, or when the deadline has
+passed and the answers file exists: the implementer writes code from the answers that you
+return, and answers that the gate rejects are not complete.
 
 ## Comparing engines and designs
 

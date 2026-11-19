@@ -218,6 +218,12 @@ ENGINE_MAP_TASK = (
     "from the same rebuild. Work spent on a design that the rows rank lower is work that a later "
     "round throws away.\n")
 
+# The implementer's own microbench budget in a round: one call of the microbench subagent with
+# a deadline this many minutes after it starts. The pre-plan phase has its own limit
+# (clean_vibesys_run --microbench-minutes). Past a request's deadline the gate accepts the
+# answers that exist, so the rest of the round goes to the code of the plan.
+IMPLEMENTER_MICROBENCH_MINUTES = 15
+
 MICROBENCH_TASK = (
     "\n## Microbench phase (mandatory in the opening rounds, then on open questions)\n\n"
     "A round plan starts as a draft. Before the implementer starts, the framework runs steps "
@@ -245,9 +251,10 @@ MICROBENCH_TASK = (
     "largest question still open in `progress/microbench/open.md`. It writes "
     "`progress/microbench/answers/<round>.md`, adds new measurements to the database, updates "
     "the ledger, and adds a status entry for the round to `progress/engine-map.md`.\n"
-    "4. Wait for complete answers before you write the code of a phase: `./microbench_check` "
-    "passes only when they are complete. If it fails after the subagent returns, give the "
-    "subagent its message and wait again. Then implement the plan. If later answers rank a "
+    "4. Wait for the answers before you write the code of a phase: `./microbench_check` "
+    "passes when they are complete, or when the deadline of the round's request file has "
+    "passed and the answers file exists. If it fails after the subagent returns, use the "
+    "implementer's microbench budget below once, then implement the plan. If later answers rank a "
     "phase's design differently from the code you already wrote, rebuild that phase in the "
     "design they rank best before you run `./check_candidate`. Before the check, write `progress/microbench/build/<round>.md`: one table row per phase of the candidate, `| phase | design built | notes |`, with the engine-map tags (E1, E2, ...) of the phase. In the design cell, name the engine, then the decomposition in the words of its rows' `p.decomp` (for example `tcgen05 swap-AB, stream_k_redadd`). `./check_candidate` refuses a phase built in another engine family than its fastest tuned matched row (rows with `tuned: true` from a sweep of two or more variants of the design; untuned rows and a phase with one tuned family force no family), unless that family's own matched rows are within the run-to-run noise of it. Inside the family built, it also refuses a decomposition slower than the family's fastest decomposition by more than the noise, and a design cell that does not name the decomposition when the rows measure two or more. To keep a slower design for one round, write `deferred: <reason> <row ids>` in the notes cell of the phase; the next round's record cannot defer the same phase. To keep a design for good, measure it under matched conditions; its rows then decide. In your notes, cite the answers that changed "
     "or confirmed a design choice. The plan's choice of design (engine, decomposition, data "
@@ -266,10 +273,20 @@ MICROBENCH_TASK = (
     "matched comparison or add a design or arm not measured for it before. A question that "
     "has gone two rounds without a matched comparison cannot be deferred. It also refuses a "
     "build record that is missing or that builds a phase in a slower family or decomposition "
-    "without a deferral. If a new question comes "
-    "up during the round, append it to the "
-    "request file and give it to the subagent again. Keep these files under `progress/`: a "
-    "revert to an earlier round keeps them.\n\n"
+    "without a deferral. Keep these files under `progress/`: a revert to an earlier round "
+    "keeps them.\n\n"
+    "### The implementer's microbench budget\n\n"
+    "Microbenchmarks in the implementer turn have a fixed budget, so that the round's time "
+    "goes to the code of the plan: one call of the `microbench` subagent, with a deadline "
+    f"{IMPLEMENTER_MICROBENCH_MINUTES} minutes after you start it. Use the call when "
+    "`./microbench_check` fails, or for a question whose answer changes the design of a phase "
+    "that this round writes. Before the call, write `deadline: YYYY-MM-DDTHH:MM UTC` as the "
+    "first line of the request file (replace the line that is there), and append the new "
+    "questions. Once the deadline has passed, `./microbench_check` accepts the answers file "
+    "that exists, and what the answers do not settle stays open in "
+    "`progress/microbench/open.md`. Do not call the subagent a second time in the round, and "
+    "do not write microbenchmarks of your own. A question that comes up after the call goes "
+    "into `progress/microbench/open.md` with its estimated effect, for a later round.\n\n"
     "After the opening rounds, the per-phase timeline of the current kernel "
     "(`./timeline_candidate`) is the default evidence for a plan, and the framework runs the "
     "phase only for the open questions of the draft that the timeline and the existing rows do "
@@ -305,7 +322,8 @@ NO_FALLBACK_TASK = (
     "failure: what you built, the test that fails, and the step that would fix it. If the "
     "named design is correct but the timeline shows the phase slower than the design it "
     "replaces, keep the faster build as the candidate and return both timelines and both "
-    "checks as evidence.\n"
+    "checks as evidence. A stage of a large change is the exception (see the next "
+    "section): its candidate is the stage.\n"
     "- **Judge.** Compare the design of each phase that the candidate builds or rewrites "
     "with the fastest design by the order above. Accept a design that the rows rank slower "
     "only when the round's evidence holds a correct build of the faster-ranked design in the "
@@ -313,6 +331,32 @@ NO_FALLBACK_TASK = (
     "end to end. Without that evidence, do not accept it, however correct or fast it is: "
     "send it back with the phase, the row ids and the design to build. Record each such "
     "gap between proxy and kernel as an open question in `progress/microbench/open.md`.\n")
+
+LARGE_CHANGE_TASK = (
+    "\n## A large change: build it in its round, in stages if it is large\n\n"
+    "A round builds the change that its plan names, at the size the plan names. A switch of "
+    "a phase's engine or decomposition, a new data path or pipeline, or a new way of "
+    "dividing or scheduling work across CTAs is built in the round that plans it. This rule "
+    "binds every role:\n\n"
+    "- **Implementer.** Write the code of the plan's change in this round. Do not replace it "
+    "with a smaller or safer change, and do not leave it for a later round: a `deferred:` "
+    "cell of the build record never postpones the change of the plan. When the change does not fit in one round, build one stage of it "
+    "that is correct and passes `./check_candidate`, for example: the new design in one phase "
+    "while the other phases keep their code; the new pipeline for one shape while the old "
+    "one serves the rest; the new scheduler that runs the old work items unchanged. Return "
+    "the stage as the candidate, with `Stage: <k> of about <n>` in the round result, what the "
+    "stage contains, its timeline, and the next stage as a list of the files and functions "
+    "it changes. A design note, a list of stages, or microbenchmarks alone are not a "
+    "stage.\n"
+    "- **Orchestrator.** A correct stage that is slower than its parent does not settle its "
+    "plan. Plan the next stage on that candidate in the next round instead of a rollback, "
+    "and judge the change when its stages are done, against the parent that the first stage "
+    "started from. Roll back when the finished change is slower, or when two stages in a row "
+    "move no phase toward the plan's forecast.\n"
+    "- **Judge.** Judge a stage on correctness and on its contract (timeline events, build "
+    "record). The no-fallback rule applies to the phases that the stage writes; a phase that "
+    "the plan leaves for a later stage keeps its design. The speed of a stage alone is not a "
+    "reason to send it back.\n")
 
 GPU_JOBS_NOTE = (
     "- Every GPU job ends with a line that starts with the job name: the GPU it ran on, "
@@ -854,7 +898,7 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
            "not see this shell's `/tmp`. Compile in this shell (`./mb_build` and nvcc need "
            "no GPU) and send only built programs to `./gpu_run`: a compile error inside a "
            "GPU job costs its wait in the queue.\n" if gpu_socket is not None else "")
-        + (ENGINE_MAP_TASK + MICROBENCH_TASK + NO_FALLBACK_TASK
+        + (ENGINE_MAP_TASK + MICROBENCH_TASK + NO_FALLBACK_TASK + LARGE_CHANGE_TASK
            + TIMING_NOISE_TASK.replace("{gpu_jobs}", GPU_JOBS_NOTE if gpu_socket is not None else "")
            + PHASE_TIMING_TASK
            + (PHASE_AGENTS_TASK if phase_agents else "") if agent == "vibesys" else ""))
