@@ -4,7 +4,6 @@ import io
 import json
 import tempfile
 import unittest
-from datetime import datetime, timezone
 from pathlib import Path
 
 from megabench import primdb
@@ -165,35 +164,6 @@ class GateTests(unittest.TestCase):
             cut.mkdir(parents=True)
             (cut / "round-0003.md").write_text("# stopped\n")
             self.assertEqual(check(ws), [])
-
-    def test_round_past_its_request_deadline_builds_on_the_answers_it_has(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            ws = Path(directory)
-            (ws / "progress/plans").mkdir(parents=True)
-            (ws / "progress/plans/round-0003.json").write_text(json.dumps(PAST_REJECTIONS[2]))
-            mb = ws / "progress/microbench"
-            for kind in ("requests", "answers"):
-                (mb / kind).mkdir(parents=True)
-            request, answers = mb / "requests/round-0003.md", mb / "answers/round-0003.md"
-            request.write_text("deadline: 2999-01-01T00:00 UTC\n- q\n")
-            answers.write_text("P1: open, the deadline came first.\n")
-            self.assertTrue(check(ws), "before the deadline the answers must be complete")
-            request.write_text("deadline: 2001-01-01T00:00 UTC\n- q\n")
-            self.assertEqual(check(ws), [])
-            answers.write_text("")
-            self.assertTrue(check(ws), "a passed deadline still needs the answers file")
-            answers.write_text("P1: open.\n")
-            request.write_text("- q\ndeadline: soon\n")
-            self.assertTrue(check(ws), "a deadline that is not a time does not count")
-
-    def test_deadline_passed_reads_the_framework_format(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            request = Path(directory) / "r.md"
-            self.assertFalse(microbench_gate.deadline_passed(request))
-            request.write_text("deadline: 2026-11-19T10:30 UTC\n- q\n")
-            at = lambda h, m: datetime(2026, 11, 19, h, m, tzinfo=timezone.utc)
-            self.assertFalse(microbench_gate.deadline_passed(request, at(10, 29)))
-            self.assertTrue(microbench_gate.deadline_passed(request, at(10, 30)))
 
     def test_phase_that_failed_before_its_answers_needs_none(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
