@@ -20,6 +20,9 @@ Per routed (token, slot) row, following DeepGEMM's fused epilogue:
 Every expert processes its rows in global (rank, token, slot) order in both
 the serial and EP layouts, so per-expert GEMMs see identical operands and
 row counts, and the EP result equals the serial result bit for bit.
+
+Single-GPU cases (``gpus == ep == 1``) are that serial problem: one process,
+all ``experts`` local, no communication.
 """
 
 from __future__ import annotations
@@ -88,7 +91,8 @@ def mxfp4_expert(seed: int, name: str, rows: int, cols: int, fan_in: float, devi
 
 
 def make_inputs(case: Case, seed: int, device: str, *, rank: int | None = None):
-    rank = dist.get_rank() if rank is None else rank
+    if rank is None:
+        rank = 0 if case.gpus == 1 else dist.get_rank()
     p = case.params
     tokens, experts, topk, hidden, inter = p['tokens'], p['experts'], p['topk'], p['hidden'], p['intermediate']
     if case.tp != 1 or case.gpus != case.ep or not 0 <= rank < case.gpus:
@@ -150,7 +154,9 @@ def experts(case: Case, values, rows, scales, local_ids, weights):
     return output
 
 
-def reference(case: Case, values, *, serial=False):
+def reference(case: Case, values, *, serial=None):
+    # A single-GPU case is the serial problem: no process group, no all-to-all.
+    serial = case.gpus == 1 if serial is None else serial
     if serial and case.gpus != 1:
         raise ValueError('serial validation requires a single-rank geometry')
     group = None if serial else initialize(case).ep_group

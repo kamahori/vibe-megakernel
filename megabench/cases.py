@@ -386,6 +386,18 @@ CASES: tuple[Case, ...] = (
            "expert_parallel", "p3", ready=True, gpus=8, ep=8, atol=0.003, rtol=0.003,
            note="FP8 x MXFP4 routed-expert layer over EP8 all-to-all; verified bitwise against the serial run on eight B200 GPUs.")
       for tokens in (512, 4096)),
+    # The same layer's work for one GPU without communication: 48 experts (one EP8
+    # rank's share; expert e has the EP8 cases' weights for expert e) and T tokens
+    # routed top-6 among them, so every expert sees T/8 rows on average, as an EP8
+    # rank does. Route, linear1, SwiGLU, FP8 requantization, linear2 and combine.
+    *(Case(f"megamoe-layer-deepseek-v4-pro-1gpu-e48-t{tokens}", "megamoe_layer",
+           "deepseek-ai/DeepSeek-V4-Pro", "moe_layer",
+           {"tokens": tokens, "experts": 48, "topk": 6, "hidden": 7168,
+            "intermediate": 3072, "act_block": 32, "swiglu_limit": 10},
+           "routed_moe", "p3", ready=True, atol=0.003, rtol=0.003,
+           note="Single-GPU FP8 x MXFP4 routed-expert layer: one EP8 rank's expert work without "
+                "dispatch/combine communication.")
+      for tokens in (512, 4096)),
     # One DSpark iteration: verify the committed token plus 5 proposals (6 rows)
     # against 2,048 cached tokens, accept the greedy prefix, draft 5 more.
     Case("dsv41-flash-dspark-step-k5-ctx2k", "dsv41_dspark_step",
