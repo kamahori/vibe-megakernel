@@ -110,7 +110,7 @@ proxy_url=http://127.0.0.1:3128
 # control files (ro) at fixed paths; the shared HF cache is masked by an empty directory.
 common=(--network none --userns=keep-id --entrypoint= --hostname megabench --shm-size "$SHM_SIZE"
     --security-opt no-new-privileges
-    -v "$WS:$WS" -v "$TRUSTED:$TRUSTED:ro" -v "$RUN/home:/home/agent"
+    -v "$WS:$WS" -v "${AGENT_TRUSTED:-$TRUSTED}:$TRUSTED:ro" -v "$RUN/home:/home/agent"
     -v "$RUN/control:$RUN/control:ro" -v "$EMPTY:/scratch/hf:ro"
     -v /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro -v "$NETDIR:/run/mb-net"
     -e HOME=/home/agent -e PATH="$CONTAINER_PATH" -e TMPDIR=/tmp -e TERM=xterm-256color

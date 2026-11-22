@@ -251,6 +251,7 @@ def prepare(args: argparse.Namespace) -> int:
     # In the container the trusted snapshot's interpreter is the image's venv.
     (run / "trusted/.venv").unlink()
     (run / "trusted/.venv").symlink_to(IMAGE_VENV)
+    agent_trusted = make_agent_trusted(run, args.trusted_hide)
 
     home = run / "home"
     if args.agent == "claude":
@@ -290,7 +291,7 @@ def prepare(args: argparse.Namespace) -> int:
         "grade_timeout": args.grade_timeout,
         "regimes": str(args.regimes.resolve()) if args.regimes else None,
         "budget_minutes": budget, "overlays": [str(o.resolve()) for o in args.overlay],
-        "removed": list(args.remove),
+        "removed": list(args.remove), "trusted_hidden": list(args.trusted_hide),
         "kickoff": (run / "control/kickoff.txt").read_text().strip(),
         "goal": goal, "snapshot_checks": args.snapshot_checks,
     }
@@ -305,7 +306,7 @@ def prepare(args: argparse.Namespace) -> int:
         "CREDENTIAL_ENV": CREDENTIAL_ENV[args.credential_kind] or "",
         "CREDENTIAL_FILE": credential, "METHOD": method, "SESSION_ID": config["session_id"],
         "GRADE_REPS": args.grade_reps, "GRADE_TIMEOUT": args.grade_timeout,
-        "SHM_SIZE": args.shm_size, "REGIMES": "1" if args.regimes else "", "FORBID": " ".join(map(str, forbidden_paths(run, credential))),
+        "AGENT_TRUSTED": agent_trusted or "", "SHM_SIZE": args.shm_size, "REGIMES": "1" if args.regimes else "", "FORBID": " ".join(map(str, forbidden_paths(run, credential))),
     }
     (run / "run.env").write_text("".join(f"{k}={shlex.quote(str(v))}\n" for k, v in env.items()))
     shutil.copy2(Path(__file__).with_name("container_round.sh"), run / "round.sh")
@@ -318,6 +319,28 @@ def prepare(args: argparse.Namespace) -> int:
           f"  {sys.executable} -m megabench.integrations.container_run smoke --run-dir {run}\n"
           f"  {sys.executable} -m megabench.integrations.container_run submit --run-dir {run}")
     return 0
+
+
+def make_agent_trusted(run: Path, hide: list[str]) -> Path | None:
+    """The trusted snapshot the agent container sees: RUN/trusted minus `hide`.
+
+    The agent container mounts it at RUN/trusted, so the workspace tools keep working; grading
+    and rescoring mount the full RUN/trusted. With nothing hidden the agent sees RUN/trusted.
+    """
+    if not hide:
+        return None
+    full, agent = run / "trusted", run / "trusted-agent"
+    shutil.copytree(full, agent, symlinks=True)
+    for rel in hide:
+        target = (agent / rel)
+        if not target.resolve().is_relative_to(agent.resolve()) or target.resolve() == agent.resolve():
+            raise SystemExit(f"--trusted-hide {rel}: not a path inside the trusted snapshot")
+        if rel.strip("/") in ("megabench", "megabench/cases.py", "megabench/harness", "megabench/tasks", ".venv"):
+            raise SystemExit(f"--trusted-hide {rel}: the evaluator needs it")
+        if not (target.exists() or target.is_symlink()):
+            raise SystemExit(f"--trusted-hide {rel}: no such path in the trusted snapshot")
+        shutil.rmtree(target) if target.is_dir() and not target.is_symlink() else target.unlink()
+    return agent
 
 
 def customize_workspace(workspace: Path, control: Path, overlays: list[Path], snapshots: bool,
@@ -619,6 +642,9 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--remove", action="append", default=[], metavar="PATH",
                       help="workspace path (relative) deleted before the overlays, e.g. an arm without "
                            "a stock tool or skill (repeat)")
+    prep.add_argument("--trusted-hide", action="append", default=[], metavar="PATH",
+                      help="path in the trusted snapshot (relative, e.g. megabench/skills) that the agent "
+                           "container does not see; grading still uses the full snapshot (repeat)")
     prep.add_argument("--kickoff-file", type=Path,
                       help="the message after /goal ({minutes} = the budget); default KICKOFF")
     prep.add_argument("--no-snapshot-checks", dest="snapshot_checks", action="store_false",

@@ -251,6 +251,29 @@ class ExperimentToolsTests(unittest.TestCase):
                     with self.assertRaises(SystemExit):
                         self.prepare(Path(other), "--remove", bad)
 
+    def test_trusted_hide_gives_the_agent_a_stripped_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self.prepare(Path(tmp), "--trusted-hide", "megabench/skills",
+                               "--trusted-hide", "megabench/primdb")
+            agent, full = run / "trusted-agent", run / "trusted"
+            self.assertFalse((agent / "megabench/skills").exists())
+            self.assertFalse((agent / "megabench/primdb").exists())
+            self.assertTrue((full / "megabench/skills").is_dir())     # grading keeps everything
+            self.assertTrue((agent / "megabench/harness").is_dir())
+            self.assertEqual(os.readlink(agent / ".venv"), os.readlink(full / ".venv"))
+            env = dict(line.split("=", 1) for line in (run / "run.env").read_text().splitlines())
+            self.assertEqual(shlex.split(env["AGENT_TRUSTED"])[0], str(agent))
+            round_sh = (run / "round.sh").read_text()
+            self.assertIn('-v "${AGENT_TRUSTED:-$TRUSTED}:$TRUSTED:ro"', round_sh)
+            self.assertIn('-v "$TRUSTED:$TRUSTED:ro" -v "$1:$1"', round_sh)  # grade_dir: full snapshot
+            for bad in ("megabench/harness", "../x", "megabench/nope"):
+                with self.subTest(bad=bad), tempfile.TemporaryDirectory() as other:
+                    with self.assertRaises(SystemExit):
+                        self.prepare(Path(other), "--trusted-hide", bad)
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self.prepare(Path(tmp))
+            self.assertFalse((run / "trusted-agent").exists())
+
     def test_budget_harvest_and_report(self) -> None:
         harvest = _harvest_module()
         with tempfile.TemporaryDirectory() as tmp:
