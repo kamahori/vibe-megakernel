@@ -234,6 +234,23 @@ class ExperimentToolsTests(unittest.TestCase):
             env = dict(line.split("=", 1) for line in (run / "run.env").read_text().splitlines())
             self.assertEqual(shlex.split(env["BUDGET_SECONDS"])[0], "1500")
 
+    def test_remove_drops_stock_paths_before_overlays(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self.prepare(Path(tmp), "--remove", "megakernel_skills", "--remove", "primdb")
+            ws = run / CASE
+            self.assertFalse((ws / "megakernel_skills").exists())
+            self.assertFalse((ws / "primdb").exists())
+            self.assertTrue((ws / "check_candidate").exists())
+            self.assertEqual(json.loads((run / "config.json").read_text())["removed"],
+                             ["megakernel_skills", "primdb"])
+            status = subprocess.run(["git", "-C", str(ws), "status", "--porcelain"],
+                                    capture_output=True, text=True).stdout
+            self.assertEqual(status, "")
+            for bad in ("check_candidate", "../x", "missing_tool"):
+                with self.subTest(bad=bad), tempfile.TemporaryDirectory() as other:
+                    with self.assertRaises(SystemExit):
+                        self.prepare(Path(other), "--remove", bad)
+
     def test_budget_harvest_and_report(self) -> None:
         harvest = _harvest_module()
         with tempfile.TemporaryDirectory() as tmp:

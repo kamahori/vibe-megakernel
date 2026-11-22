@@ -247,7 +247,7 @@ def prepare(args: argparse.Namespace) -> int:
         shutil.copyfile(args.regimes, run / "state/regimes.json")
     subprocess.run(command, check=True, cwd=run / "trusted",
                    env=os.environ | {"PYTHONPATH": str(run / "trusted")})
-    customize_workspace(workspace, run / "control", args.overlay, args.snapshot_checks)
+    customize_workspace(workspace, run / "control", args.overlay, args.snapshot_checks, args.remove)
     # In the container the trusted snapshot's interpreter is the image's venv.
     (run / "trusted/.venv").unlink()
     (run / "trusted/.venv").symlink_to(IMAGE_VENV)
@@ -290,6 +290,7 @@ def prepare(args: argparse.Namespace) -> int:
         "grade_timeout": args.grade_timeout,
         "regimes": str(args.regimes.resolve()) if args.regimes else None,
         "budget_minutes": budget, "overlays": [str(o.resolve()) for o in args.overlay],
+        "removed": list(args.remove),
         "kickoff": (run / "control/kickoff.txt").read_text().strip(),
         "goal": goal, "snapshot_checks": args.snapshot_checks,
     }
@@ -319,8 +320,18 @@ def prepare(args: argparse.Namespace) -> int:
     return 0
 
 
-def customize_workspace(workspace: Path, control: Path, overlays: list[Path], snapshots: bool) -> None:
-    """Arm overlays, ./time_left and the snapshotting ./check_candidate; one git commit."""
+def customize_workspace(workspace: Path, control: Path, overlays: list[Path], snapshots: bool,
+                        remove: list[str] = ()) -> None:
+    """Arm removals and overlays, ./time_left and the snapshotting ./check_candidate; one git commit."""
+    for rel in remove:
+        target = (workspace / rel).resolve()
+        if not target.is_relative_to(workspace.resolve()) or target == workspace.resolve():
+            raise SystemExit(f"--remove {rel}: not a path inside the workspace")
+        if rel.strip("/") in ("check_candidate", "submission.py", "TASK.md", "case.json", "reference"):
+            raise SystemExit(f"--remove {rel}: the workspace needs it")
+        if not (target.exists() or target.is_symlink()):
+            raise SystemExit(f"--remove {rel}: no such path in the stock workspace")
+        shutil.rmtree(target) if target.is_dir() and not target.is_symlink() else target.unlink()
     for overlay in overlays:
         shutil.copytree(overlay, workspace, dirs_exist_ok=True, symlinks=True)
     tool = workspace / "time_left"
@@ -605,6 +616,9 @@ def build_parser() -> argparse.ArgumentParser:
                            "./time_left reports what is left")
     prep.add_argument("--overlay", type=Path, action="append", default=[],
                       help="directory copied into the workspace (repeat; in order)")
+    prep.add_argument("--remove", action="append", default=[], metavar="PATH",
+                      help="workspace path (relative) deleted before the overlays, e.g. an arm without "
+                           "a stock tool or skill (repeat)")
     prep.add_argument("--kickoff-file", type=Path,
                       help="the message after /goal ({minutes} = the budget); default KICKOFF")
     prep.add_argument("--no-snapshot-checks", dest="snapshot_checks", action="store_false",
