@@ -18,15 +18,31 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Exper
 
 from ..cases import select_cases
 from ..harness.distributed import evaluate_distributed
+from ..harness.runner import evaluate_case
 from ..tasks import megamoe
 from ..tasks.oracle import fp32_reference
 from ..tasks.quantization import (e8m0_exponent, pack_fp8_activation, unpack_fp8_activation,
                                   unpack_mxfp4)
-from ..verify_megamoe import development, serial_case
+from ..verify_megamoe import DEVELOPMENT, development, serial_case
 
 
 def megamoe_cases():
-    return [case for case in select_cases('all') if case.family == 'megamoe_layer']
+    """The EP8 cases (communication); single-GPU cases are ``single_gpu_cases``."""
+    return [case for case in select_cases('all') if case.family == 'megamoe_layer' and case.gpus > 1]
+
+
+def single_gpu_cases():
+    return [case for case in select_cases('all') if case.family == 'megamoe_layer' and case.gpus == 1]
+
+
+def tiny_single(experts=16):
+    """Development geometry of a single-GPU case (all experts local)."""
+    return replace(single_gpu_cases()[0], ready=True, params=single_gpu_cases()[0].params | DEVELOPMENT
+                   | {'experts': experts})
+
+
+def as_bytes(value):
+    return value.view(torch.uint8) if value.dtype == torch.float8_e4m3fn else value
 
 
 def tiny(ranks=1):
@@ -173,6 +189,47 @@ class MegaMoETests(unittest.TestCase):
                     self.assertEqual(report['status'], 'pass')
                     self.assertEqual(len(report['trials']), 2)
                     self.assertTrue(all(trial['serial_comparison']['y']['bitwise_equal'] for trial in report['trials']))
+
+    def test_single_gpu_catalog_is_one_ep8_ranks_work(self):
+        cases = single_gpu_cases()
+        self.assertEqual([case.params['tokens'] for case in cases], [512, 4096])
+        ep8 = {case.params['tokens']: case for case in megamoe_cases()}
+        for case in cases:
+            with self.subTest(case=case.id):
+                self.assertEqual((case.gpus, case.tp, case.ep, case.max_gpu_launches), (1, 1, 1, 1))
+                wide = ep8[case.params['tokens']]
+                self.assertEqual(case.params['experts'], wide.params['experts'] // wide.ep)
+                self.assertEqual(case.params | {'experts': 0}, wide.params | {'experts': 0})
+                self.assertEqual((case.atol, case.rtol), (wide.atol, wide.rtol))
+                # Same average rows per expert as an EP8 rank: T*k/E_local = (8T)*k/E.
+                self.assertEqual(case.params['tokens']*case.params['topk']*wide.params['experts'],
+                                 wide.params['tokens']*wide.gpus*wide.params['topk']*case.params['experts'])
+
+    def test_single_gpu_inputs_need_no_process_group_and_reuse_ep8_rank0_experts(self):
+        case = tiny_single()
+        values = megamoe.make_inputs(case, 9, 'cpu')
+        self.assertEqual(tuple(values['l1_blocks'].shape)[0], case.params['experts'])
+        self.assertEqual(int(values['topk_idx'].max()) < case.params['experts'], True)
+        # Expert e of the single-GPU case is expert e of an EP case's rank 0.
+        wide = replace(tiny(4), params=tiny(4).params | {'experts': 4*case.params['experts']})
+        rank0 = megamoe.make_inputs(wide, 9, 'cpu', rank=0)
+        for name in ('l1_blocks', 'l1_scales', 'l2_blocks', 'l2_scales'):
+            self.assertTrue(torch.equal(values[name], rank0[name]), name)
+
+    def test_single_gpu_reference_defaults_to_serial(self):
+        case = tiny_single()
+        values = megamoe.make_inputs(case, 4, 'cpu')
+        output = megamoe.reference(case, values)['y']
+        self.assertTrue(torch.equal(output, megamoe.reference(case, values, serial=True)['y']))
+        self.assertTrue(bool(torch.isfinite(output.float()).all()))
+        with self.assertRaises(ValueError):
+            megamoe.reference(tiny(2), megamoe.make_inputs(tiny(2), 4, 'cpu', rank=0), serial=True)
+
+    def test_reference_submission_passes_the_single_gpu_harness(self):
+        submission = Path(__file__).parents[1]/'examples/reference_submission.py'
+        report = evaluate_case(tiny_single(), submission, device='cpu', trials=2, warmup=0, reps=1)
+        self.assertEqual(report['status'], 'correctness_only', report)
+        self.assertEqual(len(report['correctness']['trials']), 2)
 
     def test_reference_submission_passes_the_distributed_harness(self):
         submission = Path(__file__).parents[1]/'examples/reference_submission.py'

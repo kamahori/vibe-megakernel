@@ -84,7 +84,9 @@ class SolTests(unittest.TestCase):
                     "vla-action-step-pi05-b1": "hbm",
                     "world-frame-step-waypoint15-1b-f128": "tensor_core",
                     "megamoe-layer-deepseek-v4-pro-ep8-t512": "hbm",
-                    "megamoe-layer-deepseek-v4-pro-ep8-t4096": "tensor_core"}
+                    "megamoe-layer-deepseek-v4-pro-ep8-t4096": "tensor_core",
+                    "megamoe-layer-deepseek-v4-pro-1gpu-e48-t512": "hbm",
+                    "megamoe-layer-deepseek-v4-pro-1gpu-e48-t4096": "tensor_core"}
         for case in select_cases("all", list(expected)):
             with self.subTest(case=case.id):
                 row = estimate_case(Case(**(case.to_dict() | {"ready": True})), measured_ms=10.0)
@@ -99,6 +101,14 @@ class SolTests(unittest.TestCase):
         p = megamoe.params
         self.assertEqual(row["tensor_flops"],
                          2 * p["tokens"] * p["topk"] * 3 * p["intermediate"] * p["hidden"])
+        # The single-GPU case is one EP8 rank's work without the link term.
+        for tokens in (512, 4096):
+            wide, single = (estimate_case(Case(**(select_cases("all", [i])[0].to_dict() | {"ready": True})))
+                            for i in (f"megamoe-layer-deepseek-v4-pro-ep8-t{tokens}",
+                                      f"megamoe-layer-deepseek-v4-pro-1gpu-e48-t{tokens}"))
+            self.assertEqual(single["nvlink_floor_ms"], 0)
+            self.assertEqual((single["minimum_bytes"], single["tensor_flops"]),
+                             (wide["minimum_bytes"], wide["tensor_flops"]))
 
     def test_sequential_steps_reread_weights_larger_than_l2(self) -> None:
         def parts(case_id: str, **params) -> dict:

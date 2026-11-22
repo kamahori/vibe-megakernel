@@ -763,7 +763,11 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "return to their source rank (the reference uses all-to-all). Complete all "
         "communication inside run. The budget includes NCCL kernels and is one GPU launch per rank. "
         "Use an allocation with all required GPUs visible. Nsight capture of spawned "
-        "ranks requires `--target-processes all`.\n\n" if case.family == "megamoe_layer" else
+        "ranks requires `--target-processes all`.\n\n" if case.family == "megamoe_layer" and case.gpus > 1 else
+        f"This is one GPU's share of the expert-parallel layer without communication: all "
+        f"{case.params['experts']} experts are local, so routed (token, slot) rows are grouped by "
+        "expert on this GPU and combined back to their tokens here.\n\n"
+        if case.family == "megamoe_layer" else
         f"The evaluator starts {case.gpus} rank processes with TP={case.tp}, the upstream "
         "DeepSeek-V4.1 runtime layout. `build(case)` receives `case['execution']`: rank, world_size, "
         "tp_rank, ep_rank, device, backend, and live tp_group/ep_group handles. Attention and indexer "
