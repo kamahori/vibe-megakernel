@@ -25,7 +25,7 @@ from .test_glm53 import development as glm53_development
 
 MODULE_BY_FAMILY = TASK_MODULES
 SKILLS = ("megakernel-phase-profiling", "megakernel-microbench", "megakernel-regimes",
-          "blackwell-tensor-core-design", "megakernel-design")
+          "blackwell-tensor-core-design", "blackwell-hardware-features", "megakernel-design")
 MEGABENCH = Path(__file__).resolve().parents[1]
 
 
@@ -350,9 +350,12 @@ class AgentWorkspaceTests(unittest.TestCase):
             cuda = make_workspace(case.id, Path(directory) / "cuda", agent="plain", backend="cuda")
             self.assertFalse((rocm / "megakernel_skills/blackwell-tensor-core-design").exists())
             self.assertNotIn("blackwell-tensor-core-design", (rocm / "TASK.md").read_text())
+            self.assertFalse((rocm / "megakernel_skills/blackwell-hardware-features").exists())
+            self.assertNotIn("blackwell-hardware-features", (rocm / "TASK.md").read_text())
             self.assertTrue((rocm / scripts / "codegen_gate_amd.py").is_file())
             self.assertFalse((rocm / scripts / "codegen_gate.py").exists())
             self.assertTrue((cuda / "megakernel_skills/blackwell-tensor-core-design/SKILL.md").is_file())
+            self.assertTrue((cuda / "megakernel_skills/blackwell-hardware-features/SKILL.md").is_file())
             self.assertTrue((cuda / scripts / "codegen_gate.py").is_file())
             self.assertFalse((cuda / scripts / "codegen_gate_amd.py").exists())
 

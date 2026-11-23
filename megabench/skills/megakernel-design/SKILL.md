@@ -39,6 +39,23 @@ math and all loads were free (the sync skeleton)?
   waiting for one producer.
 - Questions: Which consumers really need all producers? How much redundant work does a CTA
   add to skip the wait? Does the new signal need a reset, and who resets it?
+- Data tagged with the step pays off when each consumer reads from a few producers. Example:
+  after QKV, each attention CTA needs the q/k/v of one head group, written by about 12 CTAs.
+  Two independently written b1 kernels (Qwen3-0.6B dense, Qwen3-30B-A3B MoE) replaced that
+  barrier this way; on the MoE kernel it saved about 1.2 µs per layer (3.6% of the step) on B200.
+  When every consumer needs every producer (router logits computed by 128 CTAs and read by all
+  CTAs), the same scheme was 10% slower than one counter barrier when every CTA polled one copy.
+  It became 3.8% faster after three changes: the producers wrote 16 copies of the logits, only
+  the TMA producer warp polled, and that warp computed the top-k and issued the expert loads
+  itself. All three were needed: moving only the top-k into a producer that polled one copy
+  cost 462 µs.
+- Poll tagged data with a short backoff (`__nanosleep` of 30-100 ns). With 148 CTAs spinning on
+  the same L2 lines and no backoff, the writers starved and the kernel hung. Where polling did
+  not hang, a 30-100 ns backoff cost under 0.3%. The best value depends on the poller count;
+  on the 16-copy router flags, 300 ns beat 30 ns by 2%. Sweep it.
+- Hold the next phase's bulk prefetch until shortly before the barrier arrival. On the MoE
+  kernel, releasing it two chunks before arrival saved 2.2%: the prefetch no longer competed
+  with the tail of the expert phase for HBM.
 
 ### Make a barrier cheaper
 - Change the barrier protocol (cooperative grid sync, an atomic counter with acquire
@@ -47,8 +64,9 @@ math and all loads were free (the sync skeleton)?
 - Questions: What does one barrier cost at your grid, and how much of it is skew rather than
   the protocol? How many barriers does a step have, and what share of the step is that?
 
-Retried often without a gain: hierarchical barriers and barriers built from per-CTA flags. A
-cheaper protocol helped in some cases and not in others, so measure your skew first.
+Retried often without a gain: hierarchical barriers, barriers built from per-CTA flags, and
+tagged data for an all-to-all dependency polled by every CTA from one copy. A cheaper protocol helped in some cases and not in
+others, so measure your skew first.
 
 ## 2. Overlap across phases and weight streaming
 
@@ -80,6 +98,15 @@ issuing the whole next phase ahead instead of its first tiles.
 - Fuse attention with its output projection, so each head adds its slice of the result.
 - Fuse gate/up with the activation, and consider fusing the down projection with a split
   reduction.
+- In MoE, fold the routing weight into the down-projection epilogue and accumulate all experts
+  into one FP32 vector, so the next phase reads one vector instead of one per expert. This saved
+  1.0-1.3% of a b1 Qwen3-30B-A3B step; it also drops the per-expert BF16 rounding (section 9).
+  Zeroing such per-layer accumulators once at kernel entry (two sets, alternated by launch
+  parity) instead of inside the layer loop saved another 0.2-0.4%.
+- At large M, fusing the activation into the GEMM epilogue saves the round trip of the GEMM
+  output through HBM. Against cuBLAS with a separate SwiGLU kernel on B200 (Qwen3-32B MLP), a
+  fused tcgen05 GEMM won 4-9% at M >= 1024 and lost at M <= 512, because its main loop ran at only
+  0.71-0.92x the speed of cuBLAS. Compare the main loop alone with cuBLAS before you credit the fusion.
 - Fuse an output head (vocabulary or codebook) with its argmax: each CTA writes a partial
   maximum in the epilogue.
 - Questions: Which barrier does the fusion remove? Does it make the reduction order change, or

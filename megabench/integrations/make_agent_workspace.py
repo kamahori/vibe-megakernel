@@ -823,7 +823,9 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "furthest-from-floor phase in isolated microbenchmarks (`megakernel-microbench`; "
         "these do not use rounds)"
         + (". " if backend == "rocm" else
-           ", and evaluate Blackwell tensor-core designs (`blackwell-tensor-core-design`). ")
+           ", evaluate Blackwell tensor-core designs (`blackwell-tensor-core-design`), and look "
+           "up measured B200 costs of grid sync, streaming loads and L2 hints "
+           "(`blackwell-hardware-features`). ")
         + ("`megakernel-stage-linking` (optional, included on request) splits the kernel into "
            "contract-checked stage packages; measured seams are not free, so ship a one-TU build. "
            if "megakernel-stage-linking" in optional_skills else "") +
