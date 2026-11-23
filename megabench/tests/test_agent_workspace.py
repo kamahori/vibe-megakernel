@@ -26,6 +26,7 @@ from .test_glm53 import development as glm53_development
 MODULE_BY_FAMILY = TASK_MODULES
 SKILLS = ("megakernel-phase-profiling", "megakernel-microbench", "megakernel-regimes",
           "blackwell-tensor-core-design", "megakernel-design")
+ROCM_ONLY_SKILLS = ("cdna-sync-and-memory", "cdna-matrix-core-design")
 MEGABENCH = Path(__file__).resolve().parents[1]
 
 
@@ -98,7 +99,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         rules = tomllib.loads((root / ".vibesys.toml").read_text())["rule"]
         ruled = {rule["path"] for rule in rules}
         found = sorted(path.parent for path in root.glob("*/SKILL.md"))
-        self.assertEqual({path.name for path in found}, set(SKILLS))
+        self.assertEqual({path.name for path in found}, set(SKILLS) | set(ROCM_ONLY_SKILLS))
         for path in found:
             with self.subTest(skill=path.name):
                 text = (path / "SKILL.md").read_text()
@@ -355,6 +356,37 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertTrue((cuda / "megakernel_skills/blackwell-tensor-core-design/SKILL.md").is_file())
             self.assertTrue((cuda / scripts / "codegen_gate.py").is_file())
             self.assertFalse((cuda / scripts / "codegen_gate_amd.py").exists())
+            for skill in ROCM_ONLY_SKILLS:
+                self.assertTrue((rocm / "megakernel_skills" / skill / "SKILL.md").is_file())
+                self.assertIn(f"`{skill}`", (rocm / "TASK.md").read_text())
+                self.assertFalse((cuda / "megakernel_skills" / skill).exists())
+                self.assertNotIn(skill, (cuda / "TASK.md").read_text())
+
+    def test_rocm_primdb_reads_the_amd_seed(self) -> None:
+        case = select_cases("p0")[0]
+        with tempfile.TemporaryDirectory() as directory:
+            rocm = make_workspace(case.id, Path(directory) / "rocm", agent="plain", backend="rocm")
+            cuda = make_workspace(case.id, Path(directory) / "cuda", agent="plain", backend="cuda")
+            self.assertIn("--seed", (rocm / "primdb").read_text())
+            self.assertIn("seed_amd.jsonl", (rocm / "primdb").read_text())
+            self.assertNotIn("--seed", (cuda / "primdb").read_text())
+            self.assertIn("measured AMD costs", (rocm / "TASK.md").read_text())
+            self.assertNotIn("B200", (rocm / "TASK.md").read_text())
+            task = (rocm / "TASK.md").read_text()
+            self.assertIn("## Measured costs on this GPU (MI300X, gfx942", task)
+            self.assertIn("grid sync", task)
+            self.assertNotIn("Measured costs on this GPU", (cuda / "TASK.md").read_text())
+            mi350 = make_workspace(case.id, Path(directory) / "mi350", agent="plain", backend="rocm", gpu="mi350x")
+            self.assertNotIn("Measured costs on this GPU", (mi350 / "TASK.md").read_text())
+            result = subprocess.run([str(rocm / "primdb"), "q", "grid_barrier.",
+                                     "--json", "--limit", "500"], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+            self.assertTrue(rows)
+            self.assertTrue(all(r["cond"]["arch"] in ("gfx90a", "gfx942", "gfx950") for r in rows))
+            result = subprocess.run([str(rocm / "primdb"), "q", "tc_mma", "--json"],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.stdout.strip(), "")
 
     def test_stage_linking_is_optional(self) -> None:
         case = select_cases("p0")[0]

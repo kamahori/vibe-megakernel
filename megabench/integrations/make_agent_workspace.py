@@ -45,6 +45,9 @@ AMD_GPUS = {
 }
 
 
+AMD_SEED = "megabench/primdb/seed_amd.jsonl"
+
+
 def rocm_hardware_text(gpu: str) -> str:
     g = AMD_GPUS[gpu]
     lds_flag = (f" (pass `--lds-per-cu {g['lds_per_cu']}`)" if g["lds_per_cu"] != 65536 else "")
@@ -61,6 +64,16 @@ def rocm_hardware_text(gpu: str) -> str:
         f"(llvm-objdump/llvm-readelf){lds_flag}; "
         "for fine intervals inside one CU use `clock64()`/`__builtin_amdgcn_s_memtime()` "
         "instead of PTX `clock64`. Nsight tools are not available.\n")
+
+
+def rocm_measured_text(benchmark_root: Path, gpu: str) -> str:
+    """The decisive measured costs for this GPU from the AMD seed ('' when it has no rows)."""
+    seed = benchmark_root / AMD_SEED
+    if not seed.is_file():
+        return ""
+    from megabench.primdb.amd_seed import task_facts
+    rows = [json.loads(line) for line in seed.read_text().splitlines() if line.strip()]
+    return task_facts(rows, AMD_GPUS[gpu]["arch"])
 
 
 REFERENCE_FILES = {
@@ -595,7 +608,9 @@ def _write_tools(project: Path, benchmark_root: Path, case: Case,
     sol.chmod(0o755)
     local = shlex.quote(str(project / "progress/microbench/primdb_local.jsonl"))
     cached = shlex.quote(str(project / CACHE_ROWS))
-    for name, module, args in (("primdb", "megabench.primdb", ""),
+    # rocm workspaces query the measured AMD rows (primbench/amd) instead of the B200 seed
+    amd_seed = ("--seed " + shlex.quote(str(benchmark_root / AMD_SEED)) + " " if backend == "rocm" else "")
+    for name, module, args in (("primdb", "megabench.primdb", amd_seed),
                                ("engine_map", "megabench.primdb.engine_map", ""),
                                ("microbench_items", "megabench.integrations.microbench_gate",
                                 "items "),
@@ -822,7 +837,9 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "phases and time them (`megakernel-phase-profiling`), study the slowest or "
         "furthest-from-floor phase in isolated microbenchmarks (`megakernel-microbench`; "
         "these do not use rounds)"
-        + (". " if backend == "rocm" else
+        + (", and evaluate CDNA designs: inter-workgroup synchronization, coherence across XCDs and "
+           "weight streaming (`cdna-sync-and-memory`), and MFMA against VALU engines for GEMV and "
+           "small-M phases (`cdna-matrix-core-design`). " if backend == "rocm" else
            ", and evaluate Blackwell tensor-core designs (`blackwell-tensor-core-design`). ")
         + ("`megakernel-stage-linking` (optional, included on request) splits the kernel into "
            "contract-checked stage packages; measured seams are not free, so ship a one-TU build. "
@@ -831,10 +848,15 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         "result over all regimes, each shape is built and checked separately, and a "
         "submission may specialize per regime; `./trace_regimes` derives regimes from a "
         "production trace (see the `megakernel-regimes` skill). "
-        "Use `./primdb` to look up measured B200 costs of hardware primitives (tensor-core "
-        "and mma.sync instruction shapes, SIMT and dequant rates, TMEM moves, barriers, "
-        "standalone and in-kernel GEMMs) before you choose or reject a design; "
-        "`./primdb --help` lists the queries. "
+        + ("Use `./primdb` to look up measured AMD costs (rows carry `cond.arch`: grid-barrier "
+           "protocols with a cross-XCD stale-read check, fences against dirty bytes, flag hand-off "
+           "latency, streaming bandwidth by load width and CU count, MFMA latency and issue rate, "
+           "wave reductions, bf16 GEMV engines at decode shapes) before you choose or reject a "
+           "design; `./primdb --help` lists the queries. " if backend == "rocm" else
+           "Use `./primdb` to look up measured B200 costs of hardware primitives (tensor-core "
+           "and mma.sync instruction shapes, SIMT and dequant rates, TMEM moves, barriers, "
+           "standalone and in-kernel GEMMs) before you choose or reject a design; "
+           "`./primdb --help` lists the queries. ") +
         "Use `./sol_info --json` for an optimistic " +
         ("speed-of-light floor (the largest of the HBM, tensor-core and NVLink "
          "bounds) with byte and FLOP breakdowns" if work_model(case)
@@ -859,7 +881,8 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
            + PHASE_TIMING_TASK
            + (PHASE_AGENTS_TASK if phase_agents else "") if agent == "vibesys" else ""))
     if backend == "rocm":
-        (project / "TASK.md").write_text((project / "TASK.md").read_text() + rocm_hardware_text(gpu))
+        (project / "TASK.md").write_text((project / "TASK.md").read_text() + rocm_hardware_text(gpu)
+                                         + rocm_measured_text(benchmark_root, gpu))
     _write_tools(project, benchmark_root, case, gpu_socket, phase_agents,
                  backend, tuple(optional_skills), gpu)
     if agent == "vibesys":

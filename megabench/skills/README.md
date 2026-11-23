@@ -10,6 +10,10 @@ Method guidance for megakernel work, one skill per directory:
 - `megakernel-microbench`: study the slowest or furthest-from-floor phase in isolated
   microbenchmarks; these do not use rounds.
 - `blackwell-tensor-core-design`: evaluate Blackwell tensor-core designs (cuda backend only).
+- `cdna-sync-and-memory`: grid barriers, fences and coherence across XCDs, flag hand-off and weight
+  streaming on AMD CDNA, with measured MI300X and MI210 costs (rocm backend only).
+- `cdna-matrix-core-design`: MFMA against VALU and dot instructions for batch-1 GEMV, a few tokens
+  and dequantized weights on AMD CDNA, with measured costs (rocm backend only).
 - `megakernel-regimes`: decide whether to specialize the kernel per batch size or KV length, using
   trace-derived regimes (`./trace_regimes`).
 
@@ -23,6 +27,12 @@ Optional skills live in `../skills-optional/` and are copied only on request
 contract-checked stage packages (PipeLink-style, `scripts/plk_link.py`). On MI300X the split did not
 improve performance: a separately compiled and linked seam cost 1.6-2.4%, and stages swapped between
 independently written kernels were slower or neutral.
+
+On the rocm backend, `./primdb` reads `megabench/primdb/seed_amd.jsonl` instead of the B200 seed.
+It is built from `megabench/primbench/amd/run_amd.sh` output with
+`python -m megabench.primdb.amd_seed DIR... -o megabench/primdb/seed_amd.jsonl`, and
+`python -m megabench.primdb.amd_seed --skill-tables` rewrites the measured tables in the two CDNA
+skills from it.
 
 VibeSys loads the skills natively; `.vibesys.toml` routes them to the `cuda` backend and the
 `kernel-writing` domain:

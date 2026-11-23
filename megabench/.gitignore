@@ -11,3 +11,4 @@ P0_TRIAL.md
 *.jsonl
 *.ncu-rep
 !primdb/seed.jsonl
+!primdb/seed_amd.jsonl

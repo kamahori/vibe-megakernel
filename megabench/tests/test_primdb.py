@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -85,3 +86,43 @@ class PrimdbTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AmdSeedTests(unittest.TestCase):
+    def test_seed_rows_are_valid_and_cover_the_probes(self) -> None:
+        from ..primdb import amd_seed
+        rows = list(primdb.read(amd_seed.SEED_AMD, "seed"))
+        families = {r["family"] for r in rows}
+        self.assertTrue({"sync", "mem", "mfma", "gemv", "simt"} <= families)
+        self.assertEqual(len({r["id"] for r in rows}), len(rows))
+        for r in rows:
+            self.assertIn(r["cond"].get("arch"), ("gfx90a", "gfx942", "gfx950"))
+        # every MFMA and GEMV row was checked against its reference
+        for r in rows:
+            if r["family"] in ("mfma", "gemv"):
+                self.assertIs(r["verified"], True, r["primitive"])
+
+    def test_skill_tables_match_the_seed(self) -> None:
+        from ..primdb import amd_seed
+        with tempfile.TemporaryDirectory() as directory:
+            skills = Path(directory) / "skills"
+            shutil.copytree(amd_seed.SKILLS, skills)
+            amd_seed.skill_tables(amd_seed.SEED_AMD, skills)
+            for name in ("cdna-sync-and-memory", "cdna-matrix-core-design"):
+                self.assertEqual((skills / name / "SKILL.md").read_text(),
+                                 (amd_seed.SKILLS / name / "SKILL.md").read_text(),
+                                 f"{name}: run python -m megabench.primdb.amd_seed --skill-tables")
+
+    def test_rows_from_a_probe_directory(self) -> None:
+        from ..primdb import amd_seed
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "probe-x-1"
+            out.mkdir()
+            (out / "sync_amd.jsonl").write_text(json.dumps(
+                {"family": "sync", "primitive": "fence.release.agent", "c.arch": "gfx942",
+                 "c.cus": 304, "p.dirty_bytes_per_block": 0, "m.ns": 900.0, "verified": None}) + "\n")
+            rows = amd_seed.rows_from(out)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["cond"]["arch"], "gfx942")
+            self.assertEqual(rows[0]["source"]["bench"], "megabench/primbench/amd/sync_amd.hip")
+            self.assertEqual(rows[0]["source"]["file"], "probe-x-1/sync_amd.jsonl")
