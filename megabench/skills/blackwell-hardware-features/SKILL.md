@@ -84,6 +84,10 @@ What this shows:
   +0.95 µs with 64–128 KB.
 - Stopping the producer while its CTA is in the barrier bounds the slowdown to about +0.25 µs.
   The stream rate in that row only reflects the 4 µs waits of the test.
+- It is not limited to barriers. In one dense b1 megakernel, an ordinary L2 load (residual and
+  norm inputs) issued on the same SM after a large bulk copy waited 1–1.5 µs. The norm step
+  took 2.76 µs with 147 KB of copies queued ahead of it. Issuing those loads first, then the
+  bulk copies, saved 25 µs per step.
 - Cluster gathers are 3–4× slower under load. `barrier.cluster` could not be tested under
   load because it needs every thread, including the producer warp.
 - PTX has no QoS or priority control for a sync line.
@@ -100,8 +104,10 @@ What this shows:
   after the next phase's first load lost 21–123 µs.
 - A router barrier became per-copy tagged logits with 16 replicas, polled by the TMA producer.
   The producer computed the top-k itself and issued the expert loads directly. Together with a
-  sorting-network top-k this saved about 58 µs (3.8%). Without the replicas, with consumers
-  polling, or without the producer issuing the expert loads, it was neutral or slower.
+  sorting-network top-k this saved about 58 µs (3.8%). All three parts are needed. Without the
+  replicas, with consumers polling, or without the producer issuing the expert loads, it was
+  neutral or slower. An agent that only moved the top-k into a producer polling one copy lost
+  462 µs.
 - In this kernel a 30 ns poll backoff cost 35 µs relative to 300 ns. On a hot all-to-all flag
   the poll traffic slows the writers. Sweep the backoff in the real kernel; the idle-barrier
   result below does not transfer.
@@ -202,7 +208,11 @@ What this shows:
   - At 1024 threads on few SMs, the prefetch costs 27–35% (it competes with demand loads).
 - Measured in place on the Qwen3-30B-A3B b1 MoE megakernel: an oracle prefetch cost +156 µs end to end, and a TMA
   ring with prefetch reached only 4.0–4.9 TB/s. Prefetch adds traffic and ordering
-  pressure that a saturated stream does not need.
+  pressure that a saturated stream does not need. An agent that prefetched next-layer
+  weights anyway lost 45%.
+- The exception is data that is not part of the weight stream. Prefetching the cold KV cache
+  into L2 ahead of attention saved 15 µs per step in an MoE b1 megakernel, while
+  prefetching weights in the same kernel did not help.
 - Questions: Is the phase latency-bound with few warps (then prefetch can help) or already
   near 7 TB/s (then it hurts)? Does the prefetch land inside a sync window?
 

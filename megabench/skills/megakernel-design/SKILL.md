@@ -47,7 +47,8 @@ math and all loads were free (the sync skeleton)?
   CTAs), the same scheme was 10% slower than one counter barrier when every CTA polled one copy.
   It became 3.8% faster after three changes: the producers wrote 16 copies of the logits, only
   the TMA producer warp polled, and that warp computed the top-k and issued the expert loads
-  itself.
+  itself. All three were needed: moving only the top-k into a producer that polled one copy
+  cost 462 µs.
 - Poll tagged data with a short backoff (`__nanosleep` of 30-100 ns). With 148 CTAs spinning on
   the same L2 lines and no backoff, the writers starved and the kernel hung. Where polling did
   not hang, a 30-100 ns backoff cost under 0.3%. The best value depends on the poller count;
