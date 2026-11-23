@@ -372,6 +372,12 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertNotIn("--seed", (cuda / "primdb").read_text())
             self.assertIn("measured AMD costs", (rocm / "TASK.md").read_text())
             self.assertNotIn("B200", (rocm / "TASK.md").read_text())
+            task = (rocm / "TASK.md").read_text()
+            self.assertIn("## Measured costs on this GPU (MI300X, gfx942", task)
+            self.assertIn("grid sync", task)
+            self.assertNotIn("Measured costs on this GPU", (cuda / "TASK.md").read_text())
+            mi350 = make_workspace(case.id, Path(directory) / "mi350", agent="plain", backend="rocm", gpu="mi350x")
+            self.assertNotIn("Measured costs on this GPU", (mi350 / "TASK.md").read_text())
             result = subprocess.run([str(rocm / "primdb"), "q", "grid_barrier.",
                                      "--json", "--limit", "500"], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)

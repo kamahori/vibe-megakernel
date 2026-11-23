@@ -66,6 +66,16 @@ def rocm_hardware_text(gpu: str) -> str:
         "instead of PTX `clock64`. Nsight tools are not available.\n")
 
 
+def rocm_measured_text(benchmark_root: Path, gpu: str) -> str:
+    """The decisive measured costs for this GPU from the AMD seed ('' when it has no rows)."""
+    seed = benchmark_root / AMD_SEED
+    if not seed.is_file():
+        return ""
+    from megabench.primdb.amd_seed import task_facts
+    rows = [json.loads(line) for line in seed.read_text().splitlines() if line.strip()]
+    return task_facts(rows, AMD_GPUS[gpu]["arch"])
+
+
 REFERENCE_FILES = {
     "dense_step": ("dense.py", "common.py", "references/qwen3.py"),
     "moe_step": ("moe.py", "common.py", "references/qwen3.py",
@@ -871,7 +881,8 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
            + PHASE_TIMING_TASK
            + (PHASE_AGENTS_TASK if phase_agents else "") if agent == "vibesys" else ""))
     if backend == "rocm":
-        (project / "TASK.md").write_text((project / "TASK.md").read_text() + rocm_hardware_text(gpu))
+        (project / "TASK.md").write_text((project / "TASK.md").read_text() + rocm_hardware_text(gpu)
+                                         + rocm_measured_text(benchmark_root, gpu))
     _write_tools(project, benchmark_root, case, gpu_socket, phase_agents,
                  backend, tuple(optional_skills), gpu)
     if agent == "vibesys":
