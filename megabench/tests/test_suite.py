@@ -66,10 +66,12 @@ class CatalogTests(unittest.TestCase):
         # only those families have single-layer cases.
         self.assertTrue(all("step" in case.id or "iteration" in case.id
                             or case.family in LAYER_FAMILIES for case in CASES))
-        self.assertEqual({case.id for case in select_cases("core")},
-                         {case.id for case in CASES if case.ready})
-        self.assertTrue(all(case.ready for case in select_cases("p0")))
-        self.assertEqual(len(select_cases("core"))+len(select_cases("planned")), len(CASES))
+        for backend in ("cuda", "neuron"):
+            self.assertEqual({case.id for case in select_cases("core", backend=backend)},
+                             {case.id for case in CASES if case.ready and case.backend == backend})
+            self.assertTrue(all(case.ready for case in select_cases("p0", backend=backend)))
+        self.assertEqual(sum(len(select_cases(suite, backend=backend)) for suite in ("core", "planned")
+                             for backend in ("cuda", "neuron")), len(CASES))
         self.assertEqual({c.params["bits"] for c in CASES
                           if c.family == "quant_step"}, {4, 8})
         self.assertTrue(any("EAGLE3" in c.model for c in CASES))
