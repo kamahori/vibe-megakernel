@@ -237,7 +237,7 @@ What changes, all chosen from the case's backend:
   in the agent container, on its cores. The task's check and benchmark skip the slow eager
   baseline; trusted grading still times it.
 - **Smoke:** `neuron-ls`, torch-neuronx's core count and a tensor op on the core, `nki` and
-  `neuron-profile` replace the `nvidia-smi`, CUDA and `ncu` checks.
+  `neuron-explorer` replace the `nvidia-smi`, CUDA and `ncu` checks.
 
 ```bash
 .venv/bin/python -m megabench.integrations.container_run build-image --platform neuron

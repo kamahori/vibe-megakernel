@@ -97,9 +97,9 @@ if [ "$ACTION" = smoke ]; then
         done
     fi
     if [ "${PLATFORM:-cuda}" = neuron ]; then
-        # The plugin's profiling skills capture NEFF/NTFF pairs with neuron-profile.
-        if out=$(neuron-profile --help 2>&1 | head -n 3) && [ -n "$out" ]; then ok "neuron-profile runs"
-        else bad "neuron-profile does not run"; fi
+        # The plugin's profiling skills capture and query profiles with neuron-explorer.
+        if neuron-explorer --help 2>&1 | grep -q Usage; then ok "neuron-explorer runs"
+        else bad "neuron-explorer does not run"; fi
         if python -c 'import nki, nki.language, nki.isa; print(nki.__version__)' >/dev/null 2>&1; then ok "nki imports"
         else bad "nki does not import"; fi
     else

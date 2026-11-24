@@ -146,7 +146,7 @@ the benchmark outside this repository. The machine is an AWS trn2.3xlarge: one T
 (LNC=2: four logical NeuronCores of 24 GiB HBM each), of which this task uses {cores}
 (`NEURON_RT_VISIBLE_CORES={core_range}`). The default Python has PyTorch with torch-neuronx
 (device `neuron`), NKI (`nki`) and `neuronx-cc`; the Neuron tools (`neuron-ls`,
-`neuron-profile`) are in `/opt/aws/neuron/bin`.
+`neuron-explorer`) are in `/opt/aws/neuron/bin`.
 
 After the session a separate trusted evaluation grades `submission.py` as it stands at the head
 of the branch `vibesys/result/{case}`.
