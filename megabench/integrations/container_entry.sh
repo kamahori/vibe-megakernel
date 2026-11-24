@@ -97,6 +97,8 @@ if [ "$ACTION" = smoke ]; then
         real_home=$HOME
         HOME=$(mktemp -d)
         cp -a "$real_home/.claude" "$real_home/.claude.json" "$real_home/.config" "$HOME/" 2>/dev/null
+        # vibesys_setup runs in a subshell here, so its exports do not reach this shell.
+        export PATH="$HOME/.local/bin:$PATH" VIBESYS_CLI="$HOME/.local/bin/vibesys-cli"
         if line=$(vibesys_setup 2>&1 | tail -n 1) && [ -x "$VIBESYS_CLI" ]; then ok "setup: $line"
         else bad "vibesys setup failed: $line"; fi
         skill=$(find "$HOME/.claude/plugins/cache" -path '*vibesys/*/optimize/references/megakernel-divide-and-conquer.md' | head -n 1)

@@ -135,7 +135,7 @@ These options run Claude Code as a VibeSys lead, with no scaffolding from this r
   - It keeps the `TASK.md` contract paragraphs, `case.json`, the `submission.py` stub and
     `reference/`, and becomes a VibeSys task, `.vibesys/tasks/<case>/`. The task's
     check is the trusted evaluator's correctness and launch audit (status `ok_provisional`).
-    Its benchmark is `kernel_latency_ms` (3 samples, `relative_noise` 0.01).
+    Its benchmark is `kernel_latency_ms` (`[pareto] relative_noise` 0.01; vibesys-cli 0.3.0 takes 5 samples per measure and reads no `samples` key).
   - Its git history starts after the tools and skills are removed.
   - The workspace sits in `RUN/work/`, which the agent container mounts read-write, because
     VibeSys puts its worktrees and phase maps beside the repository.

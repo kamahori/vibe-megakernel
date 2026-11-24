@@ -164,7 +164,8 @@ import sys
 TRUSTED = {trusted!r}
 CASE = {case!r}
 os.environ["PYTHONPATH"] = TRUSTED  # the evaluator's own subprocesses import it too
-os.environ.setdefault("MEGABENCH_STABILITY_PROCESSES", "2")
+# Each of a measure's 5 samples is already a fresh process; no extra stability probes.
+os.environ.setdefault("MEGABENCH_STABILITY_PROCESSES", "1")
 sys.path.insert(0, TRUSTED)
 
 from pathlib import Path  # noqa: E402
@@ -592,9 +593,12 @@ def bare_workspace(workspace: Path, case, trusted: Path) -> None:
         f"[accuracy]\ncommand = {command('accuracy')}\ntimeout_seconds = 1800\n\n"
         f"[benchmark]\ncommand = {command('benchmark')}\ntimeout_seconds = 2400\n\n"
         '[benchmark.result]\njson_argument = "--output-json"\nmetric = "kernel_latency_ms"\n')
+    # vibesys-cli 0.3.0 reads no `samples` (a measure takes 5, each a fresh evaluate process)
+    # and takes the noise floor of a single objective only from [pareto].
     (task / "objectives.toml").write_text(
-        "samples = 3\n\n[[objective]]\n"
-        'name = "kernel_latency_ms"\ndirection = "min"\nunit = "ms"\nrelative_noise = 0.01\n')
+        "[[objective]]\n"
+        'name = "kernel_latency_ms"\ndirection = "min"\nunit = "ms"\n\n'
+        "[pareto]\nrelative_noise = 0.01\n")
     (task / "OBJECTIVE.md").write_text(BARE_OBJECTIVE.format(
         case=case.id, model=case.model, phase=case.phase, module=module,
         launches=case.max_gpu_launches, gpus=case.gpus))

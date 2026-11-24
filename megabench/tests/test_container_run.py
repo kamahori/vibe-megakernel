@@ -453,3 +453,23 @@ class BareVibesysTests(unittest.TestCase):
                                     "claude-oauth-token", "--case", CASE, "--run-dir",
                                     str(tmp / "run"), "--image", "i", "--credential-file", str(key),
                                     "--vibesys-plugin", "https://example.invalid/v.git"])
+
+
+class BareObjectivesTests(unittest.TestCase):
+    def test_objectives_hold_only_keys_vibesys_cli_0_3_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            key = tmp / "key"
+            key.write_text("x\n")
+            key.chmod(0o600)
+            run = tmp / "run"
+            container_run.main(["prepare", "--agent", "claude", "--credential-kind",
+                                "claude-oauth-token", "--case", CASE, "--run-dir", str(run),
+                                "--image", "i", "--credential-file", str(key), "--bare",
+                                "--vibesys-plugin", "https://example.invalid/v.git"])
+            objectives = tomllib.loads(
+                (run / "work" / CASE / ".vibesys/tasks" / CASE / "objectives.toml").read_text())
+            self.assertEqual(set(objectives), {"objective", "pareto"})
+            self.assertEqual(objectives["pareto"], {"relative_noise": 0.01})
+            for row in objectives["objective"]:  # 0.3.0 refuses an objective's own noise
+                self.assertLessEqual(set(row), {"name", "direction", "unit"})
