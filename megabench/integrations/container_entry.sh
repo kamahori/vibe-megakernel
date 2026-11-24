@@ -25,7 +25,7 @@ vibesys_setup() {
         claude plugin marketplace add "$VIBESYS_PLUGIN_SOURCE" || return 1
     fi
     claude plugin install vibesys@vibesys || return 1
-    claude plugin install vibesys-kernels-cuda@vibesys || return 1
+    claude plugin install "${DOMAIN_PLUGIN:-vibesys-kernels-cuda}@vibesys" || return 1
     if [ ! -x "$VIBESYS_CLI" ]; then
         curl -fsSL https://raw.githubusercontent.com/uw-syfi/vibesys/main/cli/install.sh \
             | VIBESYS_CLI_VERSION="$VIBESYS_CLI_VERSION" VIBESYS_CLI_INSTALL_DIR="$HOME/.local/bin" sh \
@@ -53,6 +53,15 @@ if [ "$ACTION" = smoke ]; then
     else bad "workspace is not writable"; fi
     if [ -n "$(ls -A /scratch/hf 2>/dev/null)" ]; then bad "/scratch/hf is not empty"
     else ok "/scratch/hf is empty"; fi
+    if [ "${PLATFORM:-cuda}" = neuron ]; then
+        if neuron-ls >/dev/null 2>&1; then ok "neuron-ls: $(neuron-ls --json-output 2>/dev/null | jq -c '[.[] | {nc_count, memory_size}]')"
+        else bad "neuron-ls does not see the Neuron device"; fi
+        cores=$(python -c 'import torch, torch_neuronx; print(torch.neuron.device_count())' 2>/dev/null | tail -n 1)
+        if [ "$cores" = "$EXPECT_GPUS" ]; then ok "torch-neuronx sees $cores NeuronCore(s) (NEURON_RT_VISIBLE_CORES=$NEURON_RT_VISIBLE_CORES)"
+        else bad "torch-neuronx sees ${cores:-no} NeuronCore(s), the run has $EXPECT_GPUS"; fi
+        if python -c 'import torch; x = torch.arange(4096., device="neuron"); assert float(x.sum().cpu()) == 4096 * 4095 / 2; print(torch.__version__)' >/dev/null 2>&1
+        then ok "torch runs on the NeuronCore"; else bad "torch cannot use the NeuronCore"; fi
+    else
     gpus=$(nvidia-smi -L 2>/dev/null | wc -l)
     if [ "$gpus" = "$EXPECT_GPUS" ]; then ok "nvidia-smi sees $gpus GPU(s), as the job"
     else bad "nvidia-smi sees $gpus GPU(s), the job has $EXPECT_GPUS"; fi
@@ -61,6 +70,7 @@ if [ "$ACTION" = smoke ]; then
     else bad "torch sees ${torch_gpus:-no} GPU(s), the job has $EXPECT_GPUS"; fi
     if python -c 'import torch; x = torch.arange(4096., device="cuda"); assert float(x.sum()) == 4096 * 4095 / 2; print(torch.__version__, torch.cuda.get_device_name())'
     then ok "torch runs on the GPU"; else bad "torch cannot use the GPU"; fi
+    fi
     if (cd "$WS" && python -c 'import megabench.cases' 2>/dev/null); then
         bad "megabench imports without PYTHONPATH (should come only from the trusted snapshot)"
     else ok "megabench is not importable from the workspace by default"; fi
@@ -86,12 +96,20 @@ if [ "$ACTION" = smoke ]; then
             else bad "the proxy cannot reach $host"; fi
         done
     fi
-    # Nsight Compute must be able to read the GPU's counters, not only start.
-    if out=$(cd /tmp && ncu --target-processes all -c 1 --metrics gpu__time_duration.sum \
-            python -c 'import torch; torch.ones(1 << 20, device="cuda").sum().item()' 2>&1) \
-            && grep -q gpu__time_duration <<< "$out"; then
-        ok "ncu profiles a kernel: $(grep -m1 gpu__time_duration <<< "$out" | tr -s ' ')"
-    else bad "ncu cannot profile: $(grep -m2 -E 'ERR|==ERROR==|==WARNING==' <<< "$out" | tr '\n' ' ')"; fi
+    if [ "${PLATFORM:-cuda}" = neuron ]; then
+        # The plugin's profiling skills capture NEFF/NTFF pairs with neuron-profile.
+        if out=$(neuron-profile --help 2>&1 | head -n 3) && [ -n "$out" ]; then ok "neuron-profile runs"
+        else bad "neuron-profile does not run"; fi
+        if python -c 'import nki, nki.language, nki.isa; print(nki.__version__)' >/dev/null 2>&1; then ok "nki imports"
+        else bad "nki does not import"; fi
+    else
+        # Nsight Compute must be able to read the GPU's counters, not only start.
+        if out=$(cd /tmp && ncu --target-processes all -c 1 --metrics gpu__time_duration.sum \
+                python -c 'import torch; torch.ones(1 << 20, device="cuda").sum().item()' 2>&1) \
+                && grep -q gpu__time_duration <<< "$out"; then
+            ok "ncu profiles a kernel: $(grep -m1 gpu__time_duration <<< "$out" | tr -s ' ')"
+        else bad "ncu cannot profile: $(grep -m2 -E 'ERR|==ERROR==|==WARNING==' <<< "$out" | tr '\n' ' ')"; fi
+    fi
     if [ -n "${VIBESYS_PLUGIN_SOURCE:-}" ]; then
         # In a scratch HOME, so the run's own HOME starts clean for round 1.
         real_home=$HOME
@@ -104,7 +122,7 @@ if [ "$ACTION" = smoke ]; then
         skill=$(find "$HOME/.claude/plugins/cache" -path '*vibesys/*/optimize/references/megakernel-divide-and-conquer.md' | head -n 1)
         if [ -n "$skill" ]; then ok "plugin has the megakernel divide-and-conquer mode"
         else bad "the installed plugin has no megakernel divide-and-conquer mode"; fi
-        if claude plugin list 2>/dev/null | grep -q 'vibesys-kernels-cuda'; then ok "plugins listed: $(claude plugin list 2>/dev/null | grep -c '@vibesys') from vibesys"
+        if claude plugin list 2>/dev/null | grep -q "${DOMAIN_PLUGIN:-vibesys-kernels-cuda}"; then ok "plugins listed: $(claude plugin list 2>/dev/null | grep -c '@vibesys') from vibesys"
         else bad "claude plugin list does not show the plugins"; fi
         if out=$("$VIBESYS_CLI" daemon ensure 2>&1); then ok "vibesys daemon: $(head -n 1 <<< "$out")"
         else bad "vibesys daemon does not start: $out"; fi
@@ -115,13 +133,14 @@ if [ "$ACTION" = smoke ]; then
         cat > /tmp/reference_submission.py <<PY
 import sys
 sys.path.insert(0, "$TRUSTED")
+from dataclasses import replace
 from megabench.cases import select_cases
 from megabench.tasks.workloads import reference
 def build(case):
-    c = select_cases("all", [case["id"]])[0]
+    c = replace(select_cases("all", [case["id"]])[0], gpus=1, tp=1, backend="cuda")
     return lambda inputs: reference(c, inputs)
 PY
-        out=$(cd "$WS" && timeout 600 python ".vibesys/tasks/$CASE/evaluate.py" accuracy \
+        out=$(cd "$WS" && timeout 1500 python ".vibesys/tasks/$CASE/evaluate.py" accuracy \
               --submission /tmp/reference_submission.py 2>&1 | tail -n 1)
         status=$(jq -r .status <<< "$out" 2>/dev/null)
         if [ -n "$status" ] && [ "$status" != null ] && [ "$status" != ok_provisional ]; then
@@ -131,7 +150,9 @@ PY
         HOME=$real_home
     fi
     if tmux -V >/dev/null 2>&1; then ok "tmux: $(tmux -V)"; else bad "tmux does not run"; fi
-    for tool in claude codex opencode nvcc ncu git; do
+    if [ "${PLATFORM:-cuda}" = neuron ]; then tools="claude git neuron-ls neuronx-cc"
+    else tools="claude codex opencode nvcc ncu git"; fi
+    for tool in $tools; do
         if version=$("$tool" --version 2>&1 | tail -n 1); then ok "$tool: $version"
         else bad "$tool does not run"; fi
     done

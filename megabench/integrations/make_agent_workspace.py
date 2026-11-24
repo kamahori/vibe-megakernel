@@ -127,7 +127,7 @@ def _python(benchmark_root: Path) -> Path:
 def _write_reference(project: Path, benchmark_root: Path, case: Case) -> str:
     target = project / "reference/megabench"
     files = REFERENCE_FILES[case.family]
-    if case.backend == "neuron":
+    if case.backend == "neuron" and case.gpus > 1:
         files = files + ("sharding.py",)
     package_files = ["__init__.py", "tasks/__init__.py"]
     if any(name.startswith("references/") for name in files):
@@ -747,6 +747,14 @@ def make_workspace(case_id: str, output: Path, *, agent: str = "vibesys",
         writes = ("kv_write", "pe_write") if attention_kind(case) == "mla" else ("recurrent_state", "conv_state")
         outputs = outputs[:1] + writes + outputs[1:]
     topology = (
+        "The evaluator runs the step in one rank process on one logical NeuronCore of an AWS "
+        "Trainium2 chip (device `neuron:0`, torch-neuronx's native backend), with the inputs "
+        "whole, and grades its outputs against the single-device reference. `build(case)` "
+        "receives `case['execution']`: rank, world_size (1), device and backend. "
+        "The complete step must be one NKI kernel call (a `torch_neuronx.nki_op` or `nki.jit` "
+        "kernel) with no other device work: no eager PyTorch ops or `torch.compile` graphs on "
+        "Neuron tensors.\n\n"
+        if case.backend == "neuron" and case.gpus == 1 else
         f"The evaluator starts {case.gpus} rank processes, one per logical NeuronCore of one AWS "
         "Trainium2 chip (device `neuron:<rank>`). `build(case)` receives `case['execution']`: rank, "
         "world_size, tp_rank, device, backend and the live neuron tp_group. Each rank receives its "

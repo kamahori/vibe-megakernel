@@ -86,7 +86,9 @@ def stabilize(result: dict, case, case_id: str, submission: Path,
     """
     processes = int(os.environ.get("MEGABENCH_STABILITY_PROCESSES", "3"))
     timing = result.get("candidate_timing") or {}
-    if processes < 2 or case.gpus != 1 or timing.get("cuda_event_p50_ms") is None:
+    # The probes time on CUDA devices; Neuron results keep the evaluate process's reading.
+    if (processes < 2 or case.gpus != 1 or case.backend != "cuda"
+            or timing.get("cuda_event_p50_ms") is None):
         return
     probes = gpu_noise.run_probes(
         gpu_noise.probe_command(case_id, submission, regimes_path), processes - 1)
@@ -186,7 +188,7 @@ def main(case_id: str, argv: list[str] | None = None,
         import torch
 
         try:
-            if case.gpus > 1:
+            if case.gpus > 1 or case.backend == "neuron":
                 # The Trainium eager baseline is slow and only the benchmark needs it.
                 result = evaluate_case(case, submission, device="cuda:0", trials=3,
                                        warmup=0, reps=1, graph_baseline=False,

@@ -175,8 +175,15 @@ def _rank_main(rank: int, contract: dict, submission: str, inbox, outbox) -> Non
             elif kind == "baseline":
                 _, timing = message
                 from ..baselines_neuron import build_tp_baseline
+                from ..tasks.sharding import TP_FAMILIES
 
-                if baseline is None:
+                if baseline is None and world == 1 and case.family not in TP_FAMILIES:
+                    # One unsharded rank: the eager baseline is the reference itself on the core.
+                    from ..tasks.workloads import reference
+
+                    single = replace(case, gpus=1, tp=1, backend="cuda")
+                    baseline = lambda values: reference(single, values)  # noqa: E731
+                elif baseline is None:
                     baseline = build_tp_baseline(case, execution)
                 dist.barrier(group=host)
                 with torch.inference_mode():
@@ -302,7 +309,7 @@ def evaluate_neuron(case: Case, submission: Path, *, trials: int, warmup: int, r
     single = replace(case, gpus=1, tp=1, backend="cuda")
     ranks = _Ranks(case, submission)
     result: dict = {"topology": {"world_size": case.gpus, "tp": case.tp,
-                                 "layout": "megabench/tasks/sharding.py",
+                                 "layout": "megabench/tasks/sharding.py" if case.gpus > 1 else "unsharded",
                                  "device": "one logical NeuronCore per rank"}}
     try:
         correctness = {"status": "pass", "trials": []}
@@ -350,7 +357,8 @@ def evaluate_neuron(case: Case, submission: Path, *, trials: int, warmup: int, r
                 result["baseline_correctness"] = {"pass": False, "reason": str(exc)[:500]}
             result["reference_timing"] = worst_rank_timing(
                 [{"timing": reply["timing"]} for reply in ranks.request("baseline", (warmup, reps))], "timing")
-            result["reference_timing"]["baseline"] = "eager PyTorch TP4 (megabench/baselines_neuron.py)"
+            result["reference_timing"]["baseline"] = (f"eager PyTorch TP{case.gpus} (megabench/baselines_neuron.py)"
+                                                     if case.gpus > 1 else "eager PyTorch reference on one NeuronCore")
         except Exception as exc:
             result["baseline_unavailable"] = f"{type(exc).__name__}: {exc}"
         result["candidate_timing"] = worst_rank_timing(

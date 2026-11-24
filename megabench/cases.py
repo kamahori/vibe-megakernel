@@ -414,11 +414,21 @@ CASES: tuple[Case, ...] = (
 # tasks/sharding.py and graded against the unchanged single-device reference.
 TRN2_TP4_NOTE = ("Whole Trainium2 chip as four TP ranks (one per logical NeuronCore); "
                  "graded against the single-device reference.")
-# The P0 MoE case is left out: its synthetic 48-layer stack is chaotic (the
-# BF16 reference is about 100% off the FP32 oracle on logits at full depth).
+# The P0 MoE case is included although its synthetic 48-layer stack is chaotic (the BF16
+# reference is about 100% off the FP32 oracle on logits at full depth), so its oracle band is
+# wide; the CUDA case is graded with the same gate.
 CASES += tuple(replace(case, id=f"{case.id}-trn2-tp4", backend="neuron", gpus=4, tp=4,
                        note=TRN2_TP4_NOTE)
-               for case in CASES if case.suite == "p0" and case.ready and case.family != "moe_step")
+               for case in CASES if case.suite == "p0" and case.ready)
+# The multimodal cases that run on one B200 in the CUDA campaign run on one logical
+# NeuronCore (24 GiB): one rank, unsharded inputs, the same single-device contract.
+TRN2_NC1_CASES = ("vl-decode-step-gemma3-4b-b1-s128", "tts-frame-step-csm-1b-b1-s128",
+                  "vla-action-step-pi05-b1")
+TRN2_NC1_NOTE = ("One logical NeuronCore of a Trainium2 chip (LNC=2, 24 GiB), one rank; "
+                 "graded against the single-device reference.")
+CASES += tuple(replace(case, id=f"{case.id}-trn2-nc1", backend="neuron", gpus=1, tp=1,
+                       note=TRN2_NC1_NOTE)
+               for case in CASES if case.id in TRN2_NC1_CASES)
 
 # "cuda" covers NVIDIA and ROCm devices; "neuron" covers AWS Trainium.
 BACKENDS = ("cuda", "neuron")

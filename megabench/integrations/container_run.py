@@ -31,6 +31,12 @@ Grading runs the trusted ``megabench evaluate`` in a container without network
 on a copy of the workspace, with a baseline cache that the agent cannot see.
 Nothing that the agent wrote runs on the host: the host side of the job only
 copies files (``cp -a``, links not followed).
+
+Trainium (cases of backend ``neuron``): the same flow on a host with Docker and no Slurm.
+``build-image --platform neuron`` builds ``megabench/docker/neuron/agent.Dockerfile`` on the
+Neuron image; each container gets ``/dev/neuron0`` and ``NEURON_RT_VISIBLE_CORES`` (the run's
+NeuronCores); ``--scheduler local`` (the default without ``sbatch``) runs a round in the
+foreground under a lock on the chip, so runs queue one after another.
 """
 
 from __future__ import annotations
@@ -43,6 +49,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -52,6 +59,10 @@ from .clean_vibesys_run import DENIED_TOOLS, build_trusted
 REPO = Path(__file__).resolve().parents[2]
 DOCKER_DIR = REPO / "megabench/docker"
 IMAGE_REPOSITORY = "localhost/megabench-agent"
+NEURON_IMAGE_REPOSITORY = "localhost/megabench-agent-neuron"
+NEURON_DOCKER_DIR = DOCKER_DIR / "neuron"
+# The local scheduler's lock: one round (or smoke or rescore) at a time holds the accelerator.
+LOCAL_LOCK = Path(os.environ.get("MEGABENCH_LOCAL_LOCK", "/tmp/megabench-accelerator.lock"))
 IMAGE_VENV = "/opt/venv"
 AGENT_HOME = "/home/agent"
 PROXY_PORT = 3128
@@ -127,7 +138,21 @@ CUDA 13 with `nvcc` and Nsight Compute (`ncu`), and PyTorch in the default Pytho
 After the session a separate trusted evaluation grades `submission.py` as it stands at the head
 of the branch `vibesys/result/{case}`.
 """
-BARE_GITIGNORE = ".cache/\n.torch_extensions/\n__pycache__/\n*.ncu-rep\n*.nsys-rep\n"
+BARE_TASK_TAIL_NEURON = """\
+This repository is a VibeSys task: `.vibesys/tasks/{case}/` holds its check (the outputs
+against the PyTorch reference, on fresh inputs, and the launch budget) and its benchmark (the
+step's kernel latency in milliseconds, lower is better). Both load a trusted, read-only copy of
+the benchmark outside this repository. The machine is an AWS trn2.3xlarge: one Trainium2 chip
+(LNC=2: four logical NeuronCores of 24 GiB HBM each), of which this task uses {cores}
+(`NEURON_RT_VISIBLE_CORES={core_range}`). The default Python has PyTorch with torch-neuronx
+(device `neuron`), NKI (`nki`) and `neuronx-cc`; the Neuron tools (`neuron-ls`,
+`neuron-profile`) are in `/opt/aws/neuron/bin`.
+
+After the session a separate trusted evaluation grades `submission.py` as it stands at the head
+of the branch `vibesys/result/{case}`.
+"""
+BARE_GITIGNORE = (".cache/\n.torch_extensions/\n__pycache__/\n*.ncu-rep\n*.nsys-rep\n"
+                  "*.neff\n*.ntff\nneuronxcc-*/\n")
 BARE_OBJECTIVE = """\
 # {case}: a megakernel for one {model} {phase} step
 
@@ -149,6 +174,29 @@ Rules:
 - Edit only `submission.py` and files you add. Never edit `.vibesys/`, `case.json` or
   `reference/`.
 - Use the GPU(s) of this machine: {gpus} B200.
+"""
+BARE_OBJECTIVE_NEURON = """\
+# {case}: a megakernel for one {model} {phase} step
+
+This is a megakernel task on AWS Trainium2. Write `submission.py`, and any helper files of your
+own, so that `build(case)` returns `run(inputs)`, which computes the whole step that
+`reference/megabench/tasks/{module}.py` defines, for the geometry in `case.json`, in at most
+{launches} NKI kernel call(s) per step and rank: one kernel that runs the whole step as phases.
+The score is the step's kernel latency (Neuron device events, p50, the slowest rank), lower is
+better. `TASK.md` states the outputs and how the step is split over ranks.
+
+Rules:
+
+- Every output must match the PyTorch reference within the case's tolerances, on fresh random
+  inputs and weights each time; integer outputs such as tokens must match exactly.
+- Compute every output from the current inputs and weights on every call. Never modify an
+  input.
+- At most {launches} NKI kernel call(s) per step and rank (a `torch_neuronx.nki_op` or `nki.jit`
+  kernel), and no other device work: no eager PyTorch ops, `torch.compile` graphs or
+  `torch.distributed` collectives on Neuron tensors. The check audits this.
+- Edit only `submission.py` and files you add. Never edit `.vibesys/`, `case.json` or
+  `reference/`.
+- Use the NeuronCores of this machine: {cores} logical NeuronCore(s) of one Trainium2 chip.
 """
 BARE_EVALUATOR = '''\
 """The check and the benchmark of one MegaBench case, against a trusted benchmark.
@@ -197,12 +245,14 @@ def main():
     submission = args.submission.resolve()
     if args.mode == "accuracy":
         result = evaluate_case(case, submission, device="cuda:0", trials=3, warmup=1, reps=1,
-                               graph_baseline=False)
+                               graph_baseline=False, neuron_baseline=False)
         print(json.dumps(summary(result), default=str))
         return 0 if result.get("status") == "ok_provisional" else 1
     if args.output_json is None:
         parser.error("benchmark needs --output-json")
-    result = evaluate_case(case, submission, device="cuda:0", **BENCHMARK_SETTINGS)
+    # On Trainium the eager baseline is slow and the metric does not use it; grading times it.
+    result = evaluate_case(case, submission, device="cuda:0", **BENCHMARK_SETTINGS,
+                           neuron_baseline=False)
     stabilize(result, case, CASE, submission, None)
     output = summary(result)
     latency = kernel_latency_ms(result)
@@ -218,6 +268,15 @@ if __name__ == "__main__":
     raise SystemExit(main())
 '''
 # The vibesys-cli placement of the agent container: this machine, with the job's GPUs.
+# Trainium: vibesys-cli 0.3.0 has no Neuron resource; the task runs its jobs on this machine
+# (the agent container, which holds the run's NeuronCores), one at a time.
+VIBESYS_CLI_TOML_NEURON = """\
+version = "0.2"
+
+[placements.local]
+kind = "local"
+max_jobs = 1
+"""
 VIBESYS_CLI_TOML = """\
 version = "0.2"
 
@@ -293,7 +352,7 @@ def _opencode_binary() -> Path:
     return real
 
 
-def stage_context(context: Path) -> str:
+def stage_context(context: Path, platform: str = "cuda") -> str:
     """Copy everything the image build needs into *context*; return the image tag."""
     claude = shutil.which("claude")
     if not claude:
@@ -301,23 +360,46 @@ def stage_context(context: Path) -> str:
     if context.exists():
         shutil.rmtree(context)
     context.mkdir(parents=True)
+    if platform == "neuron":
+        # Claude Code only: the Neuron runs use no Codex or opencode.
+        shutil.copy2(NEURON_DOCKER_DIR / "agent.Dockerfile", context / "agent.Dockerfile")
+        shutil.copy2(DOCKER_DIR / "egress_proxy.py", context / "egress_proxy.py")
+        shutil.copy2(Path(claude).resolve(), context / "claude")
+        return _tag(context, NEURON_IMAGE_REPOSITORY)
     for name in ("agent.Dockerfile", "requirements.lock", "egress_proxy.py"):
         shutil.copy2(DOCKER_DIR / name, context / name)
     shutil.copy2(Path(claude).resolve(), context / "claude")
     shutil.copytree(_codex_vendor(), context / "codex-vendor", symlinks=True)
     shutil.copy2(_opencode_binary(), context / "opencode")
+    return _tag(context, IMAGE_REPOSITORY)
+
+
+def _tag(context: Path, repository: str) -> str:
     digest = hashlib.sha256()
     for path in sorted(p for p in context.rglob("*") if p.is_file()):
         digest.update(str(path.relative_to(context)).encode())
         digest.update(path.read_bytes())
-    tag = f"{IMAGE_REPOSITORY}:{digest.hexdigest()[:12]}"
+    tag = f"{repository}:{digest.hexdigest()[:12]}"
     (context / "IMAGE").write_text(tag + "\n")
     return tag
 
 
 def build_image(args: argparse.Namespace) -> int:
     context = args.context.resolve()
-    tag = stage_context(context)
+    tag = stage_context(context, args.platform)
+    if args.platform == "neuron":
+        # Built here with Docker (no Slurm); the check runs on the chip.
+        print(f"image: {tag}\ncontext: {context}", flush=True)
+        exists = subprocess.run(["docker", "image", "inspect", tag], capture_output=True)
+        if exists.returncode != 0:
+            subprocess.run(["docker", "build", "--build-arg", f"BASE_IMAGE={args.base_image}",
+                            "-f", "agent.Dockerfile", "-t", tag, "."], check=True, cwd=context)
+        subprocess.run(["docker", "run", "--rm", "--device=/dev/neuron0", tag, "bash", "-c",
+                        "neuron-ls | head -8; python -c 'import torch, torch_neuronx; "
+                        "print(torch.__version__, torch_neuronx.__version__)'; claude --version"],
+                       check=True)
+        print(f"built {tag}")
+        return 0
     script = context / "build.sbatch"
     script.write_text(
         "#!/bin/bash\nset -euo pipefail\n"
@@ -419,6 +501,13 @@ def prepare(args: argparse.Namespace) -> int:
     case = select_cases("all", [args.case])[0]
     if not case.ready:
         raise SystemExit(f"{args.case} is not ready")
+    platform = "neuron" if case.backend == "neuron" else "cuda"
+    runtime = args.runtime or ("docker" if platform == "neuron" else "podman")
+    cores = args.neuron_cores or (f"0-{case.gpus - 1}" if case.gpus > 1 else "0")
+    if platform == "neuron" and args.agent != "claude":
+        raise SystemExit("the Trainium image carries Claude Code only")
+    if platform == "neuron" and args.network != "open":
+        raise SystemExit("Trainium runs use --network open (the proxy mode needs Podman's setup)")
     if args.partition in ("main", "priority", "background"):
         limit = {"main": 7200, "background": 7200, "priority": 1800}[args.partition]
         if round_seconds(args) > limit:
@@ -460,7 +549,7 @@ def prepare(args: argparse.Namespace) -> int:
         if args.overlay or args.remove or args.regimes:
             raise SystemExit("--bare takes no --overlay, --remove or --regimes")
         args.snapshot_checks = False
-        bare_workspace(workspace, case, run / "trusted")
+        bare_workspace(workspace, case, run / "trusted", cores)
     else:
         customize_workspace(workspace, run / "control", args.overlay, args.snapshot_checks,
                             args.remove)
@@ -477,7 +566,8 @@ def prepare(args: argparse.Namespace) -> int:
         (home / ".claude.json").write_text(json.dumps(state, indent=2) + "\n")
         if args.vibesys_plugin:
             (home / ".config/vibesys").mkdir(parents=True)
-            (home / ".config/vibesys/cli.toml").write_text(VIBESYS_CLI_TOML.format(gpus=case.gpus))
+            (home / ".config/vibesys/cli.toml").write_text(
+                VIBESYS_CLI_TOML_NEURON if platform == "neuron" else VIBESYS_CLI_TOML.format(gpus=case.gpus))
     elif args.agent == "codex":
         (home / ".codex").mkdir(parents=True)
         (home / ".codex/config.toml").write_text(codex_config(workspace, model, args.effort))
@@ -529,6 +619,7 @@ def prepare(args: argparse.Namespace) -> int:
         "bare": args.bare, "network": args.network, "web_tools": args.web_tools,
         "vibesys_plugin": args.vibesys_plugin, "vibesys_cli_version": args.vibesys_cli_version,
         "result_branch": f"vibesys/result/{args.case}" if args.vibesys_plugin else None,
+        "platform": platform, "runtime": runtime, "neuron_cores": cores if platform == "neuron" else None,
     }
     (run / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     env = {
@@ -547,13 +638,17 @@ def prepare(args: argparse.Namespace) -> int:
         "NET_MODE": args.network, "VIBESYS_PLUGIN_SOURCE": args.vibesys_plugin or "",
         "VIBESYS_CLI_VERSION": args.vibesys_cli_version,
         "RESULT_BRANCH": config["result_branch"] or "",
+        "PLATFORM": platform, "RUNTIME": runtime,
+        "NEURON_CORES": cores if platform == "neuron" else "",
+        "DOMAIN_PLUGIN": "vibesys-kernels-trainium" if platform == "neuron" else "vibesys-kernels-cuda",
     }
     (run / "run.env").write_text("".join(f"{k}={shlex.quote(str(v))}\n" for k, v in env.items()))
     shutil.copy2(Path(__file__).with_name("container_round.sh"), run / "round.sh")
     (run / "round.sh").chmod(0o755)
     print(f"prepared {run}\n"
           f"  workspace: {workspace}\n  image: {args.image}\n"
-          f"  each round: {case.gpus} GPU(s), --time={slurm_time(round_seconds(args))} "
+          f"  each round: {case.gpus} {'NeuronCore' if platform == 'neuron' else 'GPU'}(s), "
+          f"--time={slurm_time(round_seconds(args))} "
           f"({args.agent_minutes} min agent, {args.grade_minutes} min grading)\n"
           "next:\n"
           f"  {sys.executable} -m megabench.integrations.container_run smoke --run-dir {run}\n"
@@ -561,7 +656,7 @@ def prepare(args: argparse.Namespace) -> int:
     return 0
 
 
-def bare_workspace(workspace: Path, case, trusted: Path) -> None:
+def bare_workspace(workspace: Path, case, trusted: Path, cores: str = "0") -> None:
     """Strip the stock workspace to the case's contract and make it a VibeSys task.
 
     Keeps TASK.md's contract paragraphs (not its tools), case.json, the submission stub and
@@ -574,7 +669,10 @@ def bare_workspace(workspace: Path, case, trusted: Path) -> None:
         shutil.rmtree(entry) if entry.is_dir() and not entry.is_symlink() else entry.unlink()
     task_md = workspace / "TASK.md"
     contract = task_md.read_text().split("\nUse `./check_candidate`")[0].rstrip()
-    task_md.write_text(contract + "\n\n" + BARE_TASK_TAIL.format(case=case.id, gpus=case.gpus))
+    neuron = case.backend == "neuron"
+    tail = (BARE_TASK_TAIL_NEURON.format(case=case.id, cores=case.gpus, core_range=cores) if neuron
+            else BARE_TASK_TAIL.format(case=case.id, gpus=case.gpus))
+    task_md.write_text(contract + "\n\n" + tail)
     (workspace / ".gitignore").write_text(BARE_GITIGNORE)
     reference = sorted((workspace / "reference/megabench/tasks").glob("*.py"))
     readme = (workspace / "reference/README.md").read_text()
@@ -588,8 +686,10 @@ def bare_workspace(workspace: Path, case, trusted: Path) -> None:
     command = lambda mode: json.dumps(  # noqa: E731
         [python, f".vibesys/tasks/{case.id}/evaluate.py", mode, "--submission", "submission.py"])
     (task / "vibesys.input.toml").write_text(
-        'version = "0.1"\nbackends = ["cuda"]\n\n[agent]\ndomain = "kernel-writing"\n\n'
-        '[environment]\nneeds = ["gpu"]\n\n'
+        'version = "0.1"\n'
+        + ('backends = ["trainium"]\n\n[agent]\ndomain = "kernel-writing"\n\n' if neuron else
+           'backends = ["cuda"]\n\n[agent]\ndomain = "kernel-writing"\n\n'
+           '[environment]\nneeds = ["gpu"]\n\n') +
         f"[accuracy]\ncommand = {command('accuracy')}\ntimeout_seconds = 1800\n\n"
         f"[benchmark]\ncommand = {command('benchmark')}\ntimeout_seconds = 2400\n\n"
         '[benchmark.result]\njson_argument = "--output-json"\nmetric = "kernel_latency_ms"\n')
@@ -599,9 +699,12 @@ def bare_workspace(workspace: Path, case, trusted: Path) -> None:
         "[[objective]]\n"
         'name = "kernel_latency_ms"\ndirection = "min"\nunit = "ms"\n\n'
         "[pareto]\nrelative_noise = 0.01\n")
-    (task / "OBJECTIVE.md").write_text(BARE_OBJECTIVE.format(
-        case=case.id, model=case.model, phase=case.phase, module=module,
-        launches=case.max_gpu_launches, gpus=case.gpus))
+    (task / "OBJECTIVE.md").write_text(
+        BARE_OBJECTIVE_NEURON.format(case=case.id, model=case.model, phase=case.phase,
+                                     module=module, launches=case.max_gpu_launches,
+                                     cores=case.gpus) if neuron else
+        BARE_OBJECTIVE.format(case=case.id, model=case.model, phase=case.phase, module=module,
+                              launches=case.max_gpu_launches, gpus=case.gpus))
     shutil.rmtree(workspace / ".git", ignore_errors=True)
     for argv in (["init", "-q", "-b", "main"], ["add", "-A"],
                  ["-c", "user.name=MegaBench", "-c", "user.email=megabench@example.invalid",
@@ -686,6 +789,28 @@ def _load(run: Path) -> dict:
     return json.loads(path.read_text())
 
 
+def _scheduler(args: argparse.Namespace) -> str:
+    return args.scheduler or ("slurm" if shutil.which("sbatch") else "local")
+
+
+def _local(run: Path, argv: list[str], seconds: int) -> str:
+    """Run round.sh here, in the foreground, once the accelerator lock is free; return the job id.
+
+    Stands in for a Slurm job: a unique SLURM_JOB_ID names the job's containers and logs, the
+    lock keeps two rounds off one chip, and `timeout` is the job's time limit.
+    """
+    job = f"L{time.strftime('%Y%m%d%H%M%S')}{os.getpid() % 1000:03d}"
+    log = run / "logs" / f"slurm-{job}.out"
+    command = ["flock", str(LOCAL_LOCK), "timeout", "--signal=TERM", "--kill-after=120",
+               str(seconds), str(run / "round.sh"), str(run), *argv]
+    print(f"job {job}: {' '.join(argv)} (log {log}); waiting for {LOCAL_LOCK}", flush=True)
+    with log.open("ab") as out:
+        rc = subprocess.run(command, stdout=out, stderr=subprocess.STDOUT,
+                            env=os.environ | {"SLURM_JOB_ID": job}).returncode
+    print(f"job {job} exited {rc}", flush=True)
+    return job
+
+
 def _sbatch(run: Path, config: dict, partition: str, time: str, name: str,
             argv: list[str], dependency: str | None = None) -> str:
     command = ["sbatch", "--parsable", f"--partition={partition}",
@@ -702,6 +827,10 @@ def _sbatch(run: Path, config: dict, partition: str, time: str, name: str,
 def smoke(args: argparse.Namespace) -> int:
     run = args.run_dir.resolve()
     config = _load(run)
+    if _scheduler(args) == "local":
+        job = _local(run, ["smoke"], 1800)
+        print(f"smoke job {job}: read {run}/logs/smoke-{job}.txt (the last line is SMOKE PASS or SMOKE FAIL)")
+        return 0
     job = _sbatch(run, config, args.partition, args.time, f"mb-smoke-{config['case'][:24]}",
                   ["smoke"])
     print(f"smoke job {job}: when it ends, read {run}/logs/smoke-{job}.txt "
@@ -717,6 +846,13 @@ def submit(args: argparse.Namespace) -> int:
     partition = args.partition or config["partition"]
     done = sorted((run / "state").glob("round-*.started"))
     first = len(done) + 1
+    if _scheduler(args) == "local":
+        # One round after another, here; each waits for the accelerator lock.
+        jobs = [_local(run, ["round", str(number)], seconds) for number in range(first, first + rounds)]
+        (run / "logs/jobs.txt").open("a").write(
+            "".join(f"round {first + i} job {j}\n" for i, j in enumerate(jobs)))
+        print(f"ran rounds {first}..{first + rounds - 1}; results in {run}/results")
+        return 0
     previous = args.after
     jobs = []
     for number in range(first, first + rounds):
@@ -739,6 +875,11 @@ def submit(args: argparse.Namespace) -> int:
 def rescore(args: argparse.Namespace) -> int:
     run = args.run_dir.resolve()
     config = _load(run)
+    if _scheduler(args) == "local":
+        job = _local(run, ["rescore"], int(args.time.split(":")[0]) * 3600
+                     + int(args.time.split(":")[1]) * 60)
+        print(f"rescore job {job}; then: container_run report --run-dir {run}")
+        return 0
     job = _sbatch(run, config, args.partition or config["partition"], args.time,
                   f"mb-rescore-{config['case'][:24]}", ["rescore"],
                   f"afterany:{args.after}" if args.after else None)
@@ -899,6 +1040,10 @@ def build_parser() -> argparse.ArgumentParser:
     image.add_argument("--partition", default="main")
     image.add_argument("--time", default="01:00:00")
     image.add_argument("--submit", action="store_true", help="submit the build job")
+    image.add_argument("--platform", choices=("cuda", "neuron"), default="cuda",
+                       help="neuron: build megabench/docker/neuron/agent.Dockerfile here with Docker")
+    image.add_argument("--base-image", default="megabench-neuron:native",
+                       help="the Neuron image the neuron agent image builds on")
 
     prep = sub.add_parser("prepare", help="make a new run directory for one case")
     prep.add_argument("--agent", choices=("claude", "codex", "opencode"), required=True)
@@ -975,14 +1120,22 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--vibesys-budget-minutes", type=int,
                       help="the lead's --budget time (default: the agent budget minus 15)")
     prep.add_argument("--vibesys-fanout", type=int, default=3)
+    prep.add_argument("--runtime", choices=("podman", "docker"),
+                      help="container runtime (default: docker for Trainium cases, else podman)")
+    prep.add_argument("--neuron-cores",
+                      help="NEURON_RT_VISIBLE_CORES of a Trainium run (default: 0 to gpus-1)")
 
     sm = sub.add_parser("smoke", help="check the container's view and network in a short job")
     sm.add_argument("--run-dir", type=Path, required=True)
+    sm.add_argument("--scheduler", choices=("slurm", "local"),
+                       help="local: run here under a lock (default when sbatch is missing)")
     sm.add_argument("--partition", default="priority")
     sm.add_argument("--time", default="00:15:00")
 
     sb = sub.add_parser("submit", help="submit the rounds as a chain of Slurm jobs")
     sb.add_argument("--run-dir", type=Path, required=True)
+    sb.add_argument("--scheduler", choices=("slurm", "local"),
+                       help="local: run here under a lock (default when sbatch is missing)")
     sb.add_argument("--rounds", type=int, help="rounds to add (default: the prepared count)")
     sb.add_argument("--partition", help="default: the prepared partition")
     sb.add_argument("--setup-minutes", type=int, default=5)
@@ -990,6 +1143,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     rs = sub.add_parser("rescore", help="re-check the best passing snapshots (a GPU job)")
     rs.add_argument("--run-dir", type=Path, required=True)
+    rs.add_argument("--scheduler", choices=("slurm", "local"),
+                       help="local: run here under a lock (default when sbatch is missing)")
     rs.add_argument("--partition")
     rs.add_argument("--time", default="01:30:00")
     rs.add_argument("--after", help="job id to wait for (afterany), e.g. the last round")

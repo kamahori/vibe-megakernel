@@ -15,13 +15,36 @@ set -a
 source "$RUN/run.env"
 set +a
 JOB=${SLURM_JOB_ID:?run this inside a Slurm job (container_run submit / smoke)}
+# Container runtime and accelerator: rootless Podman with the job's GPUs (CUDA, under Slurm), or
+# Docker with the Neuron device and the run's NeuronCores (Trainium, the local scheduler).
+CT=${RUNTIME:-podman}
+PLATFORM=${PLATFORM:-cuda}
+if [ "$CT" = docker ]; then
+    USERNS=(--user "$(id -u):$(id -g)")
+    RM_OPTS=(-f)
+else
+    USERNS=(--userns=keep-id)
+    RM_OPTS=(-f -t 10)
+fi
+if [ "$PLATFORM" = neuron ]; then
+    # Every container that runs on the chip (agent, grading) gets the device and the run's cores.
+    ACCEL=(--device /dev/neuron0 -e NEURON_RT_VISIBLE_CORES="$NEURON_CORES")
+    AGENT_ACCEL=("${ACCEL[@]}")
+else
+    ACCEL=()
+    AGENT_ACCEL=(-v /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro)
+fi
+accel_list() {
+    if [ "$PLATFORM" = neuron ]; then /opt/aws/neuron/bin/neuron-ls 2>/dev/null | head -n 8
+    else /usr/bin/nvidia-smi --query-gpu=index,name,uuid --format=csv,noheader; fi
+}
 AGENT_CT=mb-agent-$JOB
 LOGS=$RUN/logs
 EMPTY=$RUN/.empty
 mkdir -p "$EMPTY" "$RUN/state/baseline-cache"
 # /usr/bin before /usr/local/bin: the host's /usr/local/bin/nvidia-smi (mounted into every
 # container) is a wrapper that needs sudo outside a job's cgroup; the real binary is mounted below.
-CONTAINER_PATH=/opt/venv/bin:/usr/local/cuda/bin:/opt/codex/codex-path:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/sbin:/usr/local/bin
+CONTAINER_PATH=/opt/venv/bin:/usr/local/cuda/bin:/opt/aws/neuron/bin:/opt/codex/codex-path:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/sbin:/usr/local/bin
 # The proxy's socket directory: short (Unix socket paths are limited to 108 bytes), private.
 NETDIR=$(mktemp -d "/tmp/mb-net-$JOB.XXXXXX")
 chmod 700 "$NETDIR"
@@ -30,7 +53,7 @@ HELPER_PIDS=()
 HARVEST="/usr/bin/python3 $RUN/control/harvest.py"
 
 cleanup() {
-    podman rm -f -t 10 "$AGENT_CT" "mb-grade-$JOB" "mb-commit-$JOB" "mb-unpack-$JOB" >/dev/null 2>&1 || true
+    $CT rm "${RM_OPTS[@]}" "$AGENT_CT" "mb-grade-$JOB" "mb-commit-$JOB" "mb-unpack-$JOB" >/dev/null 2>&1 || true
     [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null
     for pid in "${HELPER_PIDS[@]}"; do kill "$pid" 2>/dev/null; done
     rm -rf "$NETDIR"
@@ -38,15 +61,15 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 143' TERM INT
 
-echo "job $JOB on $(hostname): $ACTION $NUMBER, image $IMAGE, GPUs ${CUDA_VISIBLE_DEVICES:-?}"
-/usr/bin/nvidia-smi --query-gpu=index,name,uuid --format=csv,noheader || true
+echo "job $JOB on $(hostname): $ACTION $NUMBER, image $IMAGE, GPUs ${CUDA_VISIBLE_DEVICES:-?}, NeuronCores ${NEURON_CORES:-none}"
+accel_list || true
 
 # The trusted evaluator in a container without network, on DIR; writes OUT (jsonl).
 grade_dir() {  # grade_dir DIR OUT SESSION REPS
     local regimes=()
     [ -n "${REGIMES:-}" ] && regimes=(-v "$RUN/state/regimes.json:/regimes.json:ro")
-    podman run --rm --name "mb-grade-$JOB" --network none --userns=keep-id --entrypoint= --shm-size "$SHM_SIZE" \
-        --security-opt no-new-privileges \
+    $CT run --rm --name "mb-grade-$JOB" --network none "${USERNS[@]}" --entrypoint= --shm-size "$SHM_SIZE" \
+        --security-opt no-new-privileges "${ACCEL[@]}" \
         -v "$TRUSTED:$TRUSTED:ro" -v "$1:$1" -v "$EMPTY:/scratch/hf:ro" \
         -v "$RUN/state/baseline-cache:/baseline-cache" "${regimes[@]}" \
         -e HOME=/tmp -e PATH="$CONTAINER_PATH" -e PYTHONPATH="$TRUSTED" \
@@ -70,7 +93,7 @@ if [ "$ACTION" = rescore ]; then
         name=$(basename "$tarball" .tgz)
         dir=$RUN/rescore/$name-$JOB
         mkdir -p "$dir/src"
-        podman run --rm --name "mb-unpack-$JOB" --network none --userns=keep-id --entrypoint= \
+        $CT run --rm --name "mb-unpack-$JOB" --network none "${USERNS[@]}" --entrypoint= \
             -v "$tarball:/snapshot.tgz:ro" -v "$dir/src:/out" "$IMAGE" \
             tar --no-same-owner -xzf /snapshot.tgz -C /out
         if ! $HARVEST review "$RUN" "$dir/src" > "$dir/review.json"; then
@@ -100,7 +123,7 @@ WORK=${WORK:-$WS}
 if [ "$NET_MODE" = open ]; then
     # Full network: each agent container gets its own pasta process (one per container, gone
     # with it), not a shared rootless Podman network, so no job can cut off another's.
-    network=(--network pasta)
+    if [ "$CT" = docker ]; then network=(); else network=(--network pasta); fi
 else
     # shellcheck disable=SC2086
     /usr/bin/python3 "$RUN/control/egress_proxy.py" serve --unix "$NETDIR/egress.sock" \
@@ -121,23 +144,26 @@ fi
 # Every agent container: the workspace (rw; WORK is its parent for a bare VibeSys workspace,
 # whose worktrees sit beside it), the trusted snapshot (ro), its HOME and the control files
 # (ro) at fixed paths; the shared HF cache is masked by an empty directory.
-common=("${network[@]}" --userns=keep-id --entrypoint= --hostname megabench --shm-size "$SHM_SIZE"
+common=("${network[@]}" "${USERNS[@]}" --entrypoint= --hostname megabench --shm-size "$SHM_SIZE"
     --security-opt no-new-privileges
     -v "$WORK:$WORK" -v "${AGENT_TRUSTED:-$TRUSTED}:$TRUSTED:ro" -v "$RUN/home:/home/agent"
     -v "$RUN/control:$RUN/control:ro" -v "$EMPTY:/scratch/hf:ro"
-    -v /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro
+    "${AGENT_ACCEL[@]}"
     -e HOME=/home/agent -e PATH="$CONTAINER_PATH" -e TMPDIR=/tmp -e TERM=xterm-256color
     -e HF_HUB_CACHE=/home/agent/.cache/huggingface/hub -e HF_XET_CACHE=/home/agent/.cache/huggingface/xet
     -e HF_DATASETS_CACHE=/home/agent/.cache/huggingface/datasets -e HF_HUB_OFFLINE=1
     -e DISABLE_AUTOUPDATER=1 -e IS_SANDBOX=1 -e CONTROL="$RUN/control"
     -e WS -e TRUSTED -e CASE -e AGENT -e MODEL -e EFFORT -e MODE -e GOAL_STYLE
     -e AGENT_SECONDS -e IDLE_SECONDS -e ALLOW_HOSTS -e FORBID -e RUN -e NET_MODE
-    -e VIBESYS_PLUGIN_SOURCE -e VIBESYS_CLI_VERSION -e RESULT_BRANCH
+    -e VIBESYS_PLUGIN_SOURCE -e VIBESYS_CLI_VERSION -e RESULT_BRANCH -e PLATFORM -e DOMAIN_PLUGIN
     -w "$WS")
 
 if [ "$ACTION" = smoke ]; then
     out=$LOGS/smoke-$JOB.txt
-    podman run --rm --name "$AGENT_CT" "${common[@]}" -e EXPECT_GPUS="$(/usr/bin/nvidia-smi -L | wc -l)" \
+    if [ "$PLATFORM" = neuron ]; then
+        expect=$(python3 -c 'import sys; a, _, b = sys.argv[1].partition("-"); print(int(b or a) - int(a) + 1)' "$NEURON_CORES")
+    else expect=$(/usr/bin/nvidia-smi -L | wc -l); fi
+    $CT run --rm --name "$AGENT_CT" "${common[@]}" -e EXPECT_GPUS="$expect" \
         "$IMAGE" "$RUN/control/entry.sh" smoke > "$out" 2>&1 || true
     echo "--- egress log" >> "$out"
     cat "$LOGS/egress-$JOB.jsonl" >> "$out" 2>/dev/null || true
@@ -162,9 +188,11 @@ touch "$RUN/state/round-$NUMBER.started"
 # Host-side helpers: keep the sources of every passing check, sample the GPUs once a second.
 ( while sleep 5; do $HARVEST harvest "$RUN" >/dev/null 2>> "$LOGS/harvest.err"; done ) &
 HELPER_PIDS+=($!)
-/usr/bin/nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used --format=csv,noheader \
-    -l 1 > "$LOGS/gpu-round-$NUMBER-$JOB.csv" 2>/dev/null &
-HELPER_PIDS+=($!)
+if [ "$PLATFORM" != neuron ]; then
+    /usr/bin/nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used --format=csv,noheader \
+        -l 1 > "$LOGS/gpu-round-$NUMBER-$JOB.csv" 2>/dev/null &
+    HELPER_PIDS+=($!)
+fi
 
 # The credential: read now, passed by name (never on a command line), dropped after the agent.
 credential=()
@@ -178,7 +206,7 @@ fi
 start=$(date +%s)
 set +e
 # Each output line's arrival time goes to .times (line i of .out <-> line i of .times).
-podman run --rm --name "$AGENT_CT" "${common[@]}" "${credential[@]}" -e ROUND="$NUMBER" \
+$CT run --rm --name "$AGENT_CT" "${common[@]}" "${credential[@]}" -e ROUND="$NUMBER" \
     "$IMAGE" "$RUN/control/entry.sh" round 2> "$LOGS/agent-round-$NUMBER.err" \
     | /usr/bin/python3 -u -c 'import sys, time
 out, times = open(sys.argv[1], "a"), open(sys.argv[2], "a")
@@ -198,7 +226,7 @@ if [ "$rc" -ne 124 ]; then
 fi
 
 # Snapshot the workspace in git (in a container: hooks and config are the agent's).
-podman run --rm --name "mb-commit-$JOB" --network none --userns=keep-id --entrypoint= -v "$WS:$WS" -w "$WS" \
+$CT run --rm --name "mb-commit-$JOB" --network none "${USERNS[@]}" --entrypoint= -v "$WS:$WS" -w "$WS" \
     -e HOME=/tmp "$IMAGE" bash -c 'git add -A && git -c core.hooksPath=/dev/null \
     -c user.name=MegaBench -c user.email=megabench@example.invalid commit -q --no-verify \
     -m "container_run: end of round $1" >/dev/null; git rev-parse HEAD' snapshot "$NUMBER" \
@@ -211,7 +239,7 @@ if [ -n "${RESULT_BRANCH:-}" ]; then
     # A VibeSys run's result is the head of its result branch, not the checkout: export that
     # tree (in a container: the repository's config is the agent's). With no result branch
     # (the bootstrap never passed) the checkout is graded, which holds no passing candidate.
-    podman run --rm --name "mb-export-$JOB" --network none --userns=keep-id --entrypoint= \
+    $CT run --rm --name "mb-export-$JOB" --network none "${USERNS[@]}" --entrypoint= \
         -v "$WS:$WS:ro" -v "$grade:/out" -w "$WS" -e HOME=/tmp -e GIT_CONFIG_NOSYSTEM=1 "$IMAGE" \
         bash -c 'c=$(git -c core.fsmonitor= rev-parse --verify -q "refs/heads/$1^{commit}");
                  if [ -n "$c" ]; then git -c core.fsmonitor= archive "$c" | tar -x -C /out && echo "$1 $c";

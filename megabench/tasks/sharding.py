@@ -62,6 +62,8 @@ def output_dim(name: str, value: torch.Tensor) -> int | None:
 
 
 def check_divisible(case: Case, values: dict[str, torch.Tensor], world: int) -> None:
+    if world == 1:  # one rank holds every input whole: any family runs unsharded
+        return
     if case.family not in TP_FAMILIES:
         raise ValueError(f"{case.family} has no tensor-parallel layout")
     p = case.params
@@ -78,6 +80,8 @@ def check_divisible(case: Case, values: dict[str, torch.Tensor], world: int) -> 
 
 def shard(case: Case, values: dict[str, torch.Tensor], rank: int, world: int) -> dict[str, torch.Tensor]:
     """Rank ``rank``'s views of ``values``: contiguous chunks or the replicated tensor."""
+    if world == 1:
+        return dict(values)
     out = {}
     for name, value in values.items():
         dim = input_dim(case, name)

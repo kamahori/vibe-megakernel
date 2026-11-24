@@ -26,7 +26,9 @@ SUBMISSION = Path(__file__).parent / "examples" / "neuron_tp_baseline_submission
 
 
 def development(case):
-    return replace(case, params=case.params | {"layers": 2})
+    """Two layers (and a two-layer vision tower or depth decoder where the case has one)."""
+    shrink = {key: 2 for key in ("layers", "vision_layers", "depth_layers") if key in case.params}
+    return replace(case, params=case.params | shrink)
 
 
 def audit_selftest() -> int:
@@ -87,7 +89,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.audit_selftest:
         return 1 if audit_selftest() else 0
-    cases = select_cases("p0", args.case, backend="neuron")
+    cases = (select_cases("all", args.case) if args.case
+             else select_cases("p0", backend="neuron"))
     failed = 0
     for case in cases:
         case = case if args.full else development(case)
