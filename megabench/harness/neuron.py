@@ -302,8 +302,8 @@ def evaluate_neuron(case: Case, submission: Path, *, trials: int, warmup: int, r
                     baseline: bool = True) -> dict:
     """Grade, time and audit a submission; ``baseline`` also times the eager TP baseline."""
     from ..tasks.sharding import assemble, check_divisible
-    from ..tasks.workloads import make_inputs, oracle, reference
-    from .correctness import _compare
+    from ..tasks.workloads import make_inputs, oracle, reference, regrade
+    from .correctness import _compare, _teacher_forced
     from .distributed import worst_rank_timing
 
     single = replace(case, gpus=1, tp=1, backend="cuda")
@@ -332,12 +332,19 @@ def evaluate_neuron(case: Case, submission: Path, *, trials: int, warmup: int, r
             ranks.send("trial", index, values)
             expected, exact = reference(single, values), oracle(single, values)
             replies = ranks.collect("trial")
-            del values
-            gc.collect()
             if index == 0:
                 result["build_ms"] = max(reply.get("build_ms", 0.0) for reply in replies)
                 result["first_call_ms_including_jit"] = max(reply["call_ms_including_jit"] for reply in replies)
             actual = assemble([reply["outputs"] for reply in replies])
+            # As check_trials: references that follow the candidate's own picks.
+            expected, exact = regrade(single, values, expected, exact, actual)
+            if case.family == "tts_frame_step":
+                forced = _teacher_forced(single, values, expected, exact, actual)
+                if forced[0] is not expected:
+                    scenario = "teacher_forced"
+                expected, exact = forced
+            del values
+            gc.collect()
             try:
                 details = _compare(expected, actual, single, "cpu", exact)
             except AssertionError as exc:

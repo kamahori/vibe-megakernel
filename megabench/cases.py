@@ -422,8 +422,8 @@ CASES += tuple(replace(case, id=f"{case.id}-trn2-tp4", backend="neuron", gpus=4,
                for case in CASES if case.suite == "p0" and case.ready)
 # The multimodal cases that run on one B200 in the CUDA campaign run on one logical
 # NeuronCore (24 GiB): one rank, unsharded inputs, the same single-device contract.
-TRN2_NC1_CASES = ("vl-decode-step-gemma3-4b-b1-s128", "tts-frame-step-csm-1b-b1-s128",
-                  "vla-action-step-pi05-b1")
+TRN2_NC1_CASES = ("tts-frame-step-csm-1b-b1-s128", "vla-action-step-pi05-b1",
+                  "world-frame-step-waypoint15-1b-f128")
 TRN2_NC1_NOTE = ("One logical NeuronCore of a Trainium2 chip (LNC=2, 24 GiB), one rank; "
                  "graded against the single-device reference.")
 CASES += tuple(replace(case, id=f"{case.id}-trn2-nc1", backend="neuron", gpus=1, tp=1,
