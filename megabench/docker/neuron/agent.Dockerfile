@@ -26,7 +26,7 @@ RUN set -eux; \
 COPY claude /usr/local/bin/claude
 COPY egress_proxy.py /opt/megabench/egress_proxy.py
 RUN chmod 755 /usr/local/bin/claude && claude --version && \
-    TORCH_DEVICE_BACKEND_AUTOLOAD=0 /opt/venv/bin/python -c "import torch, torch_neuronx, nki; print(torch.__version__, torch_neuronx.__version__, nki.__version__)" && \
+    /opt/venv/bin/python -c "from importlib.metadata import version as v; print(*(f'{p} {v(p)}' for p in ('torch', 'torch-neuronx', 'neuronx-cc', 'nki')))" && \
     ls /opt/aws/neuron/bin
 
 ENV PATH=/opt/venv/bin:/opt/aws/neuron/bin:${PATH} \

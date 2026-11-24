@@ -210,3 +210,39 @@ srun --jobid=JOB --overlap --pty podman exec -it mb-agent-JOB tmux attach -r -t 
 
 `megabench aggregate` takes the result files as in the
 [session protocol](SESSION_PROTOCOL.md).
+
+## Trainium (trn2.3xlarge, Docker, no Slurm)
+
+The same flow runs the `neuron` cases on one AWS Trainium2 chip (LNC=2: four logical
+NeuronCores of 24 GiB). The P0 cases run whole-chip as `<id>-trn2-tp4` (four TP ranks, inputs
+split as in `tasks/sharding.py`); the multimodal cases that use one B200 on CUDA run on one
+NeuronCore as `<id>-trn2-nc1` (one rank, inputs whole). Both are graded against the
+single-device reference.
+
+What changes, all chosen from the case's backend:
+
+- **Image:** `build-image --platform neuron` builds `megabench/docker/neuron/agent.Dockerfile`
+  on `megabench-neuron:native` (`megabench/docker/neuron/Dockerfile`) with Docker, here, and
+  checks it on the chip. Claude Code only.
+- **Containers:** Docker (`--runtime docker`, the default for Trainium), run as the invoking
+  user, with `--device /dev/neuron0` and `NEURON_RT_VISIBLE_CORES` set to the run's cores
+  (`--neuron-cores`, default `0-3` for TP4 and `0` for one core). Grading containers get the
+  same. Only `--network open` is supported (Docker's default bridge network per container).
+- **Scheduler:** `--scheduler local` (the default when `sbatch` is missing) runs `round.sh` in
+  the foreground with a unique `SLURM_JOB_ID`, under `flock /tmp/megabench-accelerator.lock`
+  and `timeout`, so runs on the one chip queue behind each other.
+- **VibeSys:** the plugin `vibesys-kernels-trainium` replaces `vibesys-kernels-cuda`. The task
+  declares `backends = ["trainium"]` and no `needs` (`vibesys-cli` 0.3.0 has no Neuron
+  resource); `cli.toml` has a `local` placement with `max_jobs = 1`, so jobs run one at a time
+  in the agent container, on its cores. The task's check and benchmark skip the slow eager
+  baseline; trusted grading still times it.
+- **Smoke:** `neuron-ls`, torch-neuronx's core count and a tensor op on the core, `nki` and
+  `neuron-profile` replace the `nvidia-smi`, CUDA and `ncu` checks.
+
+```bash
+.venv/bin/python -m megabench.integrations.container_run build-image --platform neuron
+# prepare as for CUDA, with a Trainium case id and a larger /dev/shm (the MoE inputs are ~61 GB):
+#   prepare ... --case moe-step-qwen3-30b-a3b-b1-s128-trn2-tp4 --shm-size 80g ...
+.venv/bin/python -m megabench.integrations.container_run smoke --run-dir RUN    # blocks
+.venv/bin/python -m megabench.integrations.container_run submit --run-dir RUN   # blocks
+```
