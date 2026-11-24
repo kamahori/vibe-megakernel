@@ -153,6 +153,7 @@ common=("${network[@]}" "${USERNS[@]}" --entrypoint= --hostname megabench --shm-
     -e HF_HUB_CACHE=/home/agent/.cache/huggingface/hub -e HF_XET_CACHE=/home/agent/.cache/huggingface/xet
     -e HF_DATASETS_CACHE=/home/agent/.cache/huggingface/datasets -e HF_HUB_OFFLINE=1
     -e DISABLE_AUTOUPDATER=1 -e IS_SANDBOX=1 -e CONTROL="$RUN/control"
+    -e CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0
     -e WS -e TRUSTED -e CASE -e AGENT -e MODEL -e EFFORT -e MODE -e GOAL_STYLE
     -e AGENT_SECONDS -e IDLE_SECONDS -e ALLOW_HOSTS -e FORBID -e RUN -e NET_MODE
     -e VIBESYS_PLUGIN_SOURCE -e VIBESYS_CLI_VERSION -e RESULT_BRANCH -e PLATFORM -e DOMAIN_PLUGIN
