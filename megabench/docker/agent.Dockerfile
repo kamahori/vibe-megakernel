@@ -1,8 +1,8 @@
-# Image for agent sessions on MegaBench cases (Claude Code or Codex), and for
+# Image for agent sessions on MegaBench cases (Claude Code, Codex or opencode), and for
 # grading their submissions. Built by
 #   python -m megabench.integrations.container_run build-image
 # which stages this file, requirements.lock, egress_proxy.py and the host's
-# `claude` and `codex` binaries in one build context, so the image carries the
+# `claude`, `codex` and `opencode` binaries in one build context, so the image carries the
 # same CLI versions as the host. Nothing from the repository is copied in: the
 # trusted benchmark and the workspace are mounted at run time.
 
@@ -44,10 +44,11 @@ RUN set -eux; \
 # keeps its vendor layout (its binary, helper binaries and bundled rg).
 COPY claude /usr/local/bin/claude
 COPY codex-vendor /opt/codex
+COPY opencode /usr/local/bin/opencode
 COPY egress_proxy.py /opt/megabench/egress_proxy.py
-RUN chmod -R a+rX /opt/codex && chmod 755 /usr/local/bin/claude && \
+RUN chmod -R a+rX /opt/codex && chmod 755 /usr/local/bin/claude /usr/local/bin/opencode && \
     ln -s /opt/codex/bin/codex /usr/local/bin/codex && \
-    claude --version && codex --version
+    claude --version && codex --version && opencode --version
 
 ENV PATH=/opt/venv/bin:/usr/local/cuda/bin:/opt/codex/codex-path:${PATH} \
     CUDA_HOME=/usr/local/cuda \

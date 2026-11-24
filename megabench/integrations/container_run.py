@@ -1,4 +1,4 @@
-"""Run Claude Code or Codex on one MegaBench case inside a container, under Slurm.
+"""Run Claude Code, Codex or opencode on one MegaBench case inside a container, under Slurm.
 
 On this host containers run only inside Slurm jobs (rootless Podman), and Slurm
 refuses CPU-only jobs, so each agent round is one GPU job: the agent's
@@ -8,8 +8,8 @@ submission is graded in a fresh container in the same job.
 Subcommands:
 
 - ``build-image``: stage ``megabench/docker/agent.Dockerfile``, the frozen
-  requirements, the egress proxy and the host's ``claude`` and ``codex`` in one
-  build context and build the image in a Slurm job (``--submit``).
+  requirements, the egress proxy and the host's ``claude``, ``codex`` and
+  ``opencode`` in one build context and build the image in a Slurm job (``--submit``).
 - ``prepare``: make a new run directory: a trusted snapshot of ``megabench/``
   from one git ref (past-run docs, submissions and examples removed), a fresh
   ``plain`` workspace for the case, an empty agent ``HOME`` with the agent's
@@ -44,6 +44,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from ..cases import select_cases
 from .clean_vibesys_run import DENIED_TOOLS, build_trusted
@@ -58,15 +59,37 @@ PROXY_PORT = 3128
 DEFAULT_ALLOW = {
     "claude": ("api.anthropic.com",),
     "codex": ("api.openai.com", "chatgpt.com", "auth.openai.com"),
+    "opencode": (),  # the provider's host, from OPENCODE_PROVIDERS
+}
+# OpenAI-compatible providers for opencode. Prices are USD per million tokens (from the
+# provider's /v1/models on 2026-11-23); opencode uses them for the cost in its JSON events.
+OPENCODE_PROVIDERS = {
+    "coralbricks": {
+        "name": "Coral Bricks",
+        "base_url": "https://inference.coralbricks.ai/v1",
+        "env": "CORALBRICKS_API_KEY",
+        "default_model": "deepseek-v4.1-flash",
+        "models": {
+            "deepseek-v4.1-flash": {"input": 0.19, "output": 0.6, "cache_read": 0.008},
+            "deepseek-v4.1-flash-fast": {"input": 0.45, "output": 1.8, "cache_read": 0.009},
+            "deepseek-v4.1-flash-value": {"input": 0.005, "output": 0.57, "cache_read": 0.003},
+        },
+        "context": 1048576,
+        "output": 65536,
+        "default_effort": "high",  # the API's default is no reasoning
+    },
 }
 CREDENTIAL_ENV = {
     "claude-oauth-token": "CLAUDE_CODE_OAUTH_TOKEN",
     "anthropic-api-key": "ANTHROPIC_API_KEY",
     "openai-api-key": "OPENAI_API_KEY",
     "codex-auth-json": None,  # copied to $HOME/.codex/auth.json at round start
+    "coralbricks-api-key": OPENCODE_PROVIDERS["coralbricks"]["env"],
 }
 CREDENTIAL_AGENT = {"claude-oauth-token": "claude", "anthropic-api-key": "claude",
-                    "openai-api-key": "codex", "codex-auth-json": "codex"}
+                    "openai-api-key": "codex", "codex-auth-json": "codex",
+                    "coralbricks-api-key": "opencode"}
+CREDENTIAL_PROVIDER = {"coralbricks-api-key": "coralbricks"}
 DEFAULT_GOAL = (
     "the task in TASK.md is done: submission.py passes ./check_candidate (correct outputs, "
     "within the GPU launch budget), and either its measured step time is within 1.5x of the "
@@ -80,6 +103,13 @@ KICKOFF = (
     "grades submission.py after the session. The session has a hard limit of about {minutes} "
     "minutes of wall time, GPU commands included; keep a correct submission.py in place early "
     "and improve it from there.")
+# opencode has no /goal: with --goal-style command the harness plays its part. Whenever
+# `opencode run` stops with time left, it resumes the session with this message, until the
+# agent's last reply says GOAL MET or the round's time runs out.
+GOAL_CHECK = (
+    "The harness is checking the goal of this session: {goal}. If the goal holds now, verify it "
+    "(run ./check_candidate) and end your reply with the line GOAL MET. Otherwise do not stop: "
+    "keep working toward the goal, and use ./time_left to see the time you have.")
 RESUME = ("You are resuming an earlier session on this task in a new time slot. Check the state "
           "of the workspace and continue toward the goal.")
 # ./time_left in the workspace: the agent budget left over all rounds (time between rounds,
@@ -125,6 +155,24 @@ def _codex_vendor() -> Path:
     return real.parents[1] if real.parent.name == "bin" else real.parent
 
 
+def _opencode_binary() -> Path:
+    """The host opencode's native binary (npm installs it as bin/opencode.exe)."""
+    opencode = shutil.which("opencode")
+    if not opencode:
+        raise SystemExit("opencode is not on PATH; install it with "
+                         "`npm install -g --prefix ~/.local opencode-ai`")
+    real = Path(opencode).resolve()
+    with real.open("rb") as binary:
+        native = binary.read(4) == b"\x7fELF"
+    if not native:
+        found = sorted(real.parents[2].glob("opencode-linux-x64/bin/opencode")) + sorted(
+            real.parents[1].glob("node_modules/opencode-linux-x64/bin/opencode"))
+        if not found:
+            raise SystemExit(f"no native opencode next to {real}")
+        real = found[0]
+    return real
+
+
 def stage_context(context: Path) -> str:
     """Copy everything the image build needs into *context*; return the image tag."""
     claude = shutil.which("claude")
@@ -137,6 +185,7 @@ def stage_context(context: Path) -> str:
         shutil.copy2(DOCKER_DIR / name, context / name)
     shutil.copy2(Path(claude).resolve(), context / "claude")
     shutil.copytree(_codex_vendor(), context / "codex-vendor", symlinks=True)
+    shutil.copy2(_opencode_binary(), context / "opencode")
     digest = hashlib.sha256()
     for path in sorted(p for p in context.rglob("*") if p.is_file()):
         digest.update(str(path.relative_to(context)).encode())
@@ -157,7 +206,7 @@ def build_image(args: argparse.Namespace) -> int:
         f"podman build --pull=missing -f agent.Dockerfile -t {tag} .\n"
         f"podman run --rm {tag} bash -c 'nvidia-smi -L; python -c \"import torch; "
         "print(torch.__version__, torch.cuda.is_available())\"; claude --version; "
-        "codex --version; ncu --version | tail -1'\n"
+        "codex --version; opencode --version; ncu --version | tail -1'\n"
         f"echo 'built {tag}'\n")
     script.chmod(0o755)
     command = ["sbatch", "--parsable", f"--partition={args.partition}", "--gres=gpu:1",
@@ -203,6 +252,30 @@ def codex_config(workspace: Path, model: str | None, effort: str | None) -> str:
     return "\n".join(lines)
 
 
+def opencode_config(provider: str, model: str, effort: str | None) -> dict:
+    """~/.config/opencode/opencode.json: one OpenAI-compatible provider, no web tools."""
+    spec = OPENCODE_PROVIDERS[provider]
+    entry = {"name": model, "tool_call": True, "reasoning": True,
+             "limit": {"context": spec["context"], "output": spec["output"]}}
+    if model in spec["models"]:
+        entry["cost"] = dict(spec["models"][model])
+    if effort:
+        entry["options"] = {"reasoningEffort": effort}
+    return {
+        "$schema": "https://opencode.ai/config.json",
+        "model": f"{provider}/{model}",
+        "autoupdate": False,
+        "share": "disabled",
+        # webfetch would be stopped by the proxy anyway; websearch runs past it.
+        "permission": {"edit": "allow", "bash": "allow", "external_directory": "allow",
+                       "webfetch": "deny", "websearch": "deny"},
+        "provider": {provider: {
+            "npm": "@ai-sdk/openai-compatible", "name": spec["name"],
+            "options": {"baseURL": spec["base_url"], "apiKey": "{env:" + spec["env"] + "}"},
+            "models": {model: entry}}},
+    }
+
+
 def round_seconds(args: argparse.Namespace) -> int:
     return (args.agent_minutes + args.grade_minutes + args.setup_minutes) * 60
 
@@ -230,6 +303,15 @@ def prepare(args: argparse.Namespace) -> int:
         if round_seconds(args) > limit:
             raise SystemExit(f"a round needs {slurm_time(round_seconds(args))}, over the "
                              f"{args.partition} limit; lower --agent-minutes or --grade-minutes")
+    provider = CREDENTIAL_PROVIDER.get(args.credential_kind)
+    if args.agent == "opencode":
+        if args.mode != "headless":
+            raise SystemExit("opencode runs headless only (`opencode run`)")
+        spec = OPENCODE_PROVIDERS[provider]
+        args.model = args.model or spec["default_model"]
+        args.effort = args.effort or spec["default_effort"]
+        if args.effort == "none":
+            args.effort = None
     model = args.model
     method = args.method or f"container-{args.agent}" + (f"-{model}" if model else "")
 
@@ -259,9 +341,13 @@ def prepare(args: argparse.Namespace) -> int:
         (home / ".claude").mkdir(parents=True)
         (home / ".claude/settings.json").write_text(json.dumps(settings, indent=2) + "\n")
         (home / ".claude.json").write_text(json.dumps(state, indent=2) + "\n")
-    else:
+    elif args.agent == "codex":
         (home / ".codex").mkdir(parents=True)
         (home / ".codex/config.toml").write_text(codex_config(workspace, model, args.effort))
+    else:
+        (home / ".config/opencode").mkdir(parents=True)
+        (home / ".config/opencode/opencode.json").write_text(
+            json.dumps(opencode_config(provider, model, args.effort), indent=2) + "\n")
     for name in ("state", "logs", "results", "grade", "control"):
         (run / name).mkdir(parents=True, exist_ok=True)
 
@@ -271,14 +357,17 @@ def prepare(args: argparse.Namespace) -> int:
     kickoff = args.kickoff_file.read_text() if args.kickoff_file else KICKOFF
     (run / "control/kickoff.txt").write_text(" ".join(kickoff.format(minutes=budget).split()) + "\n")
     (run / "control/resume.txt").write_text(RESUME + "\n")
+    (run / "control/goal_check.txt").write_text(GOAL_CHECK.format(goal=goal) + "\n")
     shutil.copy2(Path(__file__).with_name("container_entry.sh"), run / "control/entry.sh")
     shutil.copy2(DOCKER_DIR / "egress_proxy.py", run / "control/egress_proxy.py")
     shutil.copy2(Path(__file__).with_name("container_harvest.py"), run / "control/harvest.py")
     (run / "control/entry.sh").chmod(0o755)
 
-    allow = list(dict.fromkeys([*DEFAULT_ALLOW[args.agent], *args.allow_host]))
+    provider_hosts = [urlsplit(OPENCODE_PROVIDERS[provider]["base_url"]).hostname] if provider else []
+    allow = list(dict.fromkeys([*DEFAULT_ALLOW[args.agent], *provider_hosts, *args.allow_host]))
     config = {
-        "case": args.case, "agent": args.agent, "model": model, "effort": args.effort,
+        "case": args.case, "agent": args.agent, "provider": provider, "model": model,
+        "effort": args.effort,
         "mode": args.mode, "goal_style": args.goal_style, "image": args.image,
         "ref": args.ref,
         "ref_commit": subprocess.run(["git", "-C", str(REPO), "rev-parse", args.ref],
@@ -382,6 +471,8 @@ def forbidden_paths(run: Path, credential: Path) -> list[Path]:
     paths = [REPO / "megabench/cases.py", REPO / "megabench/tasks", REPO / ".git",
              REPO / "README.md", REPO / "reproductions", REPO / "submission.py",
              home / ".claude", home / ".claude.json", home / ".codex", home / ".ssh",
+             home / ".config/opencode/opencode.json", home / ".local/share/opencode/opencode.db",
+             home / ".bashrc",
              run / "state", run / "results", run / "grade", run / "config.json", credential,
              Path("/scratch/hf/hub")]
     return list(dict.fromkeys(paths))
@@ -497,6 +588,18 @@ def round_summary(run: Path, number: int) -> dict:
                     out["last_tool_call_s"] = round(times[index] - started, 1)
         if event.get("type") == "result":
             out["cost_usd"] = event.get("total_cost_usd")
+        # opencode (`opencode run --format json`): one tool_use event per call, the cost on
+        # each step_finish, and the harness's own goal re-prompts.
+        if event.get("type") == "harness_goal_reprompt":
+            out["goal_reprompts"] += 1
+        if event.get("type") == "tool_use":
+            out["tool_calls"] += 1
+            if index < len(times):
+                out["last_tool_call_s"] = round(times[index] - started, 1)
+        if event.get("type") == "step_finish":
+            cost = (event.get("part") or {}).get("cost")
+            if isinstance(cost, (int, float)):
+                out["cost_usd"] = (out["cost_usd"] or 0) + cost
     grades = sorted((run / "results").glob(f"round-{number}-*.jsonl"))
     record = None
     for line in grades[-1].read_text().splitlines() if grades else []:
@@ -599,25 +702,30 @@ def build_parser() -> argparse.ArgumentParser:
     image.add_argument("--submit", action="store_true", help="submit the build job")
 
     prep = sub.add_parser("prepare", help="make a new run directory for one case")
-    prep.add_argument("--agent", choices=("claude", "codex"), required=True)
+    prep.add_argument("--agent", choices=("claude", "codex", "opencode"), required=True)
     prep.add_argument("--case", required=True)
     prep.add_argument("--run-dir", type=Path, required=True)
     prep.add_argument("--image", required=True, help="tag printed by build-image")
     prep.add_argument("--credential-kind", choices=sorted(CREDENTIAL_ENV), required=True,
                       help="claude-oauth-token (`claude setup-token`) or anthropic-api-key for "
                            "Claude; openai-api-key or codex-auth-json (a ChatGPT login's "
-                           "auth.json) for Codex")
+                           "auth.json) for Codex; coralbricks-api-key for opencode")
     prep.add_argument("--credential-file", type=Path, required=True,
                       help="read at the start of each round; mode 600, outside the run")
-    prep.add_argument("--model", help="model name passed to the CLI (default: the CLI's)")
-    prep.add_argument("--effort", help="Codex model_reasoning_effort / Claude --effort")
+    prep.add_argument("--model", help="model name passed to the CLI (default: the CLI's; for "
+                                       "opencode on Coral Bricks, deepseek-v4.1-flash)")
+    prep.add_argument("--effort", help="Codex model_reasoning_effort / Claude --effort / opencode "
+                                       "reasoningEffort (Coral Bricks: low, high (default), max, "
+                                       "none)")
     prep.add_argument("--mode", choices=("headless", "tmux"),
                       help="headless: `claude -p` / `codex exec`; tmux: the interactive TUI in "
                            "tmux, typed into like a user (default: headless for claude, tmux "
-                           "for codex)")
+                           "for codex; opencode is headless only)")
     prep.add_argument("--goal", default=DEFAULT_GOAL, help="the /goal condition (one line)")
     prep.add_argument("--goal-style", choices=("command", "prompt"), default="command",
-                      help="command: send `/goal <goal>`; prompt: send the goal as plain text "
+                      help="command: send `/goal <goal>` (opencode, which has no /goal: the "
+                           "harness resumes the session with GOAL_CHECK whenever it stops, until "
+                           "the agent answers GOAL MET); prompt: send the goal as plain text "
                            "(a run without the goal feature, for comparison)")
     prep.add_argument("--rounds", type=int, default=1)
     prep.add_argument("--agent-minutes", type=int, default=90)
@@ -677,7 +785,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "prepare" and args.mode is None:
-        args.mode = "headless" if args.agent == "claude" else "tmux"
+        args.mode = "tmux" if args.agent == "codex" else "headless"
     return {"build-image": build_image, "prepare": prepare, "smoke": smoke,
             "submit": submit, "rescore": rescore, "report": report}[args.command](args)
 

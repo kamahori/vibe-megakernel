@@ -59,7 +59,7 @@ if [ "$ACTION" = smoke ]; then
         else bad "the proxy cannot reach $host"; fi
     done
     if tmux -V >/dev/null 2>&1; then ok "tmux: $(tmux -V)"; else bad "tmux does not run"; fi
-    for tool in claude codex nvcc ncu git; do
+    for tool in claude codex opencode nvcc ncu git; do
         if version=$("$tool" --version 2>&1 | tail -n 1); then ok "$tool: $version"
         else bad "$tool does not run"; fi
     done
@@ -72,7 +72,12 @@ goal=$(<"$CONTROL/goal.txt")
 kickoff=$(<"$CONTROL/kickoff.txt")
 resume=$(<"$CONTROL/resume.txt")
 if [ "$ROUND" -gt 1 ]; then second=$resume; else second=$kickoff; fi
-if [ "$GOAL_STYLE" = command ]; then
+if [ "$AGENT" = opencode ]; then
+    # No /goal in opencode: the goal goes in the prompt; with GOAL_STYLE=command the loop
+    # below re-prompts until the agent says GOAL MET.
+    first="$second Keep working until this holds: $goal"
+    second=""
+elif [ "$GOAL_STYLE" = command ]; then
     first="/goal $goal"
 else  # the same goal as plain text, for a run without the goal feature
     first="$second Keep working until this holds: $goal"
@@ -86,6 +91,40 @@ fi
 json_message() {
     jq -cn --arg t "$1" '{type: "user", message: {role: "user", content: $t}}'
 }
+
+if [ "$AGENT" = opencode ]; then
+    # `opencode run` until the agent stops; then (GOAL_STYLE=command) resume the session with
+    # goal_check.txt until its last reply ends with GOAL MET or the time runs out. stdin must
+    # be closed: `opencode run` otherwise waits on it. Its model, provider and permissions are
+    # in $HOME/.config/opencode/opencode.json.
+    export OPENCODE_DISABLE_MODELS_FETCH=1 OPENCODE_DISABLE_AUTOUPDATE=1 \
+        OPENCODE_DISABLE_LSP_DOWNLOAD=1
+    deadline=$(( $(date +%s) + AGENT_SECONDS ))
+    args=(run --format json)
+    [ "$ROUND" -gt 1 ] && args+=(--continue)
+    prompt=$first
+    last=/tmp/opencode-last.jsonl
+    quick=0  # consecutive runs under a minute: the agent is not working; stop re-prompting
+    while :; do
+        began=$(date +%s)
+        left=$(( deadline - began ))
+        [ "$left" -le 30 ] && exit 124
+        timeout --signal=INT --kill-after=120 "$left" opencode "${args[@]}" "$prompt" \
+            < /dev/null | tee "$last"
+        rc=${PIPESTATUS[0]}
+        [ "$rc" -eq 124 ] && exit 124
+        [ "$GOAL_STYLE" = command ] && [ "$rc" -eq 0 ] || exit "$rc"
+        if jq -r 'select(.type == "text") | .part.text // empty' "$last" 2>/dev/null \
+                | tail -n 5 | grep -q 'GOAL MET'; then
+            exit 0
+        fi
+        if [ $(( $(date +%s) - began )) -lt 60 ]; then quick=$((quick + 1)); else quick=0; fi
+        [ "$quick" -ge 3 ] && exit 0
+        jq -cn --arg t "$(date -Is)" '{type: "harness_goal_reprompt", time: $t}'
+        args=(run --format json --continue)
+        prompt=$(<"$CONTROL/goal_check.txt")
+    done
+fi
 
 if [ "$MODE" = headless ]; then
     if [ "$AGENT" = claude ]; then

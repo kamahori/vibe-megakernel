@@ -1,7 +1,7 @@
-# Claude Code and Codex in containers
+# Claude Code, Codex and opencode in containers
 
-`megabench.integrations.container_run` runs a stock agent CLI (Claude Code or
-Codex, no VibeSys) on one MegaBench case. The agent runs in a rootless Podman
+`megabench.integrations.container_run` runs a stock agent CLI (Claude Code,
+Codex or opencode, no VibeSys) on one MegaBench case. The agent runs in a rootless Podman
 container inside a Slurm GPU job. Its submission is then graded by the trusted
 evaluator in a second container in the same job. It is built for
 `/goal`-style runs: the agent gets a condition and keeps working until the
@@ -15,7 +15,7 @@ condition holds or the time runs out.
 | Trusted snapshot (`RUN/trusted/`: `megabench/` at `--ref`, without past-run docs, submissions, examples, experiments) | read-only |
 | `HOME` | `RUN/home/` at `/home/agent`: only the agent's settings and its own session files |
 | GPUs | the job's GPUs (Slurm's cgroup) |
-| Network | an internal Podman network. The only way out is an HTTP CONNECT proxy on port 443 that admits the model API hosts (`api.anthropic.com` for Claude; `api.openai.com`, `chatgpt.com`, `auth.openai.com` for Codex) and refuses the rest. Every decision is logged in `RUN/logs/egress-JOB.jsonl` |
+| Network | an internal Podman network. The only way out is an HTTP CONNECT proxy on port 443 that admits the model API hosts (`api.anthropic.com` for Claude; `api.openai.com`, `chatgpt.com`, `auth.openai.com` for Codex; the provider's API host, such as `inference.coralbricks.ai`, for opencode) and refuses the rest. Every decision is logged in `RUN/logs/egress-JOB.jsonl` |
 | Web search / fetch | off: Claude's `WebSearch` and `WebFetch` are denied in `settings.json`; Codex has `web_search = "disabled"`. These tools run on the provider's side, so the proxy alone would not stop them |
 | Repository, host `HOME`, other runs, `/scratch/hf`, `RUN/state`, `RUN/results`, `RUN/grade`, the credential file | not visible (`/scratch/hf` is masked with an empty directory) |
 
@@ -64,7 +64,8 @@ The image is `nvidia/cuda:13.1.2-devel-ubuntu24.04` plus the following:
 
 - `/opt/venv`, built from `megabench/docker/requirements.lock` (the repo `.venv`, frozen).
 - `ncu`, tmux, git and ripgrep.
-- The host's own `claude` and `codex` binaries, at the same versions as the host.
+- The host's own `claude`, `codex` and `opencode` binaries, at the same versions as the host.
+  For opencode, install it on the host first: `npm install -g --prefix ~/.local opencode-ai`.
 
 The tag is a hash of the build context, for example
 `localhost/megabench-agent:ab9169a1bf00`. After a CLI update, run
@@ -88,6 +89,9 @@ Each agent takes one of these credential kinds:
 - **Claude:** `claude-oauth-token` (from `claude setup-token`) or `anthropic-api-key`.
 - **Codex:** `openai-api-key`, or `codex-auth-json` (the `auth.json` of a ChatGPT login,
   copied to the run's `HOME`).
+- **opencode:** `coralbricks-api-key` (Coral Bricks' OpenAI-compatible API,
+  `https://inference.coralbricks.ai/v1`). For example:
+  `(umask 077; printenv CORALBRICKS_KEY > ~/.config/megabench/coralbricks-key)`.
 
 The credential file must have mode 600 and must sit outside the run directory.
 
@@ -107,6 +111,19 @@ Options:
   optimizations in a row that each gain less than 2%.
 - `--goal-style prompt`: sends the same goal as plain text, without `/goal`.
   Use it as a control run.
+- **opencode** runs headless only (`opencode run --format json`). Its config is
+  `RUN/home/.config/opencode/opencode.json`: one provider, with `webfetch` and
+  `websearch` denied. `--model` defaults to `deepseek-v4.1-flash`; the other
+  choices are `deepseek-v4.1-flash-fast` and `deepseek-v4.1-flash-value`.
+  `--effort` sets `reasoningEffort`: `low`, `high` (the default) or `max`.
+  `none` turns reasoning off, which is the API's own default. opencode has no
+  `/goal`, so with `--goal-style command` the harness stands in for it: the goal
+  goes into the first prompt, and whenever `opencode run` stops with time left,
+  the harness resumes the session (`--continue`) with `control/goal_check.txt`.
+  It stops when the agent's last reply says `GOAL MET`, when time runs out, or
+  after three runs in a row that each last under a minute. Each re-prompt is a
+  `harness_goal_reprompt` line in the round's output, and `report` counts it.
+  `--goal-style prompt` sends the goal once, with no re-prompts.
 - `--rounds`, `--agent-minutes`, `--grade-minutes`, `--idle-minutes` (tmux),
   `--partition`, `--allow-host`, `--ref`, `--effort`.
 
@@ -146,7 +163,7 @@ srun --jobid=JOB --overlap --pty podman exec -it mb-agent-JOB tmux attach -r -t 
 |---|---|
 | `RUN/results/round-N-JOB.jsonl` | the trusted `megabench evaluate` record of round N (method `container-AGENT-MODEL`, session `...-rN`) |
 | `RUN/logs/agent-round-N.out` | headless: the CLI's JSON stream; tmux: the sent lines and the last screen |
-| `RUN/home/.claude/projects/`, `RUN/home/.codex/sessions/` | full transcripts |
+| `RUN/home/.claude/projects/`, `RUN/home/.codex/sessions/`, `RUN/home/.local/share/opencode/` (SQLite) | full transcripts |
 | `RUN/logs/egress-JOB.jsonl` | every connection the agent attempted through the proxy |
 | `RUN/logs/slurm-JOB.out`, `RUN/logs/grade-round-N.err` | job and grading logs |
 | `RUN/state/round-N.commit` | the workspace commit that was graded |

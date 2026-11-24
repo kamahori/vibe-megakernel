@@ -141,6 +141,50 @@ class PrepareTests(unittest.TestCase):
             self.assertEqual(meta["mode"], "tmux")
             self.assertIn("api.openai.com", meta["allow_hosts"])
 
+    def test_opencode_run_uses_the_coralbricks_provider_headless(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self.prepare(Path(tmp), "--agent", "opencode",
+                               "--credential-kind", "coralbricks-api-key")
+            config = json.loads((run / "home/.config/opencode/opencode.json").read_text())
+            self.assertEqual(config["model"], "coralbricks/deepseek-v4.1-flash")
+            provider = config["provider"]["coralbricks"]
+            self.assertEqual(provider["options"]["baseURL"], "https://inference.coralbricks.ai/v1")
+            self.assertEqual(provider["options"]["apiKey"], "{env:CORALBRICKS_API_KEY}")
+            model = provider["models"]["deepseek-v4.1-flash"]
+            self.assertEqual(model["options"]["reasoningEffort"], "high")
+            self.assertIn("cost", model)
+            self.assertEqual(config["permission"]["webfetch"], "deny")
+            self.assertEqual(config["permission"]["websearch"], "deny")
+            meta = json.loads((run / "config.json").read_text())
+            self.assertEqual((meta["mode"], meta["provider"]), ("headless", "coralbricks"))
+            self.assertEqual(meta["allow_hosts"], ["inference.coralbricks.ai"])
+            self.assertEqual(meta["method"], "container-opencode-deepseek-v4.1-flash")
+            env = (run / "run.env").read_text()
+            self.assertIn("CREDENTIAL_ENV=CORALBRICKS_API_KEY", env)
+            self.assertNotIn("not-a-real-token", env)
+            self.assertIn("GOAL MET", (run / "control/goal_check.txt").read_text())
+            (Path(tmp) / "t").mkdir()
+            with self.assertRaises(SystemExit):
+                self.prepare(Path(tmp) / "t", "--agent", "opencode", "--mode", "tmux",
+                             "--credential-kind", "coralbricks-api-key")
+
+    def test_report_reads_opencode_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            for name in ("logs", "state", "results"):
+                (run / name).mkdir()
+            (run / "state/round-1.started").touch()
+            (run / "state/round-1.elapsed").write_text("600 0")
+            events = [{"type": "step_start"}, {"type": "tool_use"}, {"type": "tool_use"},
+                      {"type": "step_finish", "part": {"cost": 0.25}},
+                      {"type": "harness_goal_reprompt"},
+                      {"type": "step_finish", "part": {"cost": 0.5}}]
+            (run / "logs/agent-round-1.out").write_text("\n".join(map(json.dumps, events)))
+            summary = container_run.round_summary(run, 1)
+            self.assertEqual(summary["tool_calls"], 2)
+            self.assertEqual(summary["goal_reprompts"], 1)
+            self.assertAlmostEqual(summary["cost_usd"], 0.75)
+
     def test_rejects_wrong_credential_kind_an_open_key_and_too_long_rounds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
