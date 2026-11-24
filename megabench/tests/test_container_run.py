@@ -221,7 +221,11 @@ class ScriptTests(unittest.TestCase):
             if '"${common[@]}"' not in line:
                 self.assertIn("--entrypoint=", line)
                 self.assertIn("--network none", line)
-        self.assertIn("common=(--network none --userns=keep-id --entrypoint=", text)
+        # The agent container: no network but the proxy by default; with --network open, a
+        # pasta process of its own (never a shared rootless Podman network).
+        self.assertIn('common=("${network[@]}" --userns=keep-id --entrypoint=', text)
+        self.assertIn("network=(--network none ", text)
+        self.assertIn("network=(--network pasta)", text)
         self.assertNotIn("podman network", text)  # the shared rootless uplink dies with its job
 
     def test_round_script_never_runs_git_on_the_host(self) -> None:
@@ -391,3 +395,61 @@ class ExperimentToolsTests(unittest.TestCase):
 def _harvest_module():
     from ..integrations import container_harvest
     return container_harvest
+
+
+class BareVibesysTests(unittest.TestCase):
+    """--bare --vibesys-plugin: a workspace with only the contract, as a VibeSys task."""
+
+    def test_bare_workspace_is_a_vibesys_task_without_this_repositorys_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            key = tmp / "key"
+            key.write_text("not-a-real-token\n")
+            key.chmod(0o600)
+            run = tmp / "run"
+            argv = ["prepare", "--agent", "claude", "--credential-kind", "claude-oauth-token",
+                    "--case", CASE, "--run-dir", str(run), "--image", "localhost/megabench-agent:test",
+                    "--credential-file", str(key), "--agent-minutes", "100", "--grade-minutes", "15",
+                    "--partition", "background", "--bare", "--network", "open", "--web-tools",
+                    "--vibesys-plugin", "https://example.invalid/vibesys.git#branch"]
+            self.assertEqual(container_run.main(argv), 0)
+            ws = run / "work" / CASE
+            self.assertEqual(sorted(p.name for p in ws.iterdir()),
+                             [".git", ".gitignore", ".vibesys", "TASK.md", "case.json",
+                              "reference", "submission.py"])
+            task_md = (ws / "TASK.md").read_text()
+            for word in ("check_candidate", "megakernel_skills", "primdb", "sol_info", "timeline"):
+                self.assertNotIn(word, task_md)
+            log = subprocess.run(["git", "-C", str(ws), "log", "--oneline"],
+                                 capture_output=True, text=True).stdout.splitlines()
+            self.assertEqual(len(log), 1)  # no earlier commit holds a removed tool
+            task = ws / ".vibesys/tasks" / CASE
+            manifest = tomllib.loads((task / "vibesys.input.toml").read_text())
+            self.assertEqual(manifest["version"], "0.1")
+            self.assertEqual(manifest["benchmark"]["result"]["metric"], "kernel_latency_ms")
+            self.assertIn(str(run / "trusted"), (task / "evaluate.py").read_text())
+            objectives = tomllib.loads((task / "objectives.toml").read_text())
+            self.assertEqual(objectives["objective"][0]["direction"], "min")
+            cli = tomllib.loads((run / "home/.config/vibesys/cli.toml").read_text())
+            self.assertEqual(cli["placements"]["local"]["resources"]["gpu"]["count"], 1)
+            settings = json.loads((run / "home/.claude/settings.json").read_text())
+            self.assertEqual(settings["permissions"]["deny"], [])
+            kickoff = (run / "control/kickoff.txt").read_text()
+            self.assertIn(f"/vibesys:optimize {CASE} --megakernel-divide-and-conquer", kickoff)
+            self.assertIn("--budget time 85m", kickoff)
+            env = (run / "run.env").read_text()
+            self.assertIn("NET_MODE=open", env)
+            self.assertIn(f"RESULT_BRANCH=vibesys/result/{CASE}", env)
+            self.assertIn(f"WORK={run / 'work'}", env)
+
+    def test_vibesys_plugin_needs_a_bare_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            key = tmp / "key"
+            key.write_text("x\n")
+            key.chmod(0o600)
+            with self.assertRaises(SystemExit):
+                container_run.main(["prepare", "--agent", "claude", "--credential-kind",
+                                    "claude-oauth-token", "--case", CASE, "--run-dir",
+                                    str(tmp / "run"), "--image", "i", "--credential-file", str(key),
+                                    "--vibesys-plugin", "https://example.invalid/v.git"])

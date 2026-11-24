@@ -95,34 +95,44 @@ fi
 # container's entry script exposes it as 127.0.0.1:3128. No Podman network is used: rootless
 # Podman's uplink is one process per user shared by all jobs, and it dies with the job that
 # started it, cutting every other job off.
-# shellcheck disable=SC2086
-/usr/bin/python3 "$RUN/control/egress_proxy.py" serve --unix "$NETDIR/egress.sock" \
-    --allow $ALLOW_HOSTS --log "$LOGS/egress-$JOB.jsonl" &
-PROXY_PID=$!
-for _ in $(seq 50); do
-    [ -S "$NETDIR/egress.sock" ] && break
-    sleep 0.2
-done
-[ -S "$NETDIR/egress.sock" ] || { echo "the egress proxy did not start" >&2; exit 1; }
-proxy_url=http://127.0.0.1:3128
+NET_MODE=${NET_MODE:-proxy}
+WORK=${WORK:-$WS}
+if [ "$NET_MODE" = open ]; then
+    # Full network: each agent container gets its own pasta process (one per container, gone
+    # with it), not a shared rootless Podman network, so no job can cut off another's.
+    network=(--network pasta)
+else
+    # shellcheck disable=SC2086
+    /usr/bin/python3 "$RUN/control/egress_proxy.py" serve --unix "$NETDIR/egress.sock" \
+        --allow $ALLOW_HOSTS --log "$LOGS/egress-$JOB.jsonl" &
+    PROXY_PID=$!
+    for _ in $(seq 50); do
+        [ -S "$NETDIR/egress.sock" ] && break
+        sleep 0.2
+    done
+    [ -S "$NETDIR/egress.sock" ] || { echo "the egress proxy did not start" >&2; exit 1; }
+    proxy_url=http://127.0.0.1:3128
+    network=(--network none -v "$NETDIR:/run/mb-net" -e EGRESS_SOCKET=/run/mb-net/egress.sock
+        -e HTTPS_PROXY="$proxy_url" -e https_proxy="$proxy_url"
+        -e HTTP_PROXY="$proxy_url" -e http_proxy="$proxy_url"
+        -e NO_PROXY=localhost,127.0.0.1 -e no_proxy=localhost,127.0.0.1)
+fi
 
-# Every agent container: the workspace (rw), the trusted snapshot (ro), its HOME and the
-# control files (ro) at fixed paths; the shared HF cache is masked by an empty directory.
-common=(--network none --userns=keep-id --entrypoint= --hostname megabench --shm-size "$SHM_SIZE"
+# Every agent container: the workspace (rw; WORK is its parent for a bare VibeSys workspace,
+# whose worktrees sit beside it), the trusted snapshot (ro), its HOME and the control files
+# (ro) at fixed paths; the shared HF cache is masked by an empty directory.
+common=("${network[@]}" --userns=keep-id --entrypoint= --hostname megabench --shm-size "$SHM_SIZE"
     --security-opt no-new-privileges
-    -v "$WS:$WS" -v "${AGENT_TRUSTED:-$TRUSTED}:$TRUSTED:ro" -v "$RUN/home:/home/agent"
+    -v "$WORK:$WORK" -v "${AGENT_TRUSTED:-$TRUSTED}:$TRUSTED:ro" -v "$RUN/home:/home/agent"
     -v "$RUN/control:$RUN/control:ro" -v "$EMPTY:/scratch/hf:ro"
-    -v /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro -v "$NETDIR:/run/mb-net"
+    -v /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro
     -e HOME=/home/agent -e PATH="$CONTAINER_PATH" -e TMPDIR=/tmp -e TERM=xterm-256color
-    -e HTTPS_PROXY="$proxy_url" -e https_proxy="$proxy_url"
-    -e HTTP_PROXY="$proxy_url" -e http_proxy="$proxy_url"
-    -e NO_PROXY=localhost,127.0.0.1 -e no_proxy=localhost,127.0.0.1
     -e HF_HUB_CACHE=/home/agent/.cache/huggingface/hub -e HF_XET_CACHE=/home/agent/.cache/huggingface/xet
     -e HF_DATASETS_CACHE=/home/agent/.cache/huggingface/datasets -e HF_HUB_OFFLINE=1
     -e DISABLE_AUTOUPDATER=1 -e IS_SANDBOX=1 -e CONTROL="$RUN/control"
-    -e EGRESS_SOCKET=/run/mb-net/egress.sock
     -e WS -e TRUSTED -e CASE -e AGENT -e MODEL -e EFFORT -e MODE -e GOAL_STYLE
-    -e AGENT_SECONDS -e IDLE_SECONDS -e ALLOW_HOSTS -e FORBID -e RUN
+    -e AGENT_SECONDS -e IDLE_SECONDS -e ALLOW_HOSTS -e FORBID -e RUN -e NET_MODE
+    -e VIBESYS_PLUGIN_SOURCE -e VIBESYS_CLI_VERSION -e RESULT_BRANCH
     -w "$WS")
 
 if [ "$ACTION" = smoke ]; then
@@ -197,8 +207,21 @@ podman run --rm --name "mb-commit-$JOB" --network none --userns=keep-id --entryp
 # Grade a copy: the trusted evaluator, no network, a baseline cache the agent never saw.
 grade=$RUN/grade/round-$NUMBER-$JOB
 mkdir -p "$grade"
-cp -a "$WS/." "$grade/"
-rm -rf "$grade/.git" "$grade/.torch_extensions" "$grade/.cache" "$grade/reports"
+if [ -n "${RESULT_BRANCH:-}" ]; then
+    # A VibeSys run's result is the head of its result branch, not the checkout: export that
+    # tree (in a container: the repository's config is the agent's). With no result branch
+    # (the bootstrap never passed) the checkout is graded, which holds no passing candidate.
+    podman run --rm --name "mb-export-$JOB" --network none --userns=keep-id --entrypoint= \
+        -v "$WS:$WS:ro" -v "$grade:/out" -w "$WS" -e HOME=/tmp -e GIT_CONFIG_NOSYSTEM=1 "$IMAGE" \
+        bash -c 'c=$(git -c core.fsmonitor= rev-parse --verify -q "refs/heads/$1^{commit}");
+                 if [ -n "$c" ]; then git -c core.fsmonitor= archive "$c" | tar -x -C /out && echo "$1 $c";
+                 else cp -a . /out/ && echo "checkout (no $1)"; fi' export "$RESULT_BRANCH" \
+        > "$RUN/state/round-$NUMBER.graded" 2>> "$LOGS/grade-round-$NUMBER.err" || true
+    echo "graded tree: $(cat "$RUN/state/round-$NUMBER.graded" 2>/dev/null)"
+else
+    cp -a "$WS/." "$grade/"
+fi
+rm -rf "$grade/.git" "$grade/.torch_extensions" "$grade/.cache" "$grade/reports" "$grade/.vibesys"
 result=$RUN/results/round-$NUMBER-$JOB.jsonl
 set -o noclobber
 set +e

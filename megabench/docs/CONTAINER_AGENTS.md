@@ -127,6 +127,45 @@ Options:
 - `--rounds`, `--agent-minutes`, `--grade-minutes`, `--idle-minutes` (tmux),
   `--partition`, `--allow-host`, `--ref`, `--effort`.
 
+#### VibeSys plugin runs (Claude Code)
+
+These options run Claude Code as a VibeSys lead, with no scaffolding from this repository:
+
+- `--bare`: the workspace keeps only the case's contract.
+  - It keeps the `TASK.md` contract paragraphs, `case.json`, the `submission.py` stub and
+    `reference/`, and becomes a VibeSys task, `.vibesys/tasks/<case>/`. The task's
+    check is the trusted evaluator's correctness and launch audit (status `ok_provisional`).
+    Its benchmark is `kernel_latency_ms` (3 samples, `relative_noise` 0.01).
+  - Its git history starts after the tools and skills are removed.
+  - The workspace sits in `RUN/work/`, which the agent container mounts read-write, because
+    VibeSys puts its worktrees and phase maps beside the repository.
+- `--vibesys-plugin <marketplace source>` (needs `--bare`):
+  - At round start, the container installs the `vibesys` and `vibesys-kernels-cuda` plugins
+    from that source into the run's HOME, for example
+    `https://github.com/uw-syfi/vibesys.git#<branch>`. It also installs `vibesys-cli`
+    (`--vibesys-cli-version`, default 0.3.0) from its GitHub release.
+  - `prepare` writes the CLI's placement file (`local`, with the case's GPUs).
+  - The kickoff is
+    `/vibesys:optimize <case> --megakernel-divide-and-conquer --budget time <B>m --fanout <F>`.
+    `/goal` keeps the session going until the lead's final report. `B` is the agent budget
+    minus 15 by default (`--vibesys-budget-minutes`), and `F` is `--vibesys-fanout`.
+  - Grading reads the head of `vibesys/result/<case>`, not the checkout.
+    `RUN/state/round-N.graded` names the commit.
+- `--network open`: the agent container gets a full network of its own, through a pasta
+  process per container (never a shared Podman network). The default, `proxy`, keeps the
+  allowlist proxy.
+- `--web-tools`: allows Claude's WebSearch and WebFetch.
+- `--trusted-hide PATH` (repeat): hides part of the trusted snapshot from the agent. To show
+  only what the evaluator imports, hide everything in `megabench/` but `__init__.py`,
+  `__main__.py`, `cases.py`, `harness/`, `tasks/`, `heartbeat.py`, `sol.py`, `workloads.py`,
+  `baselines.py` and `runner.py`. In `integrations/`, keep only `__init__.py`,
+  `gpu_noise.py` and `vibesys_case_evaluator.py`.
+
+With `--vibesys-plugin`, the smoke check also tests `ncu` profiling a kernel, the plugin and
+CLI install, the daemon, `vibesys-cli task card`, and the task's check run end to end on a
+submission that calls the reference. It runs these in a scratch HOME, so the run's own HOME
+starts clean.
+
 ### 3. Smoke check (about 5 minutes, no credential used)
 
 ```bash

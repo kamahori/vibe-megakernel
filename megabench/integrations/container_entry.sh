@@ -7,12 +7,32 @@ set -uo pipefail
 ACTION=${1:-round}
 ROUND=${ROUND:-1}
 cd "$WS"
-# The proxy's socket (outside this container) as 127.0.0.1:3128, this container's only way out.
-python3.12 "$CONTROL/egress_proxy.py" forward --unix "$EGRESS_SOCKET" --port 3128 &
-for _ in $(seq 50); do
-    (exec 3<>/dev/tcp/127.0.0.1/3128) 2>/dev/null && break
-    sleep 0.1
-done
+NET_MODE=${NET_MODE:-proxy}
+if [ -n "${EGRESS_SOCKET:-}" ]; then
+    # The proxy's socket (outside this container) as 127.0.0.1:3128, this container's only way out.
+    python3.12 "$CONTROL/egress_proxy.py" forward --unix "$EGRESS_SOCKET" --port 3128 &
+    for _ in $(seq 50); do
+        (exec 3<>/dev/tcp/127.0.0.1/3128) 2>/dev/null && break
+        sleep 0.1
+    done
+fi
+
+# The VibeSys plugins and vibesys-cli, installed into $HOME (RUN/home) from GitHub; prints
+# what it installed. Each step is skipped when already done, so a later round reuses them.
+vibesys_setup() {
+    export PATH="$HOME/.local/bin:$PATH" VIBESYS_CLI="$HOME/.local/bin/vibesys-cli"
+    if [ ! -d "$HOME/.claude/plugins/marketplaces/vibesys" ]; then
+        claude plugin marketplace add "$VIBESYS_PLUGIN_SOURCE" || return 1
+    fi
+    claude plugin install vibesys@vibesys || return 1
+    claude plugin install vibesys-kernels-cuda@vibesys || return 1
+    if [ ! -x "$VIBESYS_CLI" ]; then
+        curl -fsSL https://raw.githubusercontent.com/uw-syfi/vibesys/main/cli/install.sh \
+            | VIBESYS_CLI_VERSION="$VIBESYS_CLI_VERSION" VIBESYS_CLI_INSTALL_DIR="$HOME/.local/bin" sh \
+            || return 1
+    fi
+    echo "vibesys plugin $(git -C "$HOME/.claude/plugins/marketplaces/vibesys" rev-parse HEAD) ($VIBESYS_PLUGIN_SOURCE); $("$VIBESYS_CLI" --version)"
+}
 
 if [ "$ACTION" = smoke ]; then
     fail=0
@@ -46,18 +66,68 @@ if [ "$ACTION" = smoke ]; then
     else ok "megabench is not importable from the workspace by default"; fi
     if PYTHONPATH="$TRUSTED" python -m megabench sol --case "$CASE" >/dev/null 2>&1; then
         ok "trusted megabench runs (sol)"; else bad "trusted megabench does not run"; fi
-    if curl -sS -m 10 --noproxy '*' -o /dev/null https://github.com 2>/dev/null; then
-        bad "direct egress reaches github.com"; else ok "direct egress is blocked"; fi
-    if curl -fsS -m 15 -o /dev/null https://github.com 2>/dev/null; then
-        bad "the proxy lets github.com through"; else ok "the proxy refuses github.com"; fi
-    if curl -fsS -m 15 -o /dev/null http://example.com 2>/dev/null; then
-        bad "plain HTTP gets out"; else ok "plain HTTP is refused"; fi
-    for host in $ALLOW_HOSTS; do
-        case "$host" in .*) continue ;; esac
-        code=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "https://$host/")
-        if [ "$code" != "000" ]; then ok "the proxy reaches $host (HTTP $code)"
-        else bad "the proxy cannot reach $host"; fi
-    done
+    if [ "$NET_MODE" = open ]; then
+        for url in https://github.com https://api.anthropic.com https://pypi.org http://example.com; do
+            code=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$url")
+            if [ "$code" != "000" ]; then ok "open network reaches $url (HTTP $code)"
+            else bad "open network cannot reach $url"; fi
+        done
+    else
+        if curl -sS -m 10 --noproxy '*' -o /dev/null https://github.com 2>/dev/null; then
+            bad "direct egress reaches github.com"; else ok "direct egress is blocked"; fi
+        if curl -fsS -m 15 -o /dev/null https://github.com 2>/dev/null; then
+            bad "the proxy lets github.com through"; else ok "the proxy refuses github.com"; fi
+        if curl -fsS -m 15 -o /dev/null http://example.com 2>/dev/null; then
+            bad "plain HTTP gets out"; else ok "plain HTTP is refused"; fi
+        for host in $ALLOW_HOSTS; do
+            case "$host" in .*) continue ;; esac
+            code=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "https://$host/")
+            if [ "$code" != "000" ]; then ok "the proxy reaches $host (HTTP $code)"
+            else bad "the proxy cannot reach $host"; fi
+        done
+    fi
+    # Nsight Compute must be able to read the GPU's counters, not only start.
+    if out=$(cd /tmp && ncu --target-processes all -c 1 --metrics gpu__time_duration.sum \
+            python -c 'import torch; torch.ones(1 << 20, device="cuda").sum().item()' 2>&1) \
+            && grep -q gpu__time_duration <<< "$out"; then
+        ok "ncu profiles a kernel: $(grep -m1 gpu__time_duration <<< "$out" | tr -s ' ')"
+    else bad "ncu cannot profile: $(grep -m2 -E 'ERR|==ERROR==|==WARNING==' <<< "$out" | tr '\n' ' ')"; fi
+    if [ -n "${VIBESYS_PLUGIN_SOURCE:-}" ]; then
+        # In a scratch HOME, so the run's own HOME starts clean for round 1.
+        real_home=$HOME
+        HOME=$(mktemp -d)
+        cp -a "$real_home/.claude" "$real_home/.claude.json" "$real_home/.config" "$HOME/" 2>/dev/null
+        if line=$(vibesys_setup 2>&1 | tail -n 1) && [ -x "$VIBESYS_CLI" ]; then ok "setup: $line"
+        else bad "vibesys setup failed: $line"; fi
+        skill=$(find "$HOME/.claude/plugins/cache" -path '*vibesys/*/optimize/references/megakernel-divide-and-conquer.md' | head -n 1)
+        if [ -n "$skill" ]; then ok "plugin has the megakernel divide-and-conquer mode"
+        else bad "the installed plugin has no megakernel divide-and-conquer mode"; fi
+        if claude plugin list 2>/dev/null | grep -q 'vibesys-kernels-cuda'; then ok "plugins listed: $(claude plugin list 2>/dev/null | grep -c '@vibesys') from vibesys"
+        else bad "claude plugin list does not show the plugins"; fi
+        if out=$("$VIBESYS_CLI" daemon ensure 2>&1); then ok "vibesys daemon: $(head -n 1 <<< "$out")"
+        else bad "vibesys daemon does not start: $out"; fi
+        if out=$("$VIBESYS_CLI" task card "$CASE" --repo "$WS" 2>&1); then ok "task card: $(tr '\n' ' ' <<< "$out" | cut -c1-200)"
+        else bad "vibesys-cli refuses the task: $(tr '\n' ' ' <<< "$out" | cut -c1-400)"; fi
+        # The task's own check on a submission that calls the reference: correct, but over the
+        # launch budget, so it must run to the end and fail on launches.
+        cat > /tmp/reference_submission.py <<PY
+import sys
+sys.path.insert(0, "$TRUSTED")
+from megabench.cases import select_cases
+from megabench.tasks.workloads import reference
+def build(case):
+    c = select_cases("all", [case["id"]])[0]
+    return lambda inputs: reference(c, inputs)
+PY
+        out=$(cd "$WS" && timeout 600 python ".vibesys/tasks/$CASE/evaluate.py" accuracy \
+              --submission /tmp/reference_submission.py 2>&1 | tail -n 1)
+        status=$(jq -r .status <<< "$out" 2>/dev/null)
+        if [ -n "$status" ] && [ "$status" != null ] && [ "$status" != ok_provisional ]; then
+            ok "task check runs: reference submission -> $status"
+        else bad "task check did not run as expected: $(cut -c1-400 <<< "$out")"; fi
+        "$VIBESYS_CLI" daemon stop >/dev/null 2>&1
+        HOME=$real_home
+    fi
     if tmux -V >/dev/null 2>&1; then ok "tmux: $(tmux -V)"; else bad "tmux does not run"; fi
     for tool in claude codex opencode nvcc ncu git; do
         if version=$("$tool" --version 2>&1 | tail -n 1); then ok "$tool: $version"
@@ -66,6 +136,11 @@ if [ "$ACTION" = smoke ]; then
     echo "user: $(id)"
     if [ "$fail" = 0 ]; then echo "SMOKE PASS"; else echo "SMOKE FAIL"; fi
     exit 0
+fi
+
+if [ -n "${VIBESYS_PLUGIN_SOURCE:-}" ]; then
+    # Before the agent's clock starts; its output goes to stderr, not the agent's JSON stream.
+    vibesys_setup >&2 || { echo "vibesys setup failed" >&2; exit 5; }
 fi
 
 goal=$(<"$CONTROL/goal.txt")
