@@ -1,7 +1,8 @@
 #!/bin/bash
 # Build the AMD probes for the current GPU and run each once.
 # Usage: bash megabench/primbench/amd/run_amd.sh OUT_DIR   (raw JSON lines per probe in OUT_DIR)
-# Then:  python -m megabench.primdb add OUT_DIR/*.jsonl   (or the importer used for the seed)
+# Token sweep M = 1..128 (VALU vs MFMA, x in LDS, split-K): bin/gemv_amd --msweep > SWEEP_DIR/gemv_msweep.jsonl
+# Then:  python -m megabench.primdb.amd_seed OUT_DIR [SWEEP_DIR ...] -o megabench/primdb/seed_amd.jsonl
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 out=${1:?usage: run_amd.sh OUT_DIR}

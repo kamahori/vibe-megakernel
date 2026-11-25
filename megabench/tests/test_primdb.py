@@ -102,6 +102,35 @@ class AmdSeedTests(unittest.TestCase):
             if r["family"] in ("mfma", "gemv"):
                 self.assertIs(r["verified"], True, r["primitive"])
 
+    def test_seed_has_the_token_sweep_on_both_gpus(self) -> None:
+        from ..primdb import amd_seed
+        rows = list(primdb.read(amd_seed.SEED_AMD, "seed"))
+        for arch in ("gfx942", "gfx90a"):
+            lds = {r["params"]["M"] for r in rows if r["cond"]["arch"] == arch
+                   and r["primitive"] in ("gemv.bf16.mfma_lds_sk", "gemv.bf16.mfma_lds_db")}
+            self.assertEqual(lds, {1, 4, 8, 16, 32, 64, 128}, arch)
+        self.assertFalse([r for r in rows if "mfma32" in r["primitive"]])
+
+    def test_sweep_rows_that_repeat_the_full_probe_are_dropped(self) -> None:
+        from ..primdb import amd_seed
+        with tempfile.TemporaryDirectory() as tmp:
+            full, sweep = Path(tmp) / "probe-x-1", Path(tmp) / "msweep-x-2"
+            full.mkdir(); sweep.mkdir()
+            base = {"family": "gemv", "primitive": "gemv.bf16.valu_r1", "dev": "gemv_amd.hip", "c.arch": "gfx942",
+                    "c.cus": 304, "p.N": 4096, "p.K": 1024, "p.M": 4, "p.threads": 256, "m.us_single": 6.3,
+                    "verified": True}
+            (full / "gemv_amd.jsonl").write_text(json.dumps(base) + "\n")
+            lines = [dict(base, **{"p.launch_bounds": 1024}),                     # repeats the probe
+                     dict(base, **{"p.launch_bounds": 512}),                      # new kernel bound
+                     dict(base, **{"p.launch_bounds": 1024, "p.N": 2048, "p.K": 768}),  # new shape
+                     dict(base, **{"primitive": "gemv.bf16.mfma32_lds_sk", "p.launch_bounds": 512})]
+            (sweep / "gemv_msweep.jsonl").write_text("".join(json.dumps(l) + "\n" for l in lines))
+            rows = amd_seed.drop_repeats(amd_seed.rows_from(full) + amd_seed.rows_from(sweep))
+            kept = sorted((r["source"]["file"].split("/")[0], r["params"]["N"], r["params"].get("launch_bounds"))
+                          for r in rows)
+            self.assertEqual(kept, [("msweep-x-2", 2048, 1024), ("msweep-x-2", 4096, 512), ("probe-x-1", 4096, None)])
+            self.assertTrue(all(r["source"]["bench"].endswith("gemv_amd.hip") for r in rows))
+
     def test_skill_tables_match_the_seed(self) -> None:
         from ..primdb import amd_seed
         with tempfile.TemporaryDirectory() as directory:

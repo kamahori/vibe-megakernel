@@ -1,6 +1,6 @@
 ---
 name: cdna-matrix-core-design
-description: Use when planning or reviewing a matrix-shaped megakernel phase (batch-1 GEMV, a few tokens of speculative decoding or MoE, attention products, dequantized weights) on AMD CDNA (MI300X gfx942, MI210 gfx90a, MI350X gfx950), to put MFMA, VALU and dot-instruction designs into the candidate set and decide among them by measurement.
+description: Use when planning or reviewing a matrix-shaped megakernel phase (batch-1 GEMV, several tokens from speculative decoding, MoE expert batches or batched decode, attention products, dequantized weights) on AMD CDNA (MI300X gfx942, MI210 gfx90a, MI350X gfx950), to put MFMA, VALU and dot-instruction designs into the candidate set and decide among them by measurement.
 ---
 
 # CDNA matrix-core and vector-engine design
@@ -68,7 +68,7 @@ CU, best thread count per engine):
 | 1024 x 2048 | 0.8 | **4.2 (256)** | 5.3 (512) | 28.0 (256) | 10.6 (512) |
 | 1536 x 2048 | 1.2 | **4.5 (512)** | 5.7 (512) | 28.3 (256) | 10.7 (512) |
 | 1024 x 3072 | 1.2 | **5.2 (256)** | 6.2 (256) | 40.5 (256) | 14.2 (256) |
-| 4096 x 1024 | 1.6 | **4.7 (1024)** | 5.3 (512) | 15.4 (256) | 7.2 (512) |
+| 4096 x 1024 | 1.6 | **4.7 (512)** | 5.3 (512) | 15.4 (256) | 7.2 (512) |
 | 6144 x 1024 | 2.4 | **5.9 (512)** | 6.2 (512) | 15.7 (256) | 7.5 (512) |
 | 6144 x 4096 | 9.5 | 18.0 (1024) | **18.0 (512)** | 57.2 (256) | 23.0 (512) |
 | 151936 x 1024 | 58.7 | 80.8 (1024) | **79.5 (512)** | 109.3 (1024) | 81.7 (1024) |
@@ -99,40 +99,79 @@ Questions:
   about 0.07 ms in the kernel; MFMA for QKV lost 0.05-0.09 ms in every variant. Tile balance
   (the most tiles any wave gets) decided it.
 
-## A few tokens (speculative decoding, MoE expert batches, M = 2..16)
+## Several tokens (speculative decoding, MoE expert batches, batched decode: M = 2..128)
 
 With M tokens, each weight byte feeds M multiply-adds. VALU cost grows with M; MFMA cost
 does not until M fills the tile.
 
-Measured on MI300X (`./primdb q gemv arch=gfx942 M=4,8,16`):
+Measured on MI300X (`./primdb q gemv arch=gfx942 M=4,8,16,32,64,128`; MI210 rows: `arch=gfx90a`):
 
 <!-- MI300X_SMALLM_TABLE -->
-| N x K | M | valu_r1 us | valu_r4 us | mfma16 us |
-|---|---|---|---|---|
-| 1536 x 2048 | 1 | 4.5 | 5.7 | 28.3 |
-| 1536 x 2048 | 4 | 6.0 | 8.5 | 30.1 |
-| 1536 x 2048 | 8 | 6.4 | - | 31.5 |
-| 1536 x 2048 | 16 | 10.7 | - | 32.6 |
-| 4096 x 1024 | 1 | 4.7 | 5.3 | 15.4 |
-| 4096 x 1024 | 4 | 6.3 | 7.9 | 15.9 |
-| 4096 x 1024 | 8 | 7.6 | - | 16.9 |
-| 4096 x 1024 | 16 | 13.7 | - | 17.4 |
-| 6144 x 4096 | 1 | 18.0 | 18.0 | 57.2 |
-| 6144 x 4096 | 4 | 26.6 | 23.3 | 65.0 |
-| 6144 x 4096 | 8 | 31.4 | - | 61.9 |
-| 6144 x 4096 | 16 | 58.4 | - | 63.6 |
+| N x K | M | valu_r1 us | valu_r4 us | mfma16 us | mfma_lds_sk us | mfma_lds_db us |
+|---|---|---|---|---|---|---|
+| 1536 x 2048 | 1 | **4.5** | 5.7 | 28.3 | 6.3 | 6.1 |
+| 1536 x 2048 | 4 | **6.0** | 8.5 | 30.1 | 6.4 | 6.3 |
+| 1536 x 2048 | 8 | 6.4 | - | 31.5 | **6.4** | 6.5 |
+| 1536 x 2048 | 16 | 9.4 | 17.0 | 32.6 | 8.2 | **7.8** |
+| 1536 x 2048 | 32 | 16.3 | 35.1 | 42.9 | 12.5 | **12.4** |
+| 1536 x 2048 | 64 | 29.9 | 60.1 | 77.0 | 20.8 | **20.7** |
+| 1536 x 2048 | 128 | 55.0 | 115.2 | 99.0 | **38.2** | 50.0 |
+| 2048 x 768 | 1 | **3.3** | 3.8 | 11.7 | 4.2 | 4.4 |
+| 2048 x 768 | 4 | **3.9** | 6.0 | 13.0 | 4.6 | 4.6 |
+| 2048 x 768 | 8 | **4.6** | - | 13.0 | 5.2 | 5.5 |
+| 2048 x 768 | 16 | 6.6 | 11.2 | 13.5 | 5.1 | **4.9** |
+| 2048 x 768 | 32 | 10.6 | 21.5 | 17.5 | 6.7 | **6.0** |
+| 2048 x 768 | 64 | 19.3 | 38.4 | 29.8 | **10.7** | 11.8 |
+| 2048 x 768 | 128 | 34.9 | 74.0 | 39.1 | **19.6** | 36.1 |
+| 4096 x 1024 | 1 | **4.7** | 5.3 | 15.4 | 6.4 | 6.7 |
+| 4096 x 1024 | 4 | **6.3** | 7.9 | 15.9 | 6.9 | 6.8 |
+| 4096 x 1024 | 8 | 7.6 | - | 16.9 | 7.2 | **7.0** |
+| 4096 x 1024 | 16 | 11.6 | 14.1 | 17.4 | 9.3 | **9.2** |
+| 4096 x 1024 | 32 | 21.2 | 26.8 | 22.6 | **14.8** | 15.1 |
+| 4096 x 1024 | 64 | 39.1 | 48.2 | 39.7 | **26.2** | 26.7 |
+| 4096 x 1024 | 128 | 73.9 | 86.0 | 51.5 | **49.0** | 84.9 |
+| 6144 x 4096 | 1 | 18.0 | **18.0** | 57.2 | 21.5 | 22.6 |
+| 6144 x 4096 | 4 | 26.6 | 23.3 | 65.0 | **22.3** | 23.4 |
+| 6144 x 4096 | 8 | 31.4 | - | 61.9 | **24.2** | 24.9 |
+| 6144 x 4096 | 16 | 52.2 | 45.0 | 63.3 | 27.5 | **26.9** |
+| 6144 x 4096 | 32 | 100.2 | 81.7 | 83.4 | 38.9 | **33.9** |
+| 6144 x 4096 | 64 | 191.3 | 153.8 | 151.1 | 62.5 | **50.2** |
+| 6144 x 4096 | 128 | 354.7 | 302.4 | 247.5 | 105.7 | **88.4** |
+
+us = one cold GEMV, best thread count; bold = fastest. `mfma_lds_*`: x staged in LDS per k-chunk, 16x16x16 MFMA, split-K with fp32 atomics; `_db` double-buffers the chunk (64-k chunks at M = 128).
 <!-- /MI300X_SMALLM_TABLE -->
 
-On MI300X the probe's `mfma16` time is flat in M (about 16, 30 and 62 us on the three shapes)
-but VALU stayed faster up to M = 16 on every shape (6144 x 4096: 58 vs 64 us). On MI210 the
-same kernels crossed at M = 8 and MFMA was 2.5x faster at M = 16. The `mfma16` engine wastes
-the broadcast columns at M < 16; a layout with split K or several row tiles per wave may cross
-earlier. Measure your layout at your M before choosing.
+The MFMA layout decides the answer, not the instruction:
+- `mfma16` reads x from global in every wave and gives each wave one 16-row tile, so the
+  1536- and 2048-row shapes keep most waves idle. Against it VALU looks better up to M = 16
+  on MI300X.
+- `mfma_lds_sk` stages x[0..M) for one 128-k chunk in LDS once per block, and splits K across
+  blocks until there is at least one task per block, adding partials with fp32 atomics. On
+  MI300X it passes VALU at M = 4 (6144 x 4096), M = 8 (4096 x 1024, 1536 x 2048) and
+  M = 16 (2048 x 768). At M = 16 it is 1.7x faster than VALU on 6144 x 4096; at M = 128 it is
+  1.4-1.8x faster on the small shapes and 3.4x on 6144 x 4096.
+- VALU stays fastest at M = 1, by about 30% on MI300X.
+- On MI210 the LDS engine crosses at M = 4-8 and is 5-6.6x faster than VALU at M = 128;
+  MI300X's VALU is relatively much stronger.
+- Double-buffering the LDS chunk (`mfma_lds_db`) gained 13-20% only on 6144 x 4096 at
+  M >= 32 and was neutral elsewhere. At M = 128 it needs 64-k chunks to fit 64 KB of LDS, and
+  there it lost badly on the small shapes.
+- 32x32x8 MFMA tiles (32 rows x 32 tokens per wave) were measured and were 1.3-2.3x slower
+  than 16x16 on both GPUs: no more FLOPs per cycle on CDNA, half the row tiles, so K has to
+  be split more.
+- The best LDS row reaches about 73 TFLOP/s on MI300X (about 6% of the bf16 peak) and 55 on
+  MI210 (about 30%), so a tuned large-M kernel can do better than these rows.
+
+For MoE with 128 experts and top-8 routing, each expert sees about batch / 16 tokens: MFMA pays
+for gate/up from about batch 128 and for down from about batch 256 on MI300X. Measure your
+layout at your M before choosing.
 
 Questions:
 - At your M, is the VALU path still bound by bytes? Compare its time at M against M = 1.
 - Do the tokens' activations stay in registers or LDS across the K loop? Each token is one more
-  x load per weight load on VALU; on MFMA it is a column of B.
+  x load per weight load on VALU; on MFMA it is a column of B, and reading it from global in
+  every wave made the plain `mfma16` engine lose.
+- Does every wave have a tile? With N / 16 tiles below the number of waves, split K.
 - Do earlier runs' symptoms fit? A 5-token fp32-activation GEMV reached only 1.6-2.6 TB/s on
   MI300X: the VALU issue rate, not HBM, was the limit.
 

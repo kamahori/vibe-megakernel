@@ -3,7 +3,8 @@
   python -m megabench.primdb.amd_seed OUT_DIR [OUT_DIR ...] -o megabench/primdb/seed_amd.jsonl
   python -m megabench.primdb.amd_seed --skill-tables     # rewrite the CDNA skills' measured tables
 
-Each OUT_DIR holds one GPU's `*.jsonl` probe lines; every row keeps `cond.arch` and `cond.cus`,
+Each OUT_DIR holds one GPU's `*.jsonl` probe lines (a `gemv_amd --msweep` directory holds
+`gemv_msweep.jsonl`; its rows that repeat a full-probe measurement on the same arch are dropped); every row keeps `cond.arch` and `cond.cus`,
 so one seed can hold several AMD GPUs. rocm workspaces query this seed instead of the B200 one.
 """
 
@@ -22,7 +23,26 @@ SKILLS = Path(__file__).resolve().parents[1] / "skills"
 ARCHES = (("gfx942", "MI300X"), ("gfx90a", "MI210"))
 BW_TB_S = {"gfx942": 5.3, "gfx90a": 1.6, "gfx950": 8.0}
 
-PROBES = ("sync_amd", "mem_amd", "mfma_amd", "gemv_amd")
+PROBES = ("sync_amd", "mem_amd", "mfma_amd", "gemv_amd", "gemv_msweep")
+GEMV_ENGINES = ("valu_r1", "valu_r4", "mfma16", "mfma_lds_sk", "mfma_lds_db")
+
+
+def _keep(name: str, flat: dict) -> bool:
+    return name != "gemv_msweep" or flat.get("primitive", "").split(".")[-1] in GEMV_ENGINES
+
+
+def _measured(r: dict) -> tuple:
+    p = dict(r["params"])
+    p.setdefault("launch_bounds", 1024)
+    for k in ("split_k", "k_chunk"):
+        p.pop(k, None)
+    return r["primitive"], r["cond"].get("arch"), json.dumps(p, sort_keys=True)
+
+
+def drop_repeats(rows: list[dict]) -> list[dict]:
+    """Drop gemv_msweep rows that repeat a measurement a full probe already made on that arch."""
+    probe = {_measured(r) for r in rows if not r["source"]["file"].endswith("gemv_msweep.jsonl")}
+    return [r for r in rows if not r["source"]["file"].endswith("gemv_msweep.jsonl") or _measured(r) not in probe]
 
 
 def rows_from(out: Path) -> list[dict]:
@@ -34,9 +54,13 @@ def rows_from(out: Path) -> list[dict]:
         for line in path.read_text().splitlines():
             if not line.strip():
                 continue
-            row = normalize(json.loads(line), **{"s.bench": f"megabench/primbench/amd/{name}.hip",
+            flat = json.loads(line)
+            if not _keep(name, flat):
+                continue
+            bench = "gemv_amd" if name == "gemv_msweep" else name
+            row = normalize(flat, **{"s.bench": f"megabench/primbench/amd/{bench}.hip",
                                                  "s.file": f"{out.name}/{path.name}"})
-            row["source"]["bench"] = f"megabench/primbench/amd/{name}.hip"
+            row["source"]["bench"] = f"megabench/primbench/amd/{bench}.hip"
             row["id"] = row_id(row)
             validate(row)
             rows.append(row)
@@ -153,12 +177,18 @@ def table_smallm(rows, arch="gfx942"):
     ms = sorted({r["params"].get("M", 1) for r in rows if r["family"] == "gemv" and r["cond"]["arch"] == arch})
     shapes = sorted({(r["params"]["N"], r["params"]["K"]) for r in rows if r["family"] == "gemv"
                      and r["cond"]["arch"] == arch and r["params"].get("M", 1) > 1})
-    lines = ["| N x K | M | valu_r1 us | valu_r4 us | mfma16 us |", "|---|---|---|---|---|"]
+    lines = ["| N x K | M | " + " | ".join(f"{e} us" for e in GEMV_ENGINES) + " |", "|---" * (2 + len(GEMV_ENGINES)) + "|"]
     for n, k in shapes:
         for m in ms:
             b = _best(rows, arch, n, k, m)
-            cells = [_fmt(b[e][0]) if e in b else "-" for e in ("valu_r1", "valu_r4", "mfma16")]
+            if not b:
+                continue
+            lo = min(v[0] for v in b.values())
+            cells = [("**" if b[e][0] == lo else "") + _fmt(b[e][0]) + ("**" if b[e][0] == lo else "") if e in b else "-"
+                     for e in GEMV_ENGINES]
             lines.append(f"| {n} x {k} | {m} | " + " | ".join(cells) + " |")
+    lines.append("\nus = one cold GEMV, best thread count; bold = fastest. `mfma_lds_*`: x staged in LDS per k-chunk, "
+                 "16x16x16 MFMA, split-K with fp32 atomics; `_db` double-buffers the chunk (64-k chunks at M = 128).")
     return "\n".join(lines)
 
 
@@ -216,12 +246,13 @@ def task_facts(rows, arch: str) -> str:
             g.append(f"{n}x{k}: " + ", ".join(f"{e} {b[e][0]:.1f}" for e in ("valu_r1", "valu_r4", "mfma4", "mfma16") if e in b) + " us")
     if g:
         lines.append("- Batch-1 bf16 GEMV, cold, best thread count: " + "; ".join(g) + ".")
-    sm = [(m, _best(rows, arch, 6144, 4096, m)) for m in (1, 4, 8, 16)]
-    sm = [(m, b) for m, b in sm if "mfma16" in b and ("valu_r1" in b or "valu_r4" in b)]
-    if sm:
-        lines.append("- M tokens, 6144x4096: " + "; ".join(
-            f"M={m} VALU {min(b[e][0] for e in ('valu_r1', 'valu_r4') if e in b):.1f} vs MFMA16 {b['mfma16'][0]:.1f} us"
-            for m, b in sm) + ".")
+    for n, k in ((6144, 4096), (1536, 2048)):
+        sm = [(m, _best(rows, arch, n, k, m)) for m in (1, 4, 8, 16, 32, 128)]
+        sm = [(m, b) for m, b in sm if any(e.startswith("mfma_lds") for e in b) and ("valu_r1" in b or "valu_r4" in b)]
+        if sm:
+            lines.append(f"- M tokens, {n}x{k} (VALU vs MFMA with x in LDS + split-K): " + "; ".join(
+                f"M={m} {min(b[e][0] for e in ('valu_r1', 'valu_r4') if e in b):.1f} vs "
+                f"{min(b[e][0] for e in b if e.startswith('mfma_lds')):.1f} us" for m, b in sm) + ".")
     ws = {r["primitive"]: r["metrics"]["cyc"] for r in rows if r["primitive"].startswith("wave_sum.")}
     if ws:
         lines.append(f"- 64-lane float sum: DPP + readlane {f(ws.get('wave_sum.dpp_readlane'), 0)} cycles, "
@@ -258,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if not a.dirs or not a.output:
         p.error("give OUT_DIR... and -o, or --skill-tables")
-    rows = [r for d in a.dirs for r in rows_from(d)]
+    rows = drop_repeats([r for d in a.dirs for r in rows_from(d)])
     if len({r["id"] for r in rows}) != len(rows):
         raise SystemExit("duplicate row ids: run each GPU's probes into its own directory")
     a.output.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows))
