@@ -3,3 +3,4 @@ primbench-seed-*.log
 
 # Agent and hand-written kernel submissions stay out of the repo (PR 40 review).
 megabench/submissions/
+neuron_profile/
