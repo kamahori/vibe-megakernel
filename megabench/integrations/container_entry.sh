@@ -231,11 +231,37 @@ if [ "$MODE" = headless ]; then
         [ -n "$MODEL" ] && args+=(--model "$MODEL")
         [ -n "$EFFORT" ] && args+=(--effort "$EFFORT")
         [ "$ROUND" -gt 1 ] && args+=(--continue)
-        {
-            json_message "$first"
-            [ -n "$second" ] && json_message "$second"
-        } | timeout --signal=INT --kill-after=120 "$AGENT_SECONDS" claude "${args[@]}"
-        exit $?
+        # A subscription token can hit its usage window mid-session; claude -p then ends on
+        # the 429. Wait for the window to reset and resume the same session (--continue)
+        # until the round's deadline. The wait counts against the round's wall clock.
+        deadline=$(( $(date +%s) + AGENT_SECONDS ))
+        last=/tmp/claude-last.jsonl
+        while :; do
+            left=$(( deadline - $(date +%s) ))
+            [ "$left" -le 60 ] && exit 124
+            {
+                json_message "$first"
+                [ -n "$second" ] && json_message "$second"
+            } | timeout --signal=INT --kill-after=120 "$left" claude "${args[@]}" | tee "$last"
+            rc=${PIPESTATUS[1]}
+            [ "$rc" -eq 124 ] && exit 124
+            jq -e 'select(.type == "result" and .api_error == "usage_limit_reached")' \
+                "$last" >/dev/null 2>&1 || exit "$rc"
+            reset=$(jq -r '.. | objects | select(.status? == "rejected" and .resetsAt?)
+                    | .resetsAt' "$last" 2>/dev/null | tail -n 1)
+            [ -n "$reset" ] && [ "$reset" != null ] || reset=$(( $(date +%s) + 900 ))
+            wake=$(( reset + 60 ))
+            [ "$wake" -ge $(( deadline - 300 )) ] && exit 124
+            jq -cn --arg t "$(date -Is)" --argjson w "$wake" \
+                '{type: "harness_usage_limit_wait", time: $t, wake: $w}'
+            sleep $(( wake - $(date +%s) > 0 ? wake - $(date +%s) : 0 ))
+            args=(-p --dangerously-skip-permissions --verbose --continue
+                  --input-format stream-json --output-format stream-json)
+            [ -n "$MODEL" ] && args+=(--model "$MODEL")
+            [ -n "$EFFORT" ] && args+=(--effort "$EFFORT")
+            first="/goal $goal"
+            second="The session stopped on the account's usage limit, which has now reset. Check the state of the optimization (vibesys-cli, git) and continue toward the goal; relaunch any workers that were stopped."
+        done
     fi
     prompt=$first
     [ -n "$second" ] && prompt="$first $second"
