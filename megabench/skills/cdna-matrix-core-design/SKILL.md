@@ -151,7 +151,7 @@ The MFMA layout decides the answer, not the instruction:
   M = 16 (2048 x 768). At M = 16 it is 1.7x faster than VALU on 6144 x 4096; at M = 128 it is
   1.4-1.8x faster on the small shapes and 3.4x on 6144 x 4096.
 - VALU stays fastest at M = 1, by about 30% on MI300X.
-- On MI210 the LDS engine crosses at M = 4-8 and is 5-6.6x faster than VALU at M = 128;
+- On MI210 the LDS engine crosses at M = 4-8 and is 5-8x faster than VALU at M = 128;
   MI300X's VALU is relatively much stronger.
 - Double-buffering the LDS chunk (`mfma_lds_db`) gained 13-20% only on 6144 x 4096 at
   M >= 32 and was neutral elsewhere. At M = 128 it needs 64-k chunks to fit 64 KB of LDS, and
