@@ -236,8 +236,10 @@ if [ "$MODE" = headless ]; then
         # until the round's deadline. The wait counts against the round's wall clock.
         deadline=$(( $(date +%s) + AGENT_SECONDS ))
         last=/tmp/claude-last.jsonl
+        quick=0
         while :; do
-            left=$(( deadline - $(date +%s) ))
+            began=$(date +%s)
+            left=$(( deadline - began ))
             [ "$left" -le 60 ] && exit 124
             {
                 json_message "$first"
@@ -245,8 +247,29 @@ if [ "$MODE" = headless ]; then
             } | timeout --signal=INT --kill-after=120 "$left" claude "${args[@]}" | tee "$last"
             rc=${PIPESTATUS[1]}
             [ "$rc" -eq 124 ] && exit 124
-            jq -e 'select(.type == "result" and .api_error == "usage_limit_reached")' \
-                "$last" >/dev/null 2>&1 || exit "$rc"
+            resume_args() {
+                args=(-p --dangerously-skip-permissions --verbose --continue
+                      --input-format stream-json --output-format stream-json)
+                [ -n "$MODEL" ] && args+=(--model "$MODEL")
+                [ -n "$EFFORT" ] && args+=(--effort "$EFFORT")
+            }
+            if ! jq -e 'select(.type == "result" and .api_error == "usage_limit_reached")' \
+                    "$last" >/dev/null 2>&1; then
+                # claude -p also exits when only background shells are left (it does not
+                # wait on those), ending a run early. With GOAL_STYLE=command, resume until
+                # the agent says GOAL MET, the time runs out, or it stops right away 3 times.
+                [ "$GOAL_STYLE" = command ] && [ "$rc" -eq 0 ] || exit "$rc"
+                [ $(( deadline - $(date +%s) )) -gt 900 ] || exit 0
+                jq -rs 'map(select(.type == "result")) | last | .result // ""' "$last" \
+                    2>/dev/null | tail -n 5 | grep -q 'GOAL MET' && exit 0
+                if [ $(( $(date +%s) - began )) -lt 60 ]; then quick=$((quick + 1)); else quick=0; fi
+                [ "${quick:-0}" -ge 3 ] && exit 0
+                jq -cn --arg t "$(date -Is)" '{type: "harness_goal_reprompt", time: $t}'
+                resume_args
+                first="/goal $goal"
+                second=$(<"$CONTROL/goal_check.txt")
+                continue
+            fi
             reset=$(jq -r '.. | objects | select(.status? == "rejected" and .resetsAt?)
                     | .resetsAt' "$last" 2>/dev/null | tail -n 1)
             [ -n "$reset" ] && [ "$reset" != null ] || reset=$(( $(date +%s) + 900 ))
@@ -255,10 +278,7 @@ if [ "$MODE" = headless ]; then
             jq -cn --arg t "$(date -Is)" --argjson w "$wake" \
                 '{type: "harness_usage_limit_wait", time: $t, wake: $w}'
             sleep $(( wake - $(date +%s) > 0 ? wake - $(date +%s) : 0 ))
-            args=(-p --dangerously-skip-permissions --verbose --continue
-                  --input-format stream-json --output-format stream-json)
-            [ -n "$MODEL" ] && args+=(--model "$MODEL")
-            [ -n "$EFFORT" ] && args+=(--effort "$EFFORT")
+            resume_args
             first="/goal $goal"
             second="The session stopped on the account's usage limit, which has now reset. Check the state of the optimization (vibesys-cli, git) and continue toward the goal; relaunch any workers that were stopped."
         done
