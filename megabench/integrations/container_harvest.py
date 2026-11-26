@@ -174,11 +174,32 @@ def review(directory: Path) -> list[str]:
     return problems
 
 
+def usage_limit_extension(run: Path, number: int) -> int:
+    """Seconds round NUMBER's deadline moved out for usage-limit waits (container_entry.sh)."""
+    total = 0
+    log = run / "logs" / f"agent-round-{number}.out"
+    if log.exists():
+        for line in log.read_text(errors="replace").splitlines():
+            if '"harness_usage_limit_wait"' not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("type") == "harness_usage_limit_wait":
+                total = max(total, int(event.get("extended_total_s") or 0))
+    return total
+
+
 def budget(run: Path, number: int) -> int:
     env = _env(run)
     total = int(env["BUDGET_SECONDS"])
     slot = int(env["AGENT_SECONDS"])
-    used = sum(int(p.read_text().split()[0]) for p in (run / "state").glob("round-*.elapsed"))
+    # Time that moved a round's deadline out for a usage-limit wait was not agent time.
+    used = 0
+    for path in (run / "state").glob("round-*.elapsed"):
+        done = int(path.name.split("-")[1].split(".")[0])
+        used += max(0, int(path.read_text().split()[0]) - usage_limit_extension(run, done))
     left = max(0, total - used)
     seconds = min(slot, left)
     now = int(time.time())

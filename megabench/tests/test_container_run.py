@@ -322,6 +322,28 @@ class ExperimentToolsTests(unittest.TestCase):
             run = self.prepare(Path(tmp))
             self.assertFalse((run / "trusted-agent").exists())
 
+    def test_usage_limit_extension_is_not_agent_time(self) -> None:
+        harvest = _harvest_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self.prepare(Path(tmp), "--usage-limit-extension-minutes", "10")
+            env = (run / "run.env").read_text()
+            self.assertIn("USAGE_LIMIT_EXTENSION_SECONDS=600", env)
+            self.assertEqual(json.loads((run / "config.json").read_text())
+                             ["usage_limit_extension_minutes"], 10)
+            # Round 1 ran 900 s of wall clock, 300 s of it a compensated usage-limit wait
+            # (the larger total of two waits): only 600 s of the 25 minutes are spent.
+            (run / "state/round-1.elapsed").write_text("900 124\n")
+            (run / "logs/agent-round-1.out").write_text("".join(json.dumps(e) + "\n" for e in (
+                {"type": "assistant"},
+                {"type": "harness_usage_limit_wait", "waited_s": 100, "extended_total_s": 100},
+                {"type": "harness_usage_limit_wait", "waited_s": 200, "extended_total_s": 300})))
+            self.assertEqual(harvest.usage_limit_extension(run, 1), 300)
+            self.assertEqual(harvest.budget(run, 2), 600)
+            (run / "state/round-1.started").touch()
+            summary = container_run.round_summary(run, 1)
+            self.assertEqual((summary["usage_limit_waits"], summary["usage_limit_wait_s"],
+                              summary["usage_limit_extension_s"]), (2, 300, 300))
+
     def test_budget_harvest_and_report(self) -> None:
         harvest = _harvest_module()
         with tempfile.TemporaryDirectory() as tmp:
