@@ -480,7 +480,8 @@ def opencode_config(provider: str, model: str, effort: str | None) -> dict:
 
 
 def round_seconds(args: argparse.Namespace) -> int:
-    return (args.agent_minutes + args.grade_minutes + args.setup_minutes) * 60
+    return (args.agent_minutes + args.grade_minutes + args.setup_minutes
+            + args.usage_limit_extension_minutes) * 60
 
 
 def slurm_time(seconds: int) -> str:
@@ -579,6 +580,7 @@ def prepare(args: argparse.Namespace) -> int:
         (run / name).mkdir(parents=True, exist_ok=True)
 
     budget = args.budget_minutes or args.agent_minutes * args.rounds
+    lead = None
     if args.vibesys_plugin:
         # The lead's own budget leaves the end of the slot for its last integration and report.
         lead = args.vibesys_budget_minutes or max(1, budget - 15)
@@ -608,6 +610,7 @@ def prepare(args: argparse.Namespace) -> int:
         "gpus": case.gpus, "partition": args.partition, "rounds": args.rounds,
         "agent_minutes": args.agent_minutes, "grade_minutes": args.grade_minutes,
         "idle_minutes": args.idle_minutes, "allow_hosts": allow, "method": method,
+        "usage_limit_extension_minutes": args.usage_limit_extension_minutes,
         "session_id": f"{method}-{args.case}-{run.name}", "credential_kind": args.credential_kind,
         "credential_file": str(credential), "grade_reps": args.grade_reps,
         "grade_timeout": args.grade_timeout,
@@ -628,6 +631,8 @@ def prepare(args: argparse.Namespace) -> int:
         "EFFORT": args.effort or "", "MODE": args.mode, "GOAL_STYLE": args.goal_style,
         "AGENT_SECONDS": args.agent_minutes * 60, "IDLE_SECONDS": args.idle_minutes * 60,
         "BUDGET_SECONDS": budget * 60,
+        "USAGE_LIMIT_EXTENSION_SECONDS": args.usage_limit_extension_minutes * 60,
+        "LEAD_BUDGET_MINUTES": lead or "",
         "ALLOW_HOSTS": " ".join(allow), "CREDENTIAL_KIND": args.credential_kind,
         "CREDENTIAL_ENV": CREDENTIAL_ENV[args.credential_kind] or "",
         "CREDENTIAL_FILE": credential, "METHOD": method, "SESSION_ID": config["session_id"],
@@ -649,7 +654,9 @@ def prepare(args: argparse.Namespace) -> int:
           f"  workspace: {workspace}\n  image: {args.image}\n"
           f"  each round: {case.gpus} {'NeuronCore' if platform == 'neuron' else 'GPU'}(s), "
           f"--time={slurm_time(round_seconds(args))} "
-          f"({args.agent_minutes} min agent, {args.grade_minutes} min grading)\n"
+          f"({args.agent_minutes} min agent, {args.grade_minutes} min grading"
+          + (f", up to {args.usage_limit_extension_minutes} min usage-limit extension"
+             if args.usage_limit_extension_minutes else "") + ")\n"
           "next:\n"
           f"  {sys.executable} -m megabench.integrations.container_run smoke --run-dir {run}\n"
           f"  {sys.executable} -m megabench.integrations.container_run submit --run-dir {run}")
@@ -842,7 +849,10 @@ def submit(args: argparse.Namespace) -> int:
     run = args.run_dir.resolve()
     config = _load(run)
     rounds = args.rounds or config["rounds"]
-    seconds = (config["agent_minutes"] + config["grade_minutes"]) * 60 + args.setup_minutes * 60
+    # The job's time limit also covers the most the agent's deadline can move out for
+    # usage-limit waits (container_entry.sh), so a compensated round is not killed early.
+    seconds = (config["agent_minutes"] + config["grade_minutes"]
+               + config.get("usage_limit_extension_minutes", 0)) * 60 + args.setup_minutes * 60
     partition = args.partition or config["partition"]
     done = sorted((run / "state").glob("round-*.started"))
     first = len(done) + 1
@@ -913,7 +923,8 @@ def round_summary(run: Path, number: int) -> dict:
         if (logs / f"agent-round-{number}.times").exists() else []
     out = {"round": number, "agent_seconds": seconds, "exit": rc,
            "ended": {None: "unknown", 124: "time slot over"}.get(rc, "agent ended the session"),
-           "goal_reprompts": 0, "tool_calls": 0, "cost_usd": None, "last_tool_call_s": None}
+           "goal_reprompts": 0, "tool_calls": 0, "cost_usd": None, "last_tool_call_s": None,
+           "usage_limit_waits": 0, "usage_limit_wait_s": 0, "usage_limit_extension_s": 0}
     for index, event in enumerate(_events(logs / f"agent-round-{number}.out")):
         if not event:
             continue
@@ -932,6 +943,11 @@ def round_summary(run: Path, number: int) -> dict:
         # each step_finish, and the harness's own goal re-prompts.
         if event.get("type") == "harness_goal_reprompt":
             out["goal_reprompts"] += 1
+        if event.get("type") == "harness_usage_limit_wait":
+            out["usage_limit_waits"] += 1
+            out["usage_limit_wait_s"] += int(event.get("waited_s") or 0)
+            out["usage_limit_extension_s"] = max(out["usage_limit_extension_s"],
+                                                 int(event.get("extended_total_s") or 0))
         if event.get("type") == "tool_use":
             out["tool_calls"] += 1
             if index < len(times):
@@ -1008,8 +1024,14 @@ def report(args: argparse.Namespace) -> int:
         # a session that stops when ./time_left reaches 0 used its whole budget.
         "ended_early": bool(rounds) and rounds[-1]["exit"] not in (124, None)
         and (run / "state/finished").exists()
-        and (config.get("budget_minutes") or 0) * 60 - sum(r["agent_seconds"] or 0 for r in rounds) > 120,
+        and (config.get("budget_minutes") or 0) * 60
+        - sum((r["agent_seconds"] or 0) - r["usage_limit_extension_s"] for r in rounds) > 120,
         "goal_reprompts": sum(r["goal_reprompts"] for r in rounds),
+        # Usage-limit waits: total wall time waited, and how much of it was given back by
+        # moving the deadline out (--usage-limit-extension-minutes); the rest cost budget.
+        "usage_limit_wait_minutes": round(sum(r["usage_limit_wait_s"] for r in rounds) / 60, 1),
+        "usage_limit_extension_minutes": round(
+            sum(r["usage_limit_extension_s"] for r in rounds) / 60, 1),
         "cost_usd": round(sum(r["cost_usd"] or 0 for r in rounds), 2),
         "checks": {"n": len(checks), "passing": len(snaps)},
         "best_agent_p50_ms": min((s["agent_p50_ms"] for s in snaps if s.get("agent_p50_ms")), default=None),
@@ -1077,6 +1099,12 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--setup-minutes", type=int, default=5)
     prep.add_argument("--idle-minutes", type=int, default=15,
                       help="tmux mode: end the round when the screen has not changed this long")
+    prep.add_argument("--usage-limit-extension-minutes", type=int, default=0,
+                      help="headless claude: when the session stops on the account's usage "
+                           "limit, move the round's deadline out by the wait (up to this many "
+                           "minutes per round) and give the VibeSys lead the longer budget; the "
+                           "job's time limit grows by the same amount (default 0: the wait "
+                           "counts against the budget)")
     prep.add_argument("--partition", default="main")
     prep.add_argument("--allow-host", action="append", default=[],
                       help="extra host the proxy lets through (repeat; .domain for a domain)")

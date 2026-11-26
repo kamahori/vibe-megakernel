@@ -233,8 +233,13 @@ if [ "$MODE" = headless ]; then
         [ "$ROUND" -gt 1 ] && args+=(--continue)
         # A subscription token can hit its usage window mid-session; claude -p then ends on
         # the 429. Wait for the window to reset and resume the same session (--continue)
-        # until the round's deadline. The wait counts against the round's wall clock.
+        # until the round's deadline. The wait counts against the round's wall clock, except
+        # that up to USAGE_LIMIT_EXTENSION_SECONDS of it (over the round) moves the deadline
+        # out by the same amount; the lead then gets a `budget: time` steering note for the
+        # longer budget (LEAD_BUDGET_MINUTES plus the extension so far).
         deadline=$(( $(date +%s) + AGENT_SECONDS ))
+        extension_cap=${USAGE_LIMIT_EXTENSION_SECONDS:-0}
+        extended=0
         last=/tmp/claude-last.jsonl
         quick=0
         while :; do
@@ -274,13 +279,33 @@ if [ "$MODE" = headless ]; then
                     | .resetsAt' "$last" 2>/dev/null | tail -n 1)
             [ -n "$reset" ] && [ "$reset" != null ] || reset=$(( $(date +%s) + 900 ))
             wake=$(( reset + 60 ))
-            [ "$wake" -ge $(( deadline - 300 )) ] && exit 124
-            jq -cn --arg t "$(date -Is)" --argjson w "$wake" \
-                '{type: "harness_usage_limit_wait", time: $t, wake: $w}'
+            now=$(date +%s)
+            # Credit the wait from now (the session has exited on the 429) to the wake. The few
+            # minutes the session spent on rejected calls before it exited are not credited.
+            waited=$(( wake > now ? wake - now : 0 ))
+            room=$(( extension_cap - extended ))
+            extend=$(( waited < room ? waited : room ))
+            [ "$extend" -lt 0 ] && extend=0
+            deadline=$(( deadline + extend ))
+            extended=$(( extended + extend ))
+            if [ "$wake" -ge $(( deadline - 300 )) ]; then
+                jq -cn --arg t "$(date -Is)" --argjson w "$wake" --argjson e "$extend" \
+                    --argjson x "$extended" \
+                    '{type: "harness_usage_limit_wait", time: $t, wake: $w, waited_s: 0,
+                      extended_by_s: 0, extended_total_s: ($x - $e), gave_up: true}'
+                exit 124
+            fi
+            jq -cn --arg t "$(date -Is)" --argjson w "$wake" --argjson s "$waited" \
+                --argjson e "$extend" --argjson x "$extended" \
+                '{type: "harness_usage_limit_wait", time: $t, wake: $w, waited_s: $s,
+                  extended_by_s: $e, extended_total_s: $x}'
             sleep $(( wake - $(date +%s) > 0 ? wake - $(date +%s) : 0 ))
             resume_args
             first="/goal $goal"
             second="The session stopped on the account's usage limit, which has now reset. Check the state of the optimization (vibesys-cli, git) and continue toward the goal; relaunch any workers that were stopped."
+            if [ "$extended" -gt 0 ] && [ -n "${LEAD_BUDGET_MINUTES:-}" ]; then
+                second="$second Operator steering note: budget: time $(( LEAD_BUDGET_MINUTES + (extended + 59) / 60 ))m. The harness has extended the run by $(( (extended + 59) / 60 )) min in all to make up for usage-limit waits, so measure this budget from the run's original start time, as before."
+            fi
         done
     fi
     prompt=$first
