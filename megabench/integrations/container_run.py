@@ -198,6 +198,15 @@ Rules:
   `reference/`.
 - Use the NeuronCores of this machine: {cores} logical NeuronCore(s) of one Trainium2 chip.
 """
+# Cases whose trusted inputs take minutes to build on the CPU (the Trainium grader builds them
+# there): Waypoint's 128-frame history cache is ~4 min per trial, so a 3-trial check and a
+# 5 x 3-trial measure need longer limits, and the benchmark times one trial per sample (the
+# check still runs three correctness trials).
+SLOW_CASE_LIMITS = {
+    "world-frame-step-waypoint15-1b-f128-trn2-nc1": {
+        "accuracy_timeout": 3000, "benchmark_timeout": 3000,
+        "benchmark_settings": {"trials": 1}},
+}
 BARE_EVALUATOR = '''\
 """The check and the benchmark of one MegaBench case, against a trusted benchmark.
 
@@ -251,8 +260,8 @@ def main():
     if args.output_json is None:
         parser.error("benchmark needs --output-json")
     # On Trainium the eager baseline is slow and the metric does not use it; grading times it.
-    result = evaluate_case(case, submission, device="cuda:0", **BENCHMARK_SETTINGS,
-                           neuron_baseline=False)
+    result = evaluate_case(case, submission, device="cuda:0",
+                           **dict(BENCHMARK_SETTINGS, **{bench_override}), neuron_baseline=False)
     stabilize(result, case, CASE, submission, None)
     output = summary(result)
     latency = kernel_latency_ms(result)
@@ -681,7 +690,9 @@ def bare_workspace(workspace: Path, case, trusted: Path, cores: str = "0") -> No
         raise SystemExit(f"no reference module named in {workspace}/reference/README.md")
     task = workspace / ".vibesys/tasks" / case.id
     task.mkdir(parents=True)
-    (task / "evaluate.py").write_text(BARE_EVALUATOR.format(trusted=str(trusted), case=case.id))
+    limits = SLOW_CASE_LIMITS.get(case.id, {})
+    (task / "evaluate.py").write_text(BARE_EVALUATOR.format(
+        trusted=str(trusted), case=case.id, bench_override=limits.get("benchmark_settings", {})))
     python = str(trusted / ".venv/bin/python")
     command = lambda mode: json.dumps(  # noqa: E731
         [python, f".vibesys/tasks/{case.id}/evaluate.py", mode, "--submission", "submission.py"])
@@ -690,8 +701,10 @@ def bare_workspace(workspace: Path, case, trusted: Path, cores: str = "0") -> No
         + ('backends = ["trainium"]\n\n[agent]\ndomain = "kernel-writing"\n\n' if neuron else
            'backends = ["cuda"]\n\n[agent]\ndomain = "kernel-writing"\n\n'
            '[environment]\nneeds = ["gpu"]\n\n') +
-        f"[accuracy]\ncommand = {command('accuracy')}\ntimeout_seconds = 1800\n\n"
-        f"[benchmark]\ncommand = {command('benchmark')}\ntimeout_seconds = 2400\n\n"
+        f"[accuracy]\ncommand = {command('accuracy')}\n"
+        f"timeout_seconds = {limits.get('accuracy_timeout', 1800)}\n\n"
+        f"[benchmark]\ncommand = {command('benchmark')}\n"
+        f"timeout_seconds = {limits.get('benchmark_timeout', 2400)}\n\n"
         '[benchmark.result]\njson_argument = "--output-json"\nmetric = "kernel_latency_ms"\n')
     # vibesys-cli 0.3.0 reads no `samples` (a measure takes 5, each a fresh evaluate process)
     # and takes the noise floor of a single objective only from [pareto].
