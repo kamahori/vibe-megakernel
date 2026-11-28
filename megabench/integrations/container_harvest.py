@@ -8,6 +8,8 @@ writes JSON. The tarballs are extracted later in a container without network.
     harvest.py review RUN DIR    static source review of an extracted snapshot (exit 1: fail)
     harvest.py budget RUN N      print this round's agent seconds (0: the budget is spent)
                                  and write RUN/control/round.json for ./time_left
+    harvest.py limit RUN N       if round N ended on a usage limit of the agent's account,
+                                 print "RESETS_AT KIND HIT_AT" (epoch seconds); else nothing
 
 The workspace's ./check_candidate tars the sources to WS/.harness/pending/<id>.tgz before
 the check and writes WS/reports/check-<id>.jsonl after it. A check passes when its record's
@@ -188,6 +190,53 @@ def budget(run: Path, number: int) -> int:
     return seconds if seconds >= 120 else 0
 
 
+def limit(run: Path, number: int) -> str:
+    """How round N's agent stopped on a usage limit, from its stream-json output.
+
+    Claude Code reports its account's rate limits as rate_limit_event lines
+    ({"rate_limit_info": {"status": "allowed" | "allowed_warning" | "rejected", "resetsAt": epoch,
+    "rateLimitType": "five_hour" | "seven_day" | ...}}). The round ended on a limit when the last
+    such event is a rejection, or when the last result is an error saying the limit was hit.
+    Prints "RESETS_AT KIND HIT_AT": when the limit lifts, which limit, and when the agent was first
+    refused (from the .times file), so that the time after it is not counted as the agent's."""
+    out = run / f"logs/agent-round-{number}.out"
+    if not out.is_file():
+        return ""
+    times_path = run / f"logs/agent-round-{number}.times"
+    times = times_path.read_text().split() if times_path.is_file() else []
+    last_event, last_result, hit_at = None, None, None
+    with out.open(errors="replace") as lines:
+        for i, line in enumerate(lines):
+            if '"rate_limit_event"' not in line and '"type":"result"' not in line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            at = float(times[i]) if i < len(times) else None
+            if record.get("type") == "rate_limit_event":
+                last_event = record.get("rate_limit_info") or {}
+                if last_event.get("status") == "rejected":
+                    hit_at = hit_at or at
+                else:
+                    hit_at = None
+            elif record.get("type") == "result":
+                last_result = record
+                if record.get("is_error") and re.search(r"hit your .*limit", str(record.get("result", ""))):
+                    hit_at = hit_at or at
+    rejected = last_event is not None and last_event.get("status") == "rejected"
+    said = (last_result is not None and last_result.get("is_error")
+            and re.search(r"hit your .*limit", str(last_result.get("result", ""))))
+    if not (rejected or said):
+        return ""
+    resets = int((last_event or {}).get("resetsAt") or 0) if rejected else 0
+    hit = int(hit_at or time.time())
+    if resets <= 0:  # unknown: try again an hour after the refusal
+        resets = hit + 3600
+    kind = (last_event or {}).get("rateLimitType") if rejected else None
+    return f"{resets} {kind or 'unknown'} {hit}"
+
+
 def main(argv: list[str]) -> int:
     action, run = argv[0], Path(argv[1]).resolve()
     if action == "harvest":
@@ -200,6 +249,8 @@ def main(argv: list[str]) -> int:
         return 1 if problems else 0
     elif action == "budget":
         print(budget(run, int(argv[2])))
+    elif action == "limit":
+        print(limit(run, int(argv[2])))
     else:
         raise SystemExit(f"unknown action {action}")
     return 0

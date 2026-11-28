@@ -1,0 +1,63 @@
+# Apptainer image for Claude Code agent sessions on MegaBench cases on AMD Instinct GPUs (ROCm),
+# and for grading their submissions: the ROCm counterpart of agent.Dockerfile, for clusters with
+# Apptainer and no Docker or Podman. Built (unprivileged, --fakeroot) by
+#   python -m megabench.integrations.container_run build-image --runtime apptainer --submit
+# from a build context that holds this file, requirements.lock and the host's `claude`.
+# Nothing from the repository is copied in: the trusted benchmark and the workspace are
+# bound at run time. BASE is a local .sif of the rocm/pytorch image (build-image pulls it).
+
+Bootstrap: localimage
+From: {BASE}
+
+%files
+    claude /usr/local/bin/claude
+    requirements.lock /opt/requirements.lock
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    for attempt in 1 2 3 4 5; do
+        if apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+            git ripgrep tmux curl ca-certificates jq less procps file unzip ninja-build; then
+            break
+        fi
+        [ "$attempt" -lt 5 ]; sleep $((attempt * 5))
+    done
+    rm -rf /var/lib/apt/lists/*
+
+    # The interpreter that has the image's ROCm torch, reached as /opt/venv/bin/python (the
+    # path the harness uses for the trusted snapshot's interpreter).
+    PY=$(for p in /opt/venv/bin/python3 /opt/conda/bin/python3 /usr/bin/python3.12 /usr/bin/python3; do
+             [ -x "$p" ] && "$p" -c 'import torch' 2>/dev/null && { echo "$p"; break; }; done)
+    [ -n "$PY" ]
+    if [ ! -x /opt/venv/bin/python ]; then
+        mkdir -p /opt/venv/bin
+        for name in python python3 python3.12; do ln -sf "$PY" "/opt/venv/bin/$name"; done
+    fi
+    # The harness's pure-Python requirements; never the CUDA wheels, and never a torch or
+    # triton other than the image's own ROCm builds.
+    "$PY" -c 'import torch, triton; print(f"torch=={torch.__version__}\ntriton=={triton.__version__}")' \
+        > /opt/constraints.txt || "$PY" -c 'import torch; print(f"torch=={torch.__version__}")' > /opt/constraints.txt
+    grep -vE '^(nvidia-|cuda-|torch==|triton==|bitsandbytes==|apache-tvm|kernels==|numpy==|ml-dtypes==)' \
+        /opt/requirements.lock | sed 's/ *\\$//; s/ *--hash.*//' | grep -E '^[A-Za-z0-9]' > /opt/requirements-rocm.txt
+    # The lock is a complete pinned closure, so --no-deps: pip never resolves against (or
+    # replaces) the image's ROCm torch, whose local version a constraint cannot match.
+    "$PY" -m pip install --no-cache-dir --no-deps -r /opt/requirements-rocm.txt
+    "$PY" -m pip check || true
+    cat /opt/constraints.txt
+    "$PY" -c 'import torch, transformers; print("torch", torch.__version__, "hip", torch.version.hip, "transformers", transformers.__version__)'
+
+    chmod 755 /usr/local/bin/claude
+    claude --version
+    for tool in hipcc rocprofv3 rocminfo amd-smi rocm-smi; do
+        command -v "$tool" || ls /opt/rocm/bin/"$tool"
+    done
+
+%environment
+    export PATH=/opt/venv/bin:/opt/rocm/bin:$PATH
+    export ROCM_PATH=/opt/rocm
+    export DISABLE_AUTOUPDATER=1
+    export LANG=C.UTF-8
+
+%runscript
+    exec "$@"

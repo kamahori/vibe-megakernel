@@ -8,6 +8,9 @@ ACTION=${1:-round}
 ROUND=${ROUND:-1}
 cd "$WS"
 NET_MODE=${NET_MODE:-proxy}
+GPU_VENDOR=${GPU_VENDOR:-nvidia}
+# The VibeSys kernel-domain plugin for this GPU vendor (vibesys-kernels-rocm on AMD).
+KERNELS_PLUGIN=${VIBESYS_KERNELS_PLUGIN:-vibesys-kernels-cuda}
 if [ -n "${EGRESS_SOCKET:-}" ]; then
     # The proxy's socket (outside this container) as 127.0.0.1:3128, this container's only way out.
     python3.12 "$CONTROL/egress_proxy.py" forward --unix "$EGRESS_SOCKET" --port 3128 &
@@ -22,10 +25,20 @@ fi
 vibesys_setup() {
     export PATH="$HOME/.local/bin:$PATH" VIBESYS_CLI="$HOME/.local/bin/vibesys-cli"
     if [ ! -d "$HOME/.claude/plugins/marketplaces/vibesys" ]; then
-        claude plugin marketplace add "$VIBESYS_PLUGIN_SOURCE" || return 1
+        # GitHub clones here sometimes stall; retry before giving up.
+        local attempt
+        for attempt in 1 2 3; do
+            claude plugin marketplace add "$VIBESYS_PLUGIN_SOURCE" && break
+            [ "$attempt" = 3 ] && return 1
+            rm -rf "$HOME/.claude/plugins/marketplaces/"temp_git_* 2>/dev/null; sleep $((attempt * 30))
+        done
     fi
     claude plugin install vibesys@vibesys || return 1
-    claude plugin install vibesys-kernels-cuda@vibesys || return 1
+    claude plugin install "$KERNELS_PLUGIN@vibesys" || return 1
+    if [ ! -x "$VIBESYS_CLI" ] && [ -x "${CONTROL:-/nonexistent}/vibesys-cli" ]; then
+        # A build from the plugin's branch (prepare --vibesys-cli-binary), not a release.
+        mkdir -p "$HOME/.local/bin" && cp "$CONTROL/vibesys-cli" "$VIBESYS_CLI" || return 1
+    fi
     if [ ! -x "$VIBESYS_CLI" ]; then
         curl -fsSL https://raw.githubusercontent.com/uw-syfi/vibesys/main/cli/install.sh \
             | VIBESYS_CLI_VERSION="$VIBESYS_CLI_VERSION" VIBESYS_CLI_INSTALL_DIR="$HOME/.local/bin" sh \
@@ -51,11 +64,19 @@ if [ "$ACTION" = smoke ]; then
     else ok "trusted snapshot is read-only"; fi
     if touch "$WS/.smoke" 2>/dev/null; then rm -f "$WS/.smoke"; ok "workspace is writable"
     else bad "workspace is not writable"; fi
-    if [ -n "$(ls -A /scratch/hf 2>/dev/null)" ]; then bad "/scratch/hf is not empty"
-    else ok "/scratch/hf is empty"; fi
-    gpus=$(nvidia-smi -L 2>/dev/null | wc -l)
-    if [ "$gpus" = "$EXPECT_GPUS" ]; then ok "nvidia-smi sees $gpus GPU(s), as the job"
-    else bad "nvidia-smi sees $gpus GPU(s), the job has $EXPECT_GPUS"; fi
+    if [ "$GPU_VENDOR" = amd ]; then
+        gpus=$(rocminfo 2>/dev/null | grep -cE '^\s*Name:\s+gfx')
+        if [ "$gpus" = "$EXPECT_GPUS" ]; then ok "rocminfo sees $gpus GPU agent(s), as the node"
+        else bad "rocminfo sees $gpus GPU agent(s), the node has $EXPECT_GPUS"; fi
+        if [ -r /sys/module/amdgpu/version ]; then ok "amdgpu driver $(cat /sys/module/amdgpu/version) (vibesys-cli reads it)"
+        else bad "/sys/module/amdgpu/version is not readable (vibesys-cli needs it)"; fi
+    else
+        if [ -n "$(ls -A /scratch/hf 2>/dev/null)" ]; then bad "/scratch/hf is not empty"
+        else ok "/scratch/hf is empty"; fi
+        gpus=$(nvidia-smi -L 2>/dev/null | wc -l)
+        if [ "$gpus" = "$EXPECT_GPUS" ]; then ok "nvidia-smi sees $gpus GPU(s), as the job"
+        else bad "nvidia-smi sees $gpus GPU(s), the job has $EXPECT_GPUS"; fi
+    fi
     torch_gpus=$(python -c 'import torch; print(torch.cuda.device_count())' 2>/dev/null)
     if [ "$torch_gpus" = "$EXPECT_GPUS" ]; then ok "torch sees $torch_gpus GPU(s)"
     else bad "torch sees ${torch_gpus:-no} GPU(s), the job has $EXPECT_GPUS"; fi
@@ -86,8 +107,15 @@ if [ "$ACTION" = smoke ]; then
             else bad "the proxy cannot reach $host"; fi
         done
     fi
+    if [ "$GPU_VENDOR" = amd ]; then
+        # rocprofv3 must trace a kernel dispatch, not only start.
+        if out=$(cd /tmp && rocprofv3 --kernel-trace --stats --output-format csv -d /tmp/rocprof-smoke -o smoke -- \
+                python -c 'import torch; torch.ones(1 << 20, device="cuda").sum().item()' 2>&1) \
+                && find /tmp/rocprof-smoke -name '*kernel_stats.csv' | grep -q .; then
+            ok "rocprofv3 traces kernels: $(find /tmp/rocprof-smoke -name '*kernel_stats.csv' -exec sed -n 2p {} \; | head -n 1 | cut -c1-120)"
+        else bad "rocprofv3 cannot trace: $(tail -n 3 <<< "$out" | tr '\n' ' ' | cut -c1-300)"; fi
     # Nsight Compute must be able to read the GPU's counters, not only start.
-    if out=$(cd /tmp && ncu --target-processes all -c 1 --metrics gpu__time_duration.sum \
+    elif out=$(cd /tmp && ncu --target-processes all -c 1 --metrics gpu__time_duration.sum \
             python -c 'import torch; torch.ones(1 << 20, device="cuda").sum().item()' 2>&1) \
             && grep -q gpu__time_duration <<< "$out"; then
         ok "ncu profiles a kernel: $(grep -m1 gpu__time_duration <<< "$out" | tr -s ' ')"
@@ -96,6 +124,8 @@ if [ "$ACTION" = smoke ]; then
         # In a scratch HOME, so the run's own HOME starts clean for round 1.
         real_home=$HOME
         HOME=$(mktemp -d)
+        # vibesys_setup runs in a $(...) subshell below, so its exports do not reach this shell.
+        export PATH="$HOME/.local/bin:$PATH" VIBESYS_CLI="$HOME/.local/bin/vibesys-cli"
         cp -a "$real_home/.claude" "$real_home/.claude.json" "$real_home/.config" "$HOME/" 2>/dev/null
         # vibesys_setup runs in a subshell here, so its exports do not reach this shell.
         export PATH="$HOME/.local/bin:$PATH" VIBESYS_CLI="$HOME/.local/bin/vibesys-cli"
@@ -104,7 +134,7 @@ if [ "$ACTION" = smoke ]; then
         skill=$(find "$HOME/.claude/plugins/cache" -path '*vibesys/*/optimize/references/megakernel-divide-and-conquer.md' | head -n 1)
         if [ -n "$skill" ]; then ok "plugin has the megakernel divide-and-conquer mode"
         else bad "the installed plugin has no megakernel divide-and-conquer mode"; fi
-        if claude plugin list 2>/dev/null | grep -q 'vibesys-kernels-cuda'; then ok "plugins listed: $(claude plugin list 2>/dev/null | grep -c '@vibesys') from vibesys"
+        if claude plugin list 2>/dev/null | grep -q "$KERNELS_PLUGIN"; then ok "plugins listed: $(claude plugin list 2>/dev/null | grep -c '@vibesys') from vibesys"
         else bad "claude plugin list does not show the plugins"; fi
         if out=$("$VIBESYS_CLI" daemon ensure 2>&1); then ok "vibesys daemon: $(head -n 1 <<< "$out")"
         else bad "vibesys daemon does not start: $out"; fi
@@ -130,14 +160,29 @@ PY
         "$VIBESYS_CLI" daemon stop >/dev/null 2>&1
         HOME=$real_home
     fi
+    if mkdir -p /run/lock/vibesys-leases 2>/dev/null && touch /run/lock/vibesys-leases/.probe 2>/dev/null; then
+        ok "writable lease directory /run/lock/vibesys-leases"; rm -f /run/lock/vibesys-leases/.probe
+    else bad "/run/lock is not writable (vibesys-cli leases would fail)"; fi
     if tmux -V >/dev/null 2>&1; then ok "tmux: $(tmux -V)"; else bad "tmux does not run"; fi
-    for tool in claude codex opencode nvcc ncu git; do
+    if [ "$GPU_VENDOR" = amd ]; then tools="claude hipcc rocprofv3 git"; else tools="claude codex opencode nvcc ncu git"; fi
+    for tool in $tools; do
         if version=$("$tool" --version 2>&1 | tail -n 1); then ok "$tool: $version"
         else bad "$tool does not run"; fi
     done
     echo "user: $(id)"
     if [ "$fail" = 0 ]; then echo "SMOKE PASS"; else echo "SMOKE FAIL"; fi
     exit 0
+fi
+
+# An expired login (the round's copy of the credentials has no refresh token) is a failed
+# setup, not the end of the session: exit 5 so that the campaign tries the round again.
+creds=$HOME/.claude/.credentials.json
+if [ "$AGENT" = claude ] && [ -f "$creds" ]; then
+    expires=$(jq -r '.claudeAiOauth.expiresAt // 0' "$creds" 2>/dev/null || echo 0)
+    if [ $(( ${expires%%.*} / 1000 - $(date +%s) )) -lt 300 ]; then
+        echo "the login's access token has expired (or expires within 5 minutes); not starting" >&2
+        exit 5
+    fi
 fi
 
 if [ -n "${VIBESYS_PLUGIN_SOURCE:-}" ]; then
@@ -149,6 +194,25 @@ goal=$(<"$CONTROL/goal.txt")
 kickoff=$(<"$CONTROL/kickoff.txt")
 resume=$(<"$CONTROL/resume.txt")
 if [ "$ROUND" -gt 1 ]; then second=$resume; else second=$kickoff; fi
+# A VibeSys lead keeps its --budget time by the clock from the run's start, but time the session
+# spent paused (waiting for GPUs, or for a usage limit of the account to lift) is not the agent's:
+# on resume, an operator steering note moves the end of the budget by what the agent has used.
+lead=$(grep -o -- '--budget time [0-9]*m' "$CONTROL/kickoff.txt" | grep -o '[0-9]*' || true)
+if [ "$ROUND" -gt 1 ] && [ -n "$lead" ] && [ -r "$CONTROL/round.json" ]; then
+    used=$(jq -r '.used_seconds_before' "$CONTROL/round.json")
+    left=$(( lead * 60 - used ))
+    [ "$left" -lt 60 ] && left=60
+    ends=$(date -d "@$(( $(date +%s) + left ))" '+%Y-%m-%d %H:%M %Z')
+    second="$second The session was paused since its last message; that time does not count. \
+Operator steering note: budget: time $(( (used + left) / 60 ))m of working time, of which \
+$(( used / 60 ))m is used, so the budget now ends at $ends ($(( left / 60 )) minutes from now). \
+Record this in the next phase map version; background workers that were running when the \
+session paused were stopped, so check their worktrees and plans before relaunching them."
+fi
+# A note of the operator for this run (control/operator-note.txt), added on resume as it is.
+if [ "$ROUND" -gt 1 ] && [ -s "$CONTROL/operator-note.txt" ]; then
+    second="$second $(<"$CONTROL/operator-note.txt")"
+fi
 if [ "$AGENT" = opencode ]; then
     # No /goal in opencode: the goal goes in the prompt; with GOAL_STYLE=command the loop
     # below re-prompts until the agent says GOAL MET.
@@ -210,11 +274,50 @@ if [ "$MODE" = headless ]; then
         [ -n "$MODEL" ] && args+=(--model "$MODEL")
         [ -n "$EFFORT" ] && args+=(--effort "$EFFORT")
         [ "$ROUND" -gt 1 ] && args+=(--continue)
-        {
-            json_message "$first"
-            [ -n "$second" ] && json_message "$second"
-        } | timeout --signal=INT --kill-after=120 "$AGENT_SECONDS" claude "${args[@]}"
-        exit $?
+        # claude -p also exits when only background shells are left (it does not wait on
+        # those), ending a run early. With GOAL_STYLE=command, resume the session with the goal
+        # check until the agent says GOAL MET, the time runs out, or it stops at once 3 times
+        # (as kamahori/vibe-megakernel 5a57d04). A usage limit is not waited out here: the job
+        # would hold the node idle; the round ends and the campaign resubmits after the reset.
+        deadline=$(( $(date +%s) + AGENT_SECONDS ))
+        last=/tmp/claude-last.jsonl
+        quick=0
+        while :; do
+            began=$(date +%s)
+            left=$(( deadline - began ))
+            [ "$left" -le 60 ] && exit 124
+            {
+                json_message "$first"
+                [ -n "$second" ] && json_message "$second"
+            } | timeout --signal=INT --kill-after=120 "$left" claude "${args[@]}" | tee "$last"
+            rc=${PIPESTATUS[1]}
+            [ "$rc" -eq 124 ] && exit 124
+            # The login expired or was refused: a failed setup (5), so the session goes on in
+            # a later round instead of ending here.
+            if [ "$rc" -ne 0 ] && jq -rs 'map(select(.type == "result")) | last | .result // ""' \
+                    "$last" 2>/dev/null | grep -qiE 'authenticat|oauth|api key|401|/login'; then
+                echo "the login was refused (its access token has expired?); a later round resumes" >&2
+                echo "access token has expired or was refused" >&2
+                exit 5
+            fi
+            [ "$GOAL_STYLE" = command ] && [ "$rc" -eq 0 ] || exit "$rc"
+            jq -e 'select(.type == "rate_limit_event" and .rate_limit_info.status == "rejected")' \
+                "$last" >/dev/null 2>&1 && exit 75
+            # Near the end of this round: let a later round resume (124). The campaign ends the
+            # run when its whole budget is spent, not when one round's time is.
+            [ $(( deadline - $(date +%s) )) -gt 900 ] || exit 124
+            jq -rs 'map(select(.type == "result")) | last | .result // ""' "$last" \
+                2>/dev/null | tail -n 5 | grep -q 'GOAL MET' && exit 0
+            if [ $(( $(date +%s) - began )) -lt 60 ]; then quick=$((quick + 1)); else quick=0; fi
+            [ "$quick" -ge 3 ] && exit 0
+            jq -cn --arg t "$(date -Is)" '{type: "harness_goal_reprompt", time: $t}'
+            args=(-p --dangerously-skip-permissions --verbose --continue
+                  --input-format stream-json --output-format stream-json)
+            [ -n "$MODEL" ] && args+=(--model "$MODEL")
+            [ -n "$EFFORT" ] && args+=(--effort "$EFFORT")
+            first="/goal $goal"
+            second=$(<"$CONTROL/goal_check.txt")
+        done
     fi
     prompt=$first
     [ -n "$second" ] && prompt="$first $second"

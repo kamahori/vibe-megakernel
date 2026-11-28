@@ -84,9 +84,13 @@ CREDENTIAL_ENV = {
     "anthropic-api-key": "ANTHROPIC_API_KEY",
     "openai-api-key": "OPENAI_API_KEY",
     "codex-auth-json": None,  # copied to $HOME/.codex/auth.json at round start
+    # Claude Code's ~/.claude/.credentials.json, copied (without its refresh token) into the
+    # run's HOME at round start and removed when the agent exits. Apptainer runtime only.
+    "claude-credentials-json": None,
     "coralbricks-api-key": OPENCODE_PROVIDERS["coralbricks"]["env"],
 }
 CREDENTIAL_AGENT = {"claude-oauth-token": "claude", "anthropic-api-key": "claude",
+                    "claude-credentials-json": "claude",
                     "openai-api-key": "codex", "codex-auth-json": "codex",
                     "coralbricks-api-key": "opencode"}
 CREDENTIAL_PROVIDER = {"coralbricks-api-key": "coralbricks"}
@@ -117,12 +121,41 @@ RESUME = ("You are resuming an earlier session on this task in a new time slot. 
 # benchmark. No tool, skill or note of this repository's method stays in it, and its git
 # history starts after they are gone.
 BARE_KEEP = ("TASK.md", "case.json", "submission.py", "reference")
+# The GPU the runs get: the machine paragraph of a bare workspace's TASK.md, the short name in
+# OBJECTIVE.md, the VibeSys backend and kernels plugin, and the vibesys-cli resource table.
+PLATFORMS = {
+    "b200": {
+        "vendor": "nvidia", "backend": "cuda", "short": "B200", "plugin": "vibesys-kernels-cuda",
+        "cli_resource": "gpu", "amd_gpu": None,
+        "machine": "The machine has {gpus} NVIDIA B200 GPU(s) (sm_100a),\nCUDA 13 with `nvcc` and "
+                   "Nsight Compute (`ncu`), and PyTorch in the default Python.",
+    },
+    "mi300x": {
+        "vendor": "amd", "backend": "rocm", "short": "MI300X", "plugin": "vibesys-kernels-rocm",
+        "cli_resource": "rocm", "amd_gpu": "mi300x",
+        "machine": "The machine has {gpus} AMD Instinct MI300X GPU(s) (gfx942; CDNA3: 304 CUs in 8\n"
+                   "XCDs, 64-wide wavefronts, 64 KiB LDS per CU, 256 MB Infinity Cache, 5.3 TB/s HBM3, "
+                   "192 GB),\nROCm 7.1 with `hipcc`, `hiprtc`, Triton and `rocprofv3`, and the ROCm "
+                   "build of PyTorch in the\ndefault Python: `torch.cuda` and `cuda:0` address the HIP "
+                   "device, and\n`torch.utils.cpp_extension` compiles `.cu` sources with hipcc. Compile "
+                   "kernels with\n`--offload-arch=gfx942`. There is no CUDA toolkit, `nvcc` or Nsight.",
+    },
+    "mi350x": {
+        "vendor": "amd", "backend": "rocm", "short": "MI350X", "plugin": "vibesys-kernels-rocm",
+        "cli_resource": "rocm", "amd_gpu": "mi350x",
+        "machine": "The machine has {gpus} AMD Instinct MI350X GPU(s) (gfx950; CDNA4: 256 CUs in 8\n"
+                   "XCDs, 64-wide wavefronts, 160 KiB LDS per CU, 256 MB Infinity Cache, 8 TB/s HBM3E, "
+                   "288 GB),\nROCm 7.1 with `hipcc`, `hiprtc`, Triton and `rocprofv3`, and the ROCm "
+                   "build of PyTorch in the\ndefault Python: `torch.cuda` and `cuda:0` address the HIP "
+                   "device, and\n`torch.utils.cpp_extension` compiles `.cu` sources with hipcc. Compile "
+                   "kernels with\n`--offload-arch=gfx950`. There is no CUDA toolkit, `nvcc` or Nsight.",
+    },
+}
 BARE_TASK_TAIL = """\
 This repository is a VibeSys task: `.vibesys/tasks/{case}/` holds its check (the outputs
 against the PyTorch reference, on fresh inputs, and the launch budget) and its benchmark (the
 step's kernel latency in milliseconds, lower is better). Both load a trusted, read-only copy of
-the benchmark outside this repository. The machine has {gpus} NVIDIA B200 GPU(s) (sm_100a),
-CUDA 13 with `nvcc` and Nsight Compute (`ncu`), and PyTorch in the default Python.
+the benchmark outside this repository. {machine}
 
 After the session a separate trusted evaluation grades `submission.py` as it stands at the head
 of the branch `vibesys/result/{case}`.
@@ -148,7 +181,7 @@ Rules:
   step over the budget.
 - Edit only `submission.py` and files you add. Never edit `.vibesys/`, `case.json` or
   `reference/`.
-- Use the GPU(s) of this machine: {gpus} B200.
+- Use the GPU(s) of this machine: {gpus} {gpu_short}.
 """
 BARE_EVALUATOR = '''\
 """The check and the benchmark of one MegaBench case, against a trusted benchmark.
@@ -223,7 +256,7 @@ version = "0.2"
 
 [placements.local]
 kind = "local"
-[placements.local.resources.gpu]
+[placements.local.resources.{resource}]
 count = {gpus}
 """
 VIBESYS_KICKOFF = ("/vibesys:optimize {case} --megakernel-divide-and-conquer "
@@ -315,7 +348,66 @@ def stage_context(context: Path) -> str:
     return tag
 
 
+ROCM_BASE_IMAGE = "docker://rocm/pytorch:rocm7.1.1_ubuntu24.04_py3.12_pytorch_release_2.10.0"
+
+
+def build_image_apptainer(args: argparse.Namespace) -> int:
+    """Build the ROCm agent image as a .sif with unprivileged Apptainer (--fakeroot)."""
+    claude = shutil.which("claude")
+    if not claude:
+        raise SystemExit("claude is not on PATH")
+    context = args.context.resolve()
+    if context.exists():
+        shutil.rmtree(context)
+    context.mkdir(parents=True)
+    shutil.copy2(DOCKER_DIR / "requirements.lock", context / "requirements.lock")
+    shutil.copy2(Path(claude).resolve(), context / "claude")
+    base = args.base_sif.resolve() if args.base_sif else context.parent / "rocm-pytorch-base.sif"
+    definition = (DOCKER_DIR / "agent-rocm.def").read_text().replace("{BASE}", str(base))
+    (context / "agent-rocm.def").write_text(definition)
+    digest = hashlib.sha256(args.base_image.encode())
+    for name in ("agent-rocm.def", "requirements.lock", "claude"):
+        digest.update((context / name).read_bytes())
+    image = context.parent / f"megabench-agent-rocm-{digest.hexdigest()[:12]}.sif"
+    (context / "IMAGE").write_text(f"{image}\n")
+    script = context / "build.sbatch"
+    script.write_text(
+        "#!/bin/bash\nset -euo pipefail\n"
+        f"cd {shlex.quote(str(context))}\n"
+        f"if [ -s {shlex.quote(str(image))} ]; then echo 'image exists: {image}'; exit 0; fi\n"
+        "# Unpack beside the image: a node's /tmp is too small for the image's layers.\n"
+        f'export APPTAINER_TMPDIR={shlex.quote(str(context))}/tmp-$SLURM_JOB_ID\n'
+        'mkdir -p "$APPTAINER_TMPDIR"; trap \'rm -rf "$APPTAINER_TMPDIR"\' EXIT\n'
+        f"[ -s {shlex.quote(str(base))} ] || apptainer pull {shlex.quote(str(base))} {args.base_image}\n"
+        f"apptainer build --fakeroot {shlex.quote(str(image))}.tmp agent-rocm.def\n"
+        f"mv {shlex.quote(str(image))}.tmp {shlex.quote(str(image))}\n"
+        f"apptainer exec {shlex.quote(str(image))} bash -c 'python -c \"import torch; "
+        "print(torch.__version__, torch.version.hip)\"; claude --version; hipcc --version | head -n 2; "
+        "rocprofv3 --version 2>&1 | head -n 2'\n"
+        f"echo 'built {image}'\n")
+    script.chmod(0o755)
+    command = ["sbatch", "--parsable", f"--partition={args.partition}", "-N", "1", "-n", "1",
+               f"--time={args.time}", "--job-name=megabench-agent-image",
+               f"--output={context}/build-%j.out", *_slurm_account(args), str(script)]
+    print(f"image: {image}\ncontext: {context}")
+    if not args.submit:
+        print("submit the build:\n  " + shlex.join(command))
+        return 0
+    job = subprocess.run(command, check=True, capture_output=True, text=True).stdout.strip()
+    print(f"build job {job.split(';')[0]}; log: {context}/build-{job.split(';')[0]}.out")
+    return 0
+
+
+def _slurm_account(args) -> list[str]:
+    """--account / --qos for clusters that charge an allocation per job."""
+    get = args.get if isinstance(args, dict) else lambda k: getattr(args, k, None)
+    return ([f"--account={get('account')}"] if get("account") else []) + (
+        [f"--qos={get('qos')}"] if get("qos") else [])
+
+
 def build_image(args: argparse.Namespace) -> int:
+    if args.runtime == "apptainer":
+        return build_image_apptainer(args)
     context = args.context.resolve()
     tag = stage_context(context)
     script = context / "build.sbatch"
@@ -419,8 +511,23 @@ def prepare(args: argparse.Namespace) -> int:
     case = select_cases("all", [args.case])[0]
     if not case.ready:
         raise SystemExit(f"{args.case} is not ready")
-    if args.partition in ("main", "priority", "background"):
-        limit = {"main": 7200, "background": 7200, "priority": 1800}[args.partition]
+    platform = PLATFORMS[args.gpu]
+    if args.runtime == "apptainer":
+        if platform["vendor"] != "amd":
+            raise SystemExit("--runtime apptainer runs AMD GPUs only (--gpu mi300x or mi350x)")
+        if args.credential_kind != "claude-credentials-json":
+            raise SystemExit("--runtime apptainer takes --credential-kind claude-credentials-json")
+        if args.network != "open":
+            raise SystemExit("--runtime apptainer supports --network open only")
+        if not args.image.endswith(".sif") or not Path(args.image).is_file():
+            raise SystemExit(f"--image {args.image}: not a .sif file (see build-image --runtime apptainer)")
+        args.image = str(Path(args.image).resolve())
+    elif args.credential_kind == "claude-credentials-json":
+        raise SystemExit("--credential-kind claude-credentials-json is for --runtime apptainer")
+    limits = {"main": 7200, "background": 7200, "priority": 1800, "devel": 1800,
+              "mi3001x": 14400, "mi3501x": 14400, "mi2101x": 43200}
+    if args.partition in limits:
+        limit = limits[args.partition]
         if round_seconds(args) > limit:
             raise SystemExit(f"a round needs {slurm_time(round_seconds(args))}, over the "
                              f"{args.partition} limit; lower --agent-minutes or --grade-minutes")
@@ -447,8 +554,16 @@ def prepare(args: argparse.Namespace) -> int:
     workspace = run / "work" / args.case if args.bare else run / args.case
     command = [str(run / "trusted/.venv/bin/python"), "-m",
                "megabench.integrations.make_agent_workspace", "--case", args.case,
-               "--output", str(workspace), "--agent", "plain", "--backend", "cuda",
+               "--output", str(workspace), "--agent", "plain", "--backend", platform["backend"],
                "--benchmark-root", str(run / "trusted")]
+    if platform["amd_gpu"]:
+        command += ["--gpu", platform["amd_gpu"]]
+    if args.runtime == "apptainer":
+        # The workspace builder imports torch: run it in the image (its interpreter is the
+        # trusted snapshot's .venv there), with only the run directory bound.
+        command = ["apptainer", "exec", "--cleanenv", "--containall", "--no-mount", "hostfs,cwd",
+                   "--bind", f"{run}:{run}", "--pwd", str(run / "trusted"),
+                   "--env", f"PYTHONPATH={run / 'trusted'}", args.image, *command]
     if args.regimes:
         command += ["--regimes", str(args.regimes.resolve())]
         # Grading reads this copy: the workspace's regimes.json is the agent's to edit.
@@ -460,7 +575,7 @@ def prepare(args: argparse.Namespace) -> int:
         if args.overlay or args.remove or args.regimes:
             raise SystemExit("--bare takes no --overlay, --remove or --regimes")
         args.snapshot_checks = False
-        bare_workspace(workspace, case, run / "trusted")
+        bare_workspace(workspace, case, run / "trusted", platform)
     else:
         customize_workspace(workspace, run / "control", args.overlay, args.snapshot_checks,
                             args.remove)
@@ -477,7 +592,8 @@ def prepare(args: argparse.Namespace) -> int:
         (home / ".claude.json").write_text(json.dumps(state, indent=2) + "\n")
         if args.vibesys_plugin:
             (home / ".config/vibesys").mkdir(parents=True)
-            (home / ".config/vibesys/cli.toml").write_text(VIBESYS_CLI_TOML.format(gpus=case.gpus))
+            (home / ".config/vibesys/cli.toml").write_text(
+                VIBESYS_CLI_TOML.format(gpus=case.gpus, resource=platform["cli_resource"]))
     elif args.agent == "codex":
         (home / ".codex").mkdir(parents=True)
         (home / ".codex/config.toml").write_text(codex_config(workspace, model, args.effort))
@@ -498,6 +614,9 @@ def prepare(args: argparse.Namespace) -> int:
         kickoff = args.kickoff_file.read_text() if args.kickoff_file else KICKOFF
     goal = " ".join(args.goal.split())  # one line: the TUI submits on Enter
     (run / "control/goal.txt").write_text(goal + "\n")
+    if args.vibesys_cli_binary:
+        shutil.copy2(args.vibesys_cli_binary, run / "control/vibesys-cli")
+        (run / "control/vibesys-cli").chmod(0o755)
     (run / "control/kickoff.txt").write_text(" ".join(kickoff.format(minutes=budget).split()) + "\n")
     (run / "control/resume.txt").write_text(RESUME + "\n")
     (run / "control/goal_check.txt").write_text(GOAL_CHECK.format(goal=goal) + "\n")
@@ -515,7 +634,9 @@ def prepare(args: argparse.Namespace) -> int:
         "ref": args.ref,
         "ref_commit": subprocess.run(["git", "-C", str(REPO), "rev-parse", args.ref],
                                      capture_output=True, text=True).stdout.strip(),
-        "gpus": case.gpus, "partition": args.partition, "rounds": args.rounds,
+        "gpus": case.gpus, "gpu": args.gpu, "runtime": args.runtime,
+        "account": args.account, "qos": args.qos,
+        "partition": args.partition, "rounds": args.rounds,
         "agent_minutes": args.agent_minutes, "grade_minutes": args.grade_minutes,
         "idle_minutes": args.idle_minutes, "allow_hosts": allow, "method": method,
         "session_id": f"{method}-{args.case}-{run.name}", "credential_kind": args.credential_kind,
@@ -528,6 +649,7 @@ def prepare(args: argparse.Namespace) -> int:
         "goal": goal, "snapshot_checks": args.snapshot_checks,
         "bare": args.bare, "network": args.network, "web_tools": args.web_tools,
         "vibesys_plugin": args.vibesys_plugin, "vibesys_cli_version": args.vibesys_cli_version,
+        "vibesys_cli_binary": str(args.vibesys_cli_binary.resolve()) if args.vibesys_cli_binary else None,
         "result_branch": f"vibesys/result/{args.case}" if args.vibesys_plugin else None,
     }
     (run / "config.json").write_text(json.dumps(config, indent=2) + "\n")
@@ -547,9 +669,12 @@ def prepare(args: argparse.Namespace) -> int:
         "NET_MODE": args.network, "VIBESYS_PLUGIN_SOURCE": args.vibesys_plugin or "",
         "VIBESYS_CLI_VERSION": args.vibesys_cli_version,
         "RESULT_BRANCH": config["result_branch"] or "",
+        "VIBESYS_KERNELS_PLUGIN": platform["plugin"], "GPU_VENDOR": platform["vendor"],
     }
     (run / "run.env").write_text("".join(f"{k}={shlex.quote(str(v))}\n" for k, v in env.items()))
-    shutil.copy2(Path(__file__).with_name("container_round.sh"), run / "round.sh")
+    round_script = ("container_round_apptainer.sh" if args.runtime == "apptainer"
+                    else "container_round.sh")
+    shutil.copy2(Path(__file__).with_name(round_script), run / "round.sh")
     (run / "round.sh").chmod(0o755)
     print(f"prepared {run}\n"
           f"  workspace: {workspace}\n  image: {args.image}\n"
@@ -561,7 +686,7 @@ def prepare(args: argparse.Namespace) -> int:
     return 0
 
 
-def bare_workspace(workspace: Path, case, trusted: Path) -> None:
+def bare_workspace(workspace: Path, case, trusted: Path, platform: dict = PLATFORMS["b200"]) -> None:
     """Strip the stock workspace to the case's contract and make it a VibeSys task.
 
     Keeps TASK.md's contract paragraphs (not its tools), case.json, the submission stub and
@@ -574,7 +699,8 @@ def bare_workspace(workspace: Path, case, trusted: Path) -> None:
         shutil.rmtree(entry) if entry.is_dir() and not entry.is_symlink() else entry.unlink()
     task_md = workspace / "TASK.md"
     contract = task_md.read_text().split("\nUse `./check_candidate`")[0].rstrip()
-    task_md.write_text(contract + "\n\n" + BARE_TASK_TAIL.format(case=case.id, gpus=case.gpus))
+    machine = platform["machine"].format(gpus=case.gpus)
+    task_md.write_text(contract + "\n\n" + BARE_TASK_TAIL.format(case=case.id, machine=machine))
     (workspace / ".gitignore").write_text(BARE_GITIGNORE)
     reference = sorted((workspace / "reference/megabench/tasks").glob("*.py"))
     readme = (workspace / "reference/README.md").read_text()
@@ -588,7 +714,7 @@ def bare_workspace(workspace: Path, case, trusted: Path) -> None:
     command = lambda mode: json.dumps(  # noqa: E731
         [python, f".vibesys/tasks/{case.id}/evaluate.py", mode, "--submission", "submission.py"])
     (task / "vibesys.input.toml").write_text(
-        'version = "0.1"\nbackends = ["cuda"]\n\n[agent]\ndomain = "kernel-writing"\n\n'
+        f'version = "0.1"\nbackends = ["{platform["backend"]}"]\n\n[agent]\ndomain = "kernel-writing"\n\n'
         '[environment]\nneeds = ["gpu"]\n\n'
         f"[accuracy]\ncommand = {command('accuracy')}\ntimeout_seconds = 1800\n\n"
         f"[benchmark]\ncommand = {command('benchmark')}\ntimeout_seconds = 2400\n\n"
@@ -601,7 +727,7 @@ def bare_workspace(workspace: Path, case, trusted: Path) -> None:
         "[pareto]\nrelative_noise = 0.01\n")
     (task / "OBJECTIVE.md").write_text(BARE_OBJECTIVE.format(
         case=case.id, model=case.model, phase=case.phase, module=module,
-        launches=case.max_gpu_launches, gpus=case.gpus))
+        launches=case.max_gpu_launches, gpus=case.gpus, gpu_short=platform["short"]))
     shutil.rmtree(workspace / ".git", ignore_errors=True)
     for argv in (["init", "-q", "-b", "main"], ["add", "-A"],
                  ["-c", "user.name=MegaBench", "-c", "user.email=megabench@example.invalid",
@@ -687,12 +813,18 @@ def _load(run: Path) -> dict:
 
 
 def _sbatch(run: Path, config: dict, partition: str, time: str, name: str,
-            argv: list[str], dependency: str | None = None) -> str:
-    command = ["sbatch", "--parsable", f"--partition={partition}",
-               f"--gres=gpu:{config['gpus']}", f"--time={time}", f"--job-name={name}",
-               f"--output={run}/logs/slurm-%j.out"]
+            argv: list[str], dependency: str | None = None, begin: str | None = None) -> str:
+    command = ["sbatch", "--parsable", f"--partition={partition}", f"--time={time}",
+               f"--job-name={name}", f"--output={run}/logs/slurm-%j.out"]
+    if config.get("runtime") == "apptainer":
+        # Whole nodes (no GPU GRES on this kind of cluster): one node, one task, all its CPUs.
+        command += ["-N", "1", "-n", "1", "--exclusive", *_slurm_account(config)]
+    else:
+        command.append(f"--gres=gpu:{config['gpus']}")
     if dependency:
         command.append(f"--dependency={dependency}")
+    if begin:
+        command.append(f"--begin={begin}")
     command += [str(run / "round.sh"), str(run), *argv]
     out = subprocess.run(command, check=True, capture_output=True, text=True)
     sys.stderr.write(out.stderr)
@@ -723,7 +855,8 @@ def submit(args: argparse.Namespace) -> int:
         dependency = f"afterany:{previous}" if previous else None
         previous = _sbatch(run, config, partition, slurm_time(seconds),
                            f"mb-{config['agent']}-{config['case'][:24]}-r{number}",
-                           ["round", str(number)], dependency)
+                           ["round", str(number)], dependency,
+                           args.begin if number == first else None)
         jobs.append(previous)
     (run / "logs/jobs.txt").open("a").write(
         "".join(f"round {first + i} job {j}\n" for i, j in enumerate(jobs)))
@@ -899,6 +1032,14 @@ def build_parser() -> argparse.ArgumentParser:
     image.add_argument("--partition", default="main")
     image.add_argument("--time", default="01:00:00")
     image.add_argument("--submit", action="store_true", help="submit the build job")
+    image.add_argument("--runtime", choices=("podman", "apptainer"), default="podman",
+                       help="apptainer: build the ROCm .sif (agent-rocm.def) with --fakeroot")
+    image.add_argument("--base-image", default=ROCM_BASE_IMAGE,
+                       help="apptainer: the rocm/pytorch image the .sif starts from")
+    image.add_argument("--base-sif", type=Path,
+                       help="apptainer: a local .sif of --base-image (default: pulled next to the context)")
+    image.add_argument("--account")
+    image.add_argument("--qos")
 
     prep = sub.add_parser("prepare", help="make a new run directory for one case")
     prep.add_argument("--agent", choices=("claude", "codex", "opencode"), required=True)
@@ -933,6 +1074,14 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--idle-minutes", type=int, default=15,
                       help="tmux mode: end the round when the screen has not changed this long")
     prep.add_argument("--partition", default="main")
+    prep.add_argument("--runtime", choices=("podman", "apptainer"), default="podman",
+                      help="apptainer: Apptainer containers on whole Slurm nodes (no GPU GRES), "
+                           "for AMD GPUs; --image is then a .sif")
+    prep.add_argument("--gpu", choices=sorted(PLATFORMS), default="b200",
+                      help="the GPU the runs get: TASK.md's machine text, the VibeSys backend "
+                           "and kernels plugin")
+    prep.add_argument("--account", help="Slurm --account for every job of the run")
+    prep.add_argument("--qos", help="Slurm --qos for every job of the run")
     prep.add_argument("--allow-host", action="append", default=[],
                       help="extra host the proxy lets through (repeat; .domain for a domain)")
     prep.add_argument("--ref", default="HEAD", help="git ref of the trusted megabench snapshot")
@@ -972,6 +1121,9 @@ def build_parser() -> argparse.ArgumentParser:
                            "https://github.com/uw-syfi/vibesys.git#<branch>")
     prep.add_argument("--vibesys-cli-version", default="0.3.0",
                       help="vibesys-cli release installed in the container")
+    prep.add_argument("--vibesys-cli-binary", type=Path, metavar="PATH",
+                      help="a vibesys-cli binary (e.g. built from the plugin's branch) installed in "
+                           "the container instead of the --vibesys-cli-version release")
     prep.add_argument("--vibesys-budget-minutes", type=int,
                       help="the lead's --budget time (default: the agent budget minus 15)")
     prep.add_argument("--vibesys-fanout", type=int, default=3)
@@ -987,6 +1139,7 @@ def build_parser() -> argparse.ArgumentParser:
     sb.add_argument("--partition", help="default: the prepared partition")
     sb.add_argument("--setup-minutes", type=int, default=5)
     sb.add_argument("--after", help="job id the first round waits for (afterany)")
+    sb.add_argument("--begin", help="earliest start of the first round (sbatch --begin)")
 
     rs = sub.add_parser("rescore", help="re-check the best passing snapshots (a GPU job)")
     rs.add_argument("--run-dir", type=Path, required=True)
